@@ -1,0 +1,31 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.env/
+env/
+ENV/
+.venv/
+
+# Environment variables
+.env
+
+# SQLite databases and ChromaDB data
+data/legal_metadata.db
+data/users.db
+data/chroma_db/
+data/pdfs/
+data/
+*.db
+*.sqlite3
+
+# Logs
+*.log
+server.log
+
+# VSCode / IDE
+.vscode/
+.idea/

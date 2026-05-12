@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+pydantic
+chromadb
+sentence-transformers
+requests
+python-dotenv
+python-docx
+python-pptx
+openpyxl
