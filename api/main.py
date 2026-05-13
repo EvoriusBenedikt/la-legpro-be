@@ -941,12 +941,50 @@ def call_glm(messages: list, temperature: float = 0.1, timeout: int = 90) -> str
     raise HTTPException(status_code=500, detail=GENERIC_GLM_ERROR_MESSAGE)
 
 
-def retrieve_contexts(query: str, user_id: str, n_results=5, doc_category=None, hybrid_cag=True) -> List[dict]:
+def retrieve_contexts(query: str, current_user: dict, n_results=5, doc_category=None, hybrid_cag=True) -> List[dict]:
     """Searches Vector DB and returns structured raw dictionaries.
        If hybrid_cag=True, uses RAG to find the best document, then CAG to inject the full text.
+       Enforces FR-17 by strictly filtering out classified documents the user cannot access.
     """
     collection = get_chroma_collection()
+    user_id = current_user.get("id")
+    role_level = auth.get_role_level(current_user.get("role", "pengguna"))
     
+    # 1. Build Base Allowed Classifications
+    allowed_klasifikasi = ["Publik"]
+    if role_level >= 2:
+        allowed_klasifikasi.append("Rahasia")
+    if role_level >= 3:
+        allowed_klasifikasi.append("Terbatas")
+        
+    # 2. Fetch Explicit Access Grants & Document Classification Map
+    granted_doc_ids = set()
+    doc_klasifikasi_map = {}
+    db_path = os.path.join(BASE_DIR, "data", "legal_metadata.db")
+    try:
+        conn = sqlite3.connect(db_path)
+        c = conn.cursor()
+        c.execute("SELECT doc_id FROM access_grants WHERE granted_to = ? AND expires_at >= datetime('now')", (user_id,))
+        for row in c.fetchall():
+            granted_doc_ids.add(row[0])
+            
+        c.execute("SELECT id, klasifikasi FROM regulations")
+        for row in c.fetchall():
+            doc_klasifikasi_map[row[0]] = row[1] or "Publik"
+        conn.close()
+    except Exception as e:
+        print(f"Error fetching access grants for context retrieval: {e}")
+
+    def is_allowed(reg_id: str) -> bool:
+        if not reg_id:
+            return True # Allow edge case for very old unstructured data
+        if reg_id in granted_doc_ids:
+            return True
+        doc_klas = doc_klasifikasi_map.get(reg_id, "Publik")
+        return doc_klas in allowed_klasifikasi
+
+    # Over-fetch for Post-Retrieval Filtering
+    overfetch_n = 50
     where_clause = {"$or": [{"visibility": "public"}, {"user_id": user_id}]}
     if doc_category:
         where_clause = {
@@ -960,15 +998,25 @@ def retrieve_contexts(query: str, user_id: str, n_results=5, doc_category=None, 
     
     if hybrid_cag:
         # 1. RAG Discovery: Find the single most relevant chunk
-        discovery = collection.query(query_texts=[query], n_results=1, where=where_clause)
+        discovery = collection.query(query_texts=[query], n_results=overfetch_n, where=where_clause)
+        
+        best_reg_id = None
+        best_top_meta = None
         
         if discovery and discovery['documents'] and len(discovery['documents'][0]) > 0:
-            top_meta = discovery['metadatas'][0][0]
-            reg_id = top_meta.get("reg_id")
+            # Post-Filter to find the top AUTHORIZED document
+            for idx in range(len(discovery['documents'][0])):
+                meta = discovery['metadatas'][0][idx]
+                reg_id = meta.get("reg_id")
+                
+                if is_allowed(reg_id):
+                    best_reg_id = reg_id
+                    best_top_meta = meta
+                    break # Found the highest ranked authorized document
             
-            if reg_id:
+            if best_reg_id:
                 # 2. CAG Injection: Fetch all chunks for this specific document
-                doc_results = collection.get(where={"reg_id": reg_id}, include=["documents"])
+                doc_results = collection.get(where={"reg_id": best_reg_id}, include=["documents"])
                 
                 if doc_results and doc_results['documents']:
                     # Reconstruct full text
@@ -977,12 +1025,12 @@ def retrieve_contexts(query: str, user_id: str, n_results=5, doc_category=None, 
                     # Safeguard: Limit to ~25,000 characters to avoid exceeding context window
                     if len(full_text) <= 25000:
                         contexts.append({
-                            "id": reg_id,
+                            "id": best_reg_id,
                             "text": full_text,
-                            "jenis": top_meta.get('jenis', ''),
-                            "nomor": top_meta.get('nomor', ''),
-                            "sektor": top_meta.get('sektor', ''),
-                            "judul": top_meta.get('judul', '')
+                            "jenis": best_top_meta.get('jenis', ''),
+                            "nomor": best_top_meta.get('nomor', ''),
+                            "sektor": best_top_meta.get('sektor', ''),
+                            "judul": best_top_meta.get('judul', '')
                         })
                         return contexts
                     # If it exceeds 25,000 chars, we DO NOT return contexts here. 
@@ -991,14 +1039,20 @@ def retrieve_contexts(query: str, user_id: str, n_results=5, doc_category=None, 
     # Fallback to standard chunk-based RAG
     results = collection.query(
         query_texts=[query],
-        n_results=n_results,
+        n_results=overfetch_n,
         where=where_clause
     )
     
     if results and results['documents']:
         for i in range(len(results['documents'][0])):
-            doc = results['documents'][0][i]
             meta = results['metadatas'][0][i]
+            reg_id = meta.get("reg_id")
+            
+            # Apply Security Filter (FR-17)
+            if not is_allowed(reg_id):
+                continue
+                
+            doc = results['documents'][0][i]
             id_str = results['ids'][0][i]
             
             contexts.append({
@@ -1009,6 +1063,10 @@ def retrieve_contexts(query: str, user_id: str, n_results=5, doc_category=None, 
                 "sektor": meta.get('sektor', ''),
                 "judul": meta.get('judul', '')
             })
+            
+            # Stop once we have enough authorized chunks
+            if len(contexts) >= n_results:
+                break
             
     return contexts
 
@@ -1022,7 +1080,7 @@ async def chat_endpoint(req: ChatRequest, current_user: dict = Depends(auth.get_
         raise HTTPException(status_code=400, detail="Missing user message")
 
     # 1. Retrieve Context
-    contexts = retrieve_contexts(last_user_message, user_id=current_user["id"])
+    contexts = retrieve_contexts(last_user_message, current_user=current_user)
     
     # Format context for the prompt
     context_str = ""
