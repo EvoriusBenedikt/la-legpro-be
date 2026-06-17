@@ -129,7 +129,8 @@ ROLE_LEVELS = {
     "manajer": 2,
     "direktur": 3,
     "admin": 4,
-    "sekretaris perusahaan": 5
+    "sekretaris perusahaan": 5,
+    "insinyur ti": 6
 }
 
 def get_role_level(role: str) -> int:
@@ -171,12 +172,29 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
 
 def require_role(min_role: str):
     def role_dependency(current_user: dict = Depends(get_current_user)):
+        user_role = current_user.get("role", "pengguna").lower()
+        if user_role == "insinyur ti" and min_role != "insinyur ti":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Akses ditolak. Role Insinyur TI tidak dapat mengakses fitur bisnis."
+            )
+        
         min_level = get_role_level(min_role)
-        user_level = get_role_level(current_user.get("role", "pengguna"))
+        user_level = get_role_level(user_role)
         if user_level < min_level:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=f"Akses ditolak. Fitur ini memerlukan level {min_role} atau lebih tinggi."
+            )
+        return current_user
+    return role_dependency
+
+def require_exact_role(exact_role: str):
+    def role_dependency(current_user: dict = Depends(get_current_user)):
+        if current_user.get("role", "pengguna").lower() != exact_role.lower():
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Akses ditolak. Fitur ini khusus untuk role {exact_role}."
             )
         return current_user
     return role_dependency

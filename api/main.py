@@ -1,11 +1,16 @@
 import os
 import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from dotenv import load_dotenv
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+load_dotenv(os.path.join(BASE_DIR, ".env"))
+
 import re
 import json
 import time
 import requests
 import chromadb
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, field_validator
@@ -18,7 +23,6 @@ import hashlib
 import uuid
 import base64
 import logging
-from dotenv import load_dotenv
 import concurrent.futures
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
@@ -43,8 +47,6 @@ _builtins.print = _log_print
 
 
 # ── Load environment ────────────────────────────────────────────────────────
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 CHROMA_DB_DIR = os.path.join(BASE_DIR, "data", "chroma_db")
 
@@ -79,7 +81,7 @@ def init_main_db():
                   nomor TEXT, jenis TEXT, sektor TEXT, 
                   status TEXT, detail_url TEXT, local_path TEXT)''')
     try:
-        c.execute("ALTER TABLE regulations ADD COLUMN klasifikasi TEXT DEFAULT 'Publik'")
+        c.execute("ALTER TABLE regulations ADD COLUMN klasifikasi TEXT DEFAULT 'Umum'")
     except sqlite3.OperationalError:
         pass
         
@@ -92,10 +94,192 @@ def init_main_db():
         expires_at TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS audit_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        user_id TEXT,
+        action_type TEXT,
+        resource_id TEXT,
+        details TEXT
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS kg_nodes (
+        id TEXT PRIMARY KEY,
+        label TEXT NOT NULL,
+        type TEXT NOT NULL,
+        doc_id TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS kg_edges (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_id TEXT NOT NULL,
+        target_id TEXT NOT NULL,
+        relation TEXT NOT NULL,
+        doc_id TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS kg_exclusions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        entity_name TEXT UNIQUE NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )''')
+    
+    # FR-29: Document Taxonomy
+    c.execute('''CREATE TABLE IF NOT EXISTS document_taxonomy (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE NOT NULL,
+        parent_id INTEGER,
+        is_active BOOLEAN DEFAULT 1,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )''')
+    
+    # Seed default taxonomy if empty
+    c.execute("SELECT COUNT(*) FROM document_taxonomy")
+    if c.fetchone()[0] == 0:
+        default_types = [
+            "Peraturan Pemerintah",
+            "Undang-Undang",
+            "Peraturan OJK",
+            "Surat Edaran OJK",
+            "Dokumen Internal",
+            "Peraturan Menteri",
+            "Regulasi Custom"
+        ]
+        for dt in default_types:
+            c.execute("INSERT INTO document_taxonomy (name) VALUES (?)", (dt,))
+
+    
     conn.commit()
     conn.close()
 
+def log_audit(user_id: str, action_type: str, resource_id: str = "", details: str = ""):
+    import sqlite3
+    db_path = os.path.join(BASE_DIR, "data", "legal_metadata.db")
+    try:
+        conn = sqlite3.connect(db_path, timeout=10.0)
+        c = conn.cursor()
+        c.execute('''INSERT INTO audit_logs (user_id, action_type, resource_id, details) 
+                     VALUES (?, ?, ?, ?)''', (user_id, action_type, resource_id, details))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Failed to write audit log: {e}")
+
 init_main_db()
+
+def extract_and_store_graph(doc_id: str, full_text: str, nomor: str, judul: str, jenis: str):
+    """Use LLM to extract entities & relationships from a document, then upsert into KG tables."""
+    import sqlite3, json as _json
+    import os
+    
+    # FR-30: Fetch Exclusions
+    exclusions = []
+    db_path = os.path.join(BASE_DIR, "data", "legal_metadata.db")
+    try:
+        conn = sqlite3.connect(db_path, timeout=30.0)
+        c = conn.cursor()
+        c.execute("SELECT entity_name FROM kg_exclusions")
+        exclusions = [row[0] for row in c.fetchall()]
+        conn.close()
+    except Exception as e:
+        print(f"[KG] Warning: Failed to fetch exclusions: {e}")
+        
+    exclusion_text = ""
+    if exclusions:
+        exclusion_list_str = ", ".join(exclusions)
+        exclusion_text = f"\n6. DILARANG KERAS mengekstrak entitas berikut ini (Abaikan mereka sepenuhnya): {exclusion_list_str}."
+
+    snippet = full_text[:8000]  # Increased from 3500 to capture definitions (Pasal 1) and core body
+    prompt = [
+        {"role": "system", "content": (
+            "Kamu adalah ekstraktor entitas hukum level ahli. Baca teks peraturan di bawah ini dan ekstrak "
+            "entitas serta hubungan hukumnya ke dalam bentuk JSON murni. "
+            "Format JSON yang diharapkan:\n"
+            "{\"entitas\": [{\"id\": \"string unik\", \"label\": \"nama tampilan\", \"type\": \"entitas|topik\"}], "
+            "\"relasi\": [{\"source\": \"id sumber\", \"target\": \"id target\", \"rel\": \"MENCABUT|MENGUBAH|MERUJUK|MENGATUR|DITERBITKAN_OLEH\"}]}\n"
+            "Aturan Ekstraksi Kritis:\n"
+            "1. Untuk type='entitas': Selalu ekstrak lembaga penerbit (e.g. OJK, Kemnaker, BI, Kemenkeu, Presiden).\n"
+            "2. Untuk type='topik': Sangat penting untuk mendeteksi topik terkait skenario NDA dan PKS! Jika teks mengandung unsur 'Kerahasiaan', 'Data Pribadi', 'Keamanan Informasi', 'Rahasia Dagang', ekstrak sebagai topik NDA. Jika mengandung 'Perjanjian', 'Kontrak', 'Kemitraan', 'Vendor', 'Pengadaan', ekstrak sebagai topik PKS.\n"
+            "3. Selalu buat relasi DITERBITKAN_OLEH dari regulasi ini ke lembaga penerbitnya.\n"
+            "4. Gunakan nomor regulasi resmi (misal POJK-12-2023) sebagai ID untuk target relasi MERUJUK/MENGUBAH.\n"
+            "5. Jangan batasi jumlah ekstraksi. Ekstrak SEMUA entitas, topik relevan, dan regulasi terkait yang ada dalam teks untuk membangun Knowledge Graph yang padat dan komprehensif."
+            f"{exclusion_text}"
+        )},
+        {"role": "user", "content": f"Regulasi: {jenis} Nomor {nomor}\nJudul: {judul}\n\nTeks:\n{snippet}"}
+    ]
+    try:
+        raw = call_glm(prompt, temperature=0.0, timeout=45)
+        # Strip markdown code fences if present
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        data = _json.loads(raw)
+        
+        # FR-30 Post-processing: remove excluded entities
+        if exclusions:
+            exc_lower = {e.lower() for e in exclusions}
+            # Filter nodes
+            valid_entities = []
+            excluded_ids = set()
+            for ent in data.get("entitas", []):
+                if ent.get("label", "").lower() in exc_lower:
+                    excluded_ids.add(ent.get("id"))
+                else:
+                    valid_entities.append(ent)
+            data["entitas"] = valid_entities
+            
+            # Filter edges referencing excluded nodes
+            valid_relations = []
+            for rel in data.get("relasi", []):
+                if rel.get("source") not in excluded_ids and rel.get("target") not in excluded_ids:
+                    valid_relations.append(rel)
+            data["relasi"] = valid_relations
+
+    except Exception as e:
+        print(f"[KG] LLM extraction failed for {nomor}: {e}")
+        return
+
+    db_path = os.path.join(BASE_DIR, "data", "legal_metadata.db")
+    try:
+        conn = sqlite3.connect(db_path, timeout=30.0)
+        c = conn.cursor()
+
+        # Upsert the regulation itself as a node
+        reg_node_id = f"{jenis}-{nomor}".replace(" ", "-")[:80]
+        c.execute("INSERT OR REPLACE INTO kg_nodes (id, label, type, doc_id) VALUES (?, ?, ?, ?)",
+                  (reg_node_id, f"{jenis} {nomor}", "regulasi", doc_id))
+
+        # Upsert extracted entities/topics
+        for ent in data.get("entitas", []):
+            ent_id = str(ent.get("id", "")).strip()[:80]
+            ent_label = str(ent.get("label", ent_id)).strip()[:120]
+            ent_type = str(ent.get("type", "topik")).strip()
+            if ent_id:
+                c.execute("INSERT OR IGNORE INTO kg_nodes (id, label, type, doc_id) VALUES (?, ?, ?, ?)",
+                          (ent_id, ent_label, ent_type, None))
+
+        # Insert edges
+        for rel in data.get("relasi", []):
+            src = str(rel.get("source", "")).strip()[:80]
+            tgt = str(rel.get("target", "")).strip()[:80]
+            relation = str(rel.get("rel", "MERUJUK")).strip()[:40]
+            if src and tgt and src != tgt:
+                # Replace regulation self-reference with the canonical reg_node_id
+                if src == nomor or src == f"{jenis} {nomor}":
+                    src = reg_node_id
+                if tgt == nomor or tgt == f"{jenis} {nomor}":
+                    tgt = reg_node_id
+                c.execute("INSERT INTO kg_edges (source_id, target_id, relation, doc_id) VALUES (?, ?, ?, ?)",
+                          (src, tgt, relation, doc_id))
+
+        conn.commit()
+        conn.close()
+        print(f"[KG] Stored graph for {nomor}: {len(data.get('entitas',[]))} entities, {len(data.get('relasi',[]))} edges")
+    except Exception as e:
+        print(f"[KG] DB write failed for {nomor}: {e}")
 
 import auth
 import history
@@ -151,6 +335,41 @@ class AnalyzeRequest(BaseModel):
             return None
         return str(v)
 
+class ConfirmPendingRequest(BaseModel):
+    klasifikasi: str
+
+@app.post("/api/repository/pending/{doc_id}/confirm")
+async def confirm_pending_document(
+    doc_id: str,
+    req: ConfirmPendingRequest,
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(auth.require_role("sekretaris perusahaan"))
+):
+    import sqlite3
+    db_path = os.path.join(BASE_DIR, "data", "legal_metadata.db")
+    conn = sqlite3.connect(db_path, timeout=30.0)
+    c = conn.cursor()
+    
+    c.execute("SELECT local_path, nomor, judul, jenis, sektor FROM regulations WHERE id = ? AND status = 'Menunggu Konfirmasi'", (doc_id,))
+    doc = c.fetchone()
+    
+    if not doc:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Dokumen pending tidak ditemukan.")
+        
+    local_path, nomor, judul, jenis, sektor = doc
+    
+    # Update DB
+    c.execute("UPDATE regulations SET status = 'Berlaku', klasifikasi = ? WHERE id = ?", (req.klasifikasi, doc_id))
+    conn.commit()
+    conn.close()
+    
+    # Trigger vector DB injection and KG asynchronously
+    filename = os.path.basename(local_path)
+    background_tasks.add_task(ingest_document_background, local_path, doc_id, filename, nomor, jenis, sektor, 'Berlaku', req.klasifikasi)
+    
+    return {"message": "Dokumen berhasil dikonfirmasi dan dimasukkan ke repositori."}
+
 class AccessGrantRequest(BaseModel):
     granted_to: str
     reason: str
@@ -180,6 +399,10 @@ def get_glm_session() -> requests.Session:
     global _glm_session
     if _glm_session is None:
         session = requests.Session()
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        session.verify = False
+        
         retry_cfg = Retry(
             total=2,
             connect=2,
@@ -951,7 +1174,7 @@ def retrieve_contexts(query: str, current_user: dict, n_results=5, doc_category=
     role_level = auth.get_role_level(current_user.get("role", "pengguna"))
     
     # 1. Build Base Allowed Classifications
-    allowed_klasifikasi = ["Publik"]
+    allowed_klasifikasi = ["Umum"]
     if role_level >= 2:
         allowed_klasifikasi.append("Rahasia")
     if role_level >= 3:
@@ -970,7 +1193,7 @@ def retrieve_contexts(query: str, current_user: dict, n_results=5, doc_category=
             
         c.execute("SELECT id, klasifikasi FROM regulations")
         for row in c.fetchall():
-            doc_klasifikasi_map[row[0]] = row[1] or "Publik"
+            doc_klasifikasi_map[row[0]] = row[1] or "Umum"
         conn.close()
     except Exception as e:
         print(f"Error fetching access grants for context retrieval: {e}")
@@ -980,7 +1203,7 @@ def retrieve_contexts(query: str, current_user: dict, n_results=5, doc_category=
             return True # Allow edge case for very old unstructured data
         if reg_id in granted_doc_ids:
             return True
-        doc_klas = doc_klasifikasi_map.get(reg_id, "Publik")
+        doc_klas = doc_klasifikasi_map.get(reg_id, "Umum")
         return doc_klas in allowed_klasifikasi
 
     # Over-fetch for Post-Retrieval Filtering
@@ -1070,8 +1293,72 @@ def retrieve_contexts(query: str, current_user: dict, n_results=5, doc_category=
             
     return contexts
 
+def retrieve_graph_contexts(query: str, current_user: dict, max_nodes=10) -> str:
+    """FR-16: Queries the SQLite Knowledge Graph based on query keywords and returns a formatted graph string."""
+    import sqlite3
+    import os
+    import re
+    
+    # 1. Clean query to extract keywords
+    stopwords = {"apa", "siapa", "kapan", "dimana", "mengapa", "bagaimana", "dan", "atau", "di", "ke", "dari", "yang", "untuk", "dengan", "tentang", "terkait", "saja", "apakah"}
+    words = re.findall(r'\b\w+\b', query.lower())
+    keywords = [w for w in words if w not in stopwords and len(w) > 3]
+    
+    if not keywords:
+        return ""
+        
+    db_path = os.path.join(BASE_DIR, "data", "legal_metadata.db")
+    try:
+        conn = sqlite3.connect(db_path)
+        c = conn.cursor()
+        
+        # 2. Find matching nodes
+        query_conditions = " OR ".join(["label LIKE ?" for _ in keywords])
+        params = [f"%{kw}%" for kw in keywords]
+        
+        c.execute(f"SELECT id, label, type FROM kg_nodes WHERE {query_conditions} LIMIT {max_nodes}", params)
+        matched_nodes = c.fetchall()
+        
+        if not matched_nodes:
+            conn.close()
+            return ""
+            
+        matched_node_ids = [row[0] for row in matched_nodes]
+        
+        # 3. Find 1-degree connections
+        placeholders = ",".join(["?"] * len(matched_node_ids))
+        c.execute(f"""
+            SELECT e.source_id, n1.label, e.relation, e.target_id, n2.label 
+            FROM kg_edges e
+            LEFT JOIN kg_nodes n1 ON e.source_id = n1.id
+            LEFT JOIN kg_nodes n2 ON e.target_id = n2.id
+            WHERE e.source_id IN ({placeholders}) OR e.target_id IN ({placeholders})
+            LIMIT 40
+        """, matched_node_ids + matched_node_ids)
+        
+        edges = c.fetchall()
+        conn.close()
+        
+        if not edges:
+            return ""
+            
+        # 4. Format into natural text
+        graph_text = "STRUKTUR KNOWLEDGE GRAPH (Entitas dan Relasi yang relevan dengan pertanyaan):\n"
+        for src_id, src_label, relation, tgt_id, tgt_label in edges:
+            s_lbl = src_label or src_id
+            t_lbl = tgt_label or tgt_id
+            graph_text += f"- [{s_lbl}] {relation} [{t_lbl}]\n"
+            
+        return graph_text
+    except Exception as e:
+        print(f"Graph retrieval error: {e}")
+        return ""
+
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat_endpoint(req: ChatRequest, current_user: dict = Depends(auth.get_current_user)):
+    # FR-24: Admin cannot access document content or search
+    if current_user.get("role", "pengguna").lower() == "admin":
+        raise HTTPException(status_code=403, detail="Admin sistem tidak memiliki kewenangan untuk mengakses konten dokumen.")
     if not req.messages:
         raise HTTPException(status_code=400, detail="Messages array cannot be empty")
         
@@ -1079,8 +1366,11 @@ async def chat_endpoint(req: ChatRequest, current_user: dict = Depends(auth.get_
     if not last_user_message:
         raise HTTPException(status_code=400, detail="Missing user message")
 
-    # 1. Retrieve Context
+    # 1. Retrieve Semantic Context
     contexts = retrieve_contexts(last_user_message, current_user=current_user)
+    
+    # FR-16: 1.5 Retrieve Graph Context
+    graph_context = retrieve_graph_contexts(last_user_message, current_user=current_user)
     
     # Format context for the prompt
     context_str = ""
@@ -1095,6 +1385,9 @@ async def chat_endpoint(req: ChatRequest, current_user: dict = Depends(auth.get_
             snippet=c['text']
         ))
         context_str += f"SUMBER [{i+1}]: {c['jenis']} Nomor {c['nomor']}\nTEKS:\n{c['text']}\n\n"
+
+    if graph_context:
+        context_str += f"\n{graph_context}\n\n"
 
     # Fetch user's contract monitor stats
     user_stats_str = ""
@@ -1131,12 +1424,13 @@ async def chat_endpoint(req: ChatRequest, current_user: dict = Depends(auth.get_
     try:
         answer = call_glm(messages, temperature=0.1, timeout=60)
     except HTTPException as e:
-        # Upstream LLM can intermittently disconnect; keep chat endpoint stable for frontend UX.
         print(f"Chat fallback triggered due to GLM error: {e.detail}")
         answer = (
             "Maaf, layanan AI sedang mengalami gangguan koneksi sementara. "
             "Silakan coba kirim pertanyaan yang sama beberapa detik lagi."
         )
+    # FR-25: Audit log the search query
+    log_audit(current_user.get("id", ""), "SEARCH", "", f"Query: {last_user_message[:200]}")
     return ChatResponse(answer=answer, sources=sources_to_return)
 
 @app.post("/api/chat-session")
@@ -1165,6 +1459,9 @@ async def serve_pdf(filename: str):
 
 @app.get("/api/repository")
 async def get_repository(current_user: dict = Depends(auth.get_current_user)):
+    # FR-24: Admin cannot access document repository
+    if current_user.get("role", "pengguna").lower() == "admin":
+        raise HTTPException(status_code=403, detail="Admin sistem tidak memiliki kewenangan untuk mengakses repositori dokumen.")
     import sqlite3
     db_path = os.path.join(BASE_DIR, "data", "legal_metadata.db")
     if not os.path.exists(db_path):
@@ -1173,7 +1470,7 @@ async def get_repository(current_user: dict = Depends(auth.get_current_user)):
     user_id = current_user.get("id")
     role_level = auth.get_role_level(current_user.get("role", "pengguna"))
     
-    allowed_klasifikasi = ["Publik"]
+    allowed_klasifikasi = ["Umum"]
     if role_level >= 2:
         allowed_klasifikasi.append("Rahasia")
     if role_level >= 3:
@@ -1189,6 +1486,7 @@ async def get_repository(current_user: dict = Depends(auth.get_current_user)):
         SELECT id, judul, nomor, jenis, sektor, status, local_path, klasifikasi 
         FROM regulations 
         WHERE local_path IS NOT NULL AND local_path != ''
+        AND status != 'Menunggu Konfirmasi'
         AND (
             klasifikasi IN ({klas_str}) 
             OR id IN (
@@ -1205,7 +1503,7 @@ async def get_repository(current_user: dict = Depends(auth.get_current_user)):
     for row in records:
         # Depending on schema, klasifikasi might be at index 7. Handle safely.
         reg_id, judul, nomor, jenis, sektor, status, local_path = row[:7]
-        klasifikasi = row[7] if len(row) > 7 else "Publik"
+        klasifikasi = row[7] if len(row) > 7 else "Umum"
         filename = os.path.basename(local_path) if local_path else None
         docs.append({
             "id": str(reg_id) if reg_id is not None else None,
@@ -1214,7 +1512,42 @@ async def get_repository(current_user: dict = Depends(auth.get_current_user)):
             "jenis": str(jenis) if jenis else "",
             "sektor": str(sektor) if sektor else "",
             "status": str(status) if status else "",
-            "klasifikasi": str(klasifikasi) if klasifikasi else "Publik",
+            "klasifikasi": str(klasifikasi) if klasifikasi else "Umum",
+            "filename": filename
+        })
+    conn.close()
+    
+    return {"documents": docs}
+
+
+@app.get("/api/repository/pending")
+async def get_pending_repository(current_user: dict = Depends(auth.require_role("sekretaris perusahaan"))):
+    import sqlite3
+    db_path = os.path.join(BASE_DIR, "data", "legal_metadata.db")
+    conn = sqlite3.connect(db_path, timeout=30.0)
+    c = conn.cursor()
+    
+    query = """
+        SELECT id, judul, nomor, jenis, sektor, status, local_path, klasifikasi 
+        FROM regulations 
+        WHERE status = 'Menunggu Konfirmasi'
+    """
+    c.execute(query)
+    records = c.fetchall()
+    
+    docs = []
+    for row in records:
+        reg_id, judul, nomor, jenis, sektor, status, local_path = row[:7]
+        klasifikasi = row[7] if len(row) > 7 else "Umum"
+        filename = os.path.basename(local_path) if local_path else None
+        docs.append({
+            "id": str(reg_id) if reg_id is not None else None,
+            "judul": str(judul) if judul else "",
+            "nomor": str(nomor) if nomor is not None else "",
+            "jenis": str(jenis) if jenis else "",
+            "sektor": str(sektor) if sektor else "",
+            "status": str(status) if status else "",
+            "klasifikasi": str(klasifikasi) if klasifikasi else "Umum",
             "filename": filename
         })
     conn.close()
@@ -1227,31 +1560,35 @@ async def grant_document_access(
     req: AccessGrantRequest,
     current_user: dict = Depends(auth.get_current_user)
 ):
-    user_level = auth.get_role_level(current_user.get("role", "pengguna"))
+    user_role = current_user.get("role", "pengguna").lower()
+    user_level = auth.get_role_level(user_role)
+    # FR-21 & FR-22: Only Manajer (level 2+) can grant access
     if user_level < 2:
-        raise HTTPException(status_code=403, detail="Hanya Manajer atau Direktur yang dapat memberikan akses.")
+        raise HTTPException(status_code=403, detail="Hanya Manajer, Direktur, atau Sekretaris Perusahaan yang dapat memberikan akses.")
         
     import sqlite3
     import uuid
     db_path = os.path.join(BASE_DIR, "data", "legal_metadata.db")
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=30.0)
     c = conn.cursor()
     
-    c.execute("SELECT klasifikasi FROM regulations WHERE id = ?", (doc_id,))
+    c.execute("SELECT klasifikasi, judul FROM regulations WHERE id = ?", (doc_id,))
     doc = c.fetchone()
     if not doc:
         conn.close()
         raise HTTPException(status_code=404, detail="Dokumen tidak ditemukan")
         
-    klasifikasi = doc[0] if len(doc) > 0 and doc[0] else "Publik"
+    klasifikasi = doc[0] if doc[0] else "Umum"
+    doc_judul = doc[1] if doc[1] else doc_id
     
+    # FR-22: Manajer cannot grant access to Terbatas documents
     if klasifikasi == "Terbatas" and user_level < 3:
         conn.close()
-        raise HTTPException(status_code=403, detail="Manajer tidak dapat memberikan akses untuk dokumen Terbatas.")
+        raise HTTPException(status_code=403, detail="Manajer tidak dapat memberikan akses untuk dokumen Terbatas. Hanya Direktur atau Sekretaris Perusahaan yang berwenang.")
         
     if not req.reason or len(req.reason.strip()) < 5:
         conn.close()
-        raise HTTPException(status_code=400, detail="Alasan wajib diisi.")
+        raise HTTPException(status_code=400, detail="Alasan wajib diisi (minimal 5 karakter).")
         
     grant_id = str(uuid.uuid4())
     c.execute('''INSERT INTO access_grants (id, doc_id, granted_by, granted_to, reason, expires_at)
@@ -1260,13 +1597,520 @@ async def grant_document_access(
     conn.commit()
     conn.close()
     
+    # FR-25: Audit log the grant
+    log_audit(current_user.get("id", ""), "GRANT_ACCESS", doc_id, 
+              f"Diberikan kepada: {req.granted_to}, Dokumen: {doc_judul}, Alasan: {req.reason}")
+    
     return {"message": "Akses berhasil diberikan."}
+
+@app.get("/api/repository/grants")
+async def get_all_grants(current_user: dict = Depends(auth.get_current_user)):
+    """FR-23: Sekretaris Perusahaan can see all grants; others see only their own."""
+    user_role = current_user.get("role", "pengguna").lower()
+    user_level = auth.get_role_level(user_role)
+    if user_level < 2:
+        raise HTTPException(status_code=403, detail="Akses ditolak.")
+    
+    import sqlite3
+    db_path = os.path.join(BASE_DIR, "data", "legal_metadata.db")
+    conn = sqlite3.connect(db_path, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    
+    # FR-23: Sekretaris Perusahaan sees everything; others see only what they granted
+    if user_level >= 5:  # Sekretaris Perusahaan
+        c.execute('''SELECT ag.id, ag.doc_id, ag.granted_by, ag.granted_to, ag.reason, 
+                            ag.expires_at, ag.created_at, r.judul, r.klasifikasi
+                     FROM access_grants ag
+                     LEFT JOIN regulations r ON ag.doc_id = r.id
+                     ORDER BY ag.created_at DESC''')
+    else:
+        c.execute('''SELECT ag.id, ag.doc_id, ag.granted_by, ag.granted_to, ag.reason, 
+                            ag.expires_at, ag.created_at, r.judul, r.klasifikasi
+                     FROM access_grants ag
+                     LEFT JOIN regulations r ON ag.doc_id = r.id
+                     WHERE ag.granted_by = ?
+                     ORDER BY ag.created_at DESC''', (current_user["id"],))
+    
+    rows = c.fetchall()
+    conn.close()
+    return {"grants": [dict(r) for r in rows]}
+
+@app.delete("/api/repository/grant/{grant_id}")
+async def revoke_grant(grant_id: str, current_user: dict = Depends(auth.get_current_user)):
+    """FR-23: Sekretaris Perusahaan can revoke any grant."""
+    user_level = auth.get_role_level(current_user.get("role", "pengguna"))
+    if user_level < 5:  # Only Sekretaris Perusahaan
+        raise HTTPException(status_code=403, detail="Hanya Sekretaris Perusahaan yang dapat mencabut pemberian akses.")
+    
+    import sqlite3
+    db_path = os.path.join(BASE_DIR, "data", "legal_metadata.db")
+    conn = sqlite3.connect(db_path, timeout=30.0)
+    c = conn.cursor()
+    c.execute("SELECT doc_id, granted_to FROM access_grants WHERE id = ?", (grant_id,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Grant tidak ditemukan.")
+    
+    c.execute("DELETE FROM access_grants WHERE id = ?", (grant_id,))
+    conn.commit()
+    conn.close()
+    
+    log_audit(current_user.get("id", ""), "REVOKE_ACCESS", row[0], f"Akses dicabut dari: {row[1]}")
+    return {"message": "Akses berhasil dicabut."}
+
+def process_document_background(file_path: str, doc_id: str, filename: str, nomor: str, jenis: str, sektor: str, status: str, klasifikasi: str):
+    try:
+        parser = LegalDocumentParser()
+        full_text = parser.parse_pdf(file_path)
+        
+        # ── AI Recommendation (FR-4) ──────────────────────────────────────
+        messages = [
+            {"role": "system", "content": "Anda adalah analis regulasi korporat. Tugas Anda adalah memberikan rekomendasi tingkat kerahasiaan dokumen berdasarkan isinya. Balas hanya dengan satu kata: 'Umum', 'Rahasia', atau 'Terbatas'."},
+            {"role": "user", "content": f"Teks dokumen:\n{full_text[:3000]}\n\nBerdasarkan teks ini, rekomendasikan klasifikasi: Umum, Rahasia, atau Terbatas."}
+        ]
+        
+        recommended_klasifikasi = "Umum"
+        try:
+            raw_content = call_glm(messages, temperature=0.1, timeout=30)
+            raw_content = raw_content.lower()
+            if "terbatas" in raw_content:
+                recommended_klasifikasi = "Terbatas"
+            elif "rahasia" in raw_content:
+                recommended_klasifikasi = "Rahasia"
+        except Exception as llm_err:
+            print(f"LLM classification error: {llm_err}")
+            
+        import sqlite3
+        db_path = os.path.join(BASE_DIR, "data", "legal_metadata.db")
+        conn = sqlite3.connect(db_path, timeout=30.0)
+        c = conn.cursor()
+        c.execute("UPDATE regulations SET status = 'Menunggu Konfirmasi', klasifikasi = ? WHERE id = ?", (recommended_klasifikasi, doc_id))
+        conn.commit()
+        conn.close()
+        print(f"Document {doc_id} set to Pending Confirmation with AI Recommendation: {recommended_klasifikasi}")
+        
+    except Exception as e:
+        print(f"Error in process_document_background: {e}")
+        try:
+            import sqlite3
+            conn = sqlite3.connect(os.path.join(BASE_DIR, "data", "legal_metadata.db"), timeout=30.0)
+            c = conn.cursor()
+            c.execute("UPDATE regulations SET status = 'Gagal - Error' WHERE id = ?", (doc_id,))
+            conn.commit()
+            conn.close()
+        except:
+            pass
+
+def ingest_document_background(file_path: str, doc_id: str, filename: str, nomor: str, jenis: str, sektor: str, status: str, klasifikasi: str):
+    try:
+        parser = LegalDocumentParser()
+        chunker = LegalChunker()
+        
+        full_text = parser.parse_pdf(file_path)
+        
+        # ── Duplicate Detection (FR-5) ──────────────────────────────────────
+        fingerprint_text = full_text[:1500]
+        collection = get_chroma_collection()
+        dup_results = collection.query(
+            query_texts=[fingerprint_text],
+            n_results=1
+        )
+        
+        db_path = os.path.join(BASE_DIR, "data", "legal_metadata.db")
+        conn = sqlite3.connect(db_path, timeout=30.0)
+        c = conn.cursor()
+        
+        if dup_results and dup_results['distances'] and len(dup_results['distances'][0]) > 0:
+            dist = dup_results['distances'][0][0]
+            if dist < 0.15:
+                # Cleanup temp file
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                c.execute("UPDATE regulations SET status = 'Gagal - Duplikat' WHERE id = ?", (doc_id,))
+                conn.commit()
+                conn.close()
+                return
+
+        print(f"File saved to DB. Now parsing and embedding: {filename}")
+        
+        # Vector DB Injection
+        base_metadata = {
+            "reg_id": doc_id,
+            "judul": filename.replace('.pdf', ''),
+            "nomor": nomor,
+            "jenis": jenis,
+            "sektor": sektor,
+            "status": status
+        }
+        
+        chunks = chunker.chunk_document(full_text, base_metadata)
+        
+        documents = []
+        metadatas = []
+        ids = []
+        
+        import hashlib
+        for i, c_data in enumerate(chunks):
+            clean_metadata = {k: v for k, v in c_data["metadata"].items() if v is not None}
+            chunk_id = f"{nomor}_chunk_{i}"
+            hash_id = hashlib.md5(chunk_id.encode('utf-8')).hexdigest()
+            
+            documents.append(c_data["text"])
+            metadatas.append(clean_metadata)
+            ids.append(hash_id)
+            
+        if documents:
+            collection = get_chroma_collection()
+            collection.add(
+                documents=documents,
+                metadatas=metadatas,
+                ids=ids
+            )
+            print(f"Successfully added {len(documents)} chunks to ChromaDB!")
+        
+        c.execute("UPDATE regulations SET status = 'Berlaku' WHERE id = ?", (doc_id,))
+        conn.commit()
+        conn.close()
+
+        # ── Knowledge Graph Extraction (real-time, FR-KG) ───────────────────
+        judul = filename.replace('.pdf', '')
+        try:
+            extract_and_store_graph(doc_id, full_text, nomor, judul, jenis)
+        except Exception as kg_err:
+            print(f"[KG] Non-fatal extraction error for {nomor}: {kg_err}")
+        return
+        
+    except Exception as e:
+        print(f"Error processing PDF: {e}")
+        try:
+            conn = sqlite3.connect(os.path.join(BASE_DIR, "data", "legal_metadata.db"), timeout=30.0)
+            c = conn.cursor()
+            c.execute("UPDATE regulations SET status = 'Gagal - Error' WHERE id = ?", (doc_id,))
+            conn.commit()
+            conn.close()
+        except:
+            pass
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Knowledge Graph Endpoints
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.get("/api/knowledge-graph")
+async def get_knowledge_graph(
+    search: str = "",
+    node_type: str = "",
+    current_user: dict = Depends(auth.require_role("manajer"))
+):
+    """Returns all KG nodes and edges for the graph visualizer."""
+    import sqlite3
+    db_path = os.path.join(BASE_DIR, "data", "legal_metadata.db")
+    conn = sqlite3.connect(db_path, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+
+    node_query = "SELECT id, label, type, doc_id FROM kg_nodes WHERE 1=1"
+    params = []
+    if search:
+        node_query += " AND label LIKE ?"
+        params.append(f"%{search}%")
+    if node_type:
+        node_query += " AND type = ?"
+        params.append(node_type)
+    node_query += " LIMIT 500"
+
+    c.execute(node_query, params)
+    nodes = [dict(r) for r in c.fetchall()]
+
+    node_ids = {n["id"] for n in nodes}
+
+    # Only return edges where both endpoints are in the node set
+    c.execute("SELECT id, source_id, target_id, relation, doc_id FROM kg_edges LIMIT 2000")
+    all_edges = c.fetchall()
+    edges = [dict(e) for e in all_edges if e["source_id"] in node_ids and e["target_id"] in node_ids]
+
+    c.execute("SELECT COUNT(*) FROM kg_nodes")
+    total_nodes = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM kg_edges")
+    total_edges = c.fetchone()[0]
+
+    conn.close()
+    return {"nodes": nodes, "edges": edges, "total_nodes": total_nodes, "total_edges": total_edges}
+
+
+def _rebuild_kg_batch():
+    """Background worker: rebuilds KG by pulling text from ChromaDB chunks.
+    Used for documents ingested via the scraper that have no local PDF files.
+    """
+    import sqlite3
+    db_path = os.path.join(BASE_DIR, "data", "legal_metadata.db")
+    conn = sqlite3.connect(db_path, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT id, nomor, jenis, judul FROM regulations WHERE status LIKE 'Berlaku%' AND id NOT IN (SELECT DISTINCT doc_id FROM kg_nodes WHERE doc_id IS NOT NULL)")
+    docs = c.fetchall()
+    conn.close()
+
+    collection = get_chroma_collection()
+    print(f"[KG Rebuild] Starting ChromaDB-based batch for {len(docs)} documents...")
+    success, failed, skipped = 0, 0, 0
+
+    for doc in docs:
+        try:
+            # Query ChromaDB for chunks that belong to this regulation
+            results = collection.query(
+                query_texts=[doc["nomor"] or doc["judul"] or ""],
+                n_results=5,
+                where={"reg_id": str(doc["id"])}
+            )
+            documents_list = results.get("documents", [[]])[0]
+            if not documents_list:
+                # fallback: try matching by nomor in metadata
+                skipped += 1
+                continue
+
+            full_text = "\n\n".join(documents_list)
+            extract_and_store_graph(
+                doc["id"], full_text,
+                doc["nomor"] or "", doc["judul"] or "", doc["jenis"] or ""
+            )
+            success += 1
+        except Exception as e:
+            print(f"[KG Rebuild] Failed for {doc['nomor']}: {e}")
+            failed += 1
+
+    print(f"[KG Rebuild] Done. Success: {success}, Skipped (no chunks): {skipped}, Failed: {failed}")
+
+
+class ScenarioAnalyzeRequest(BaseModel):
+    scenario: str
+
+@app.post("/api/knowledge-graph/analyze-scenario")
+async def analyze_kg_scenario(req: ScenarioAnalyzeRequest):
+    """
+    Uses LLM to dynamically select which node IDs are relevant to the requested scenario.
+    """
+    import sqlite3
+    db_path = os.path.join(BASE_DIR, "data", "legal_metadata.db")
+    conn = sqlite3.connect(db_path, timeout=30.0)
+    c = conn.cursor()
+    
+    # Fetch all node IDs and labels
+    c.execute("SELECT id, label FROM kg_nodes")
+    nodes = c.fetchall()
+    conn.close()
+    
+    # We only send a subset of data to avoid exceeding context if it's too large,
+    # but 1400 nodes is about ~50k chars which is perfectly fine for modern LLMs.
+    nodes_str = "\n".join([f"ID: {n[0]} | Label: {n[1]}" for n in nodes])
+    
+    messages = [
+        {"role": "system", "content": "You are an expert legal knowledge graph analyst. Your job is to return a JSON array of Node IDs that are highly relevant to the user's requested scenario. Be strict and only return nodes directly involved with the scenario."},
+        {"role": "user", "content": f"Here is the list of all nodes in our knowledge graph:\n\n{nodes_str}\n\nScenario: {req.scenario}\n\nReturn ONLY a JSON array of strings containing the exact IDs of the nodes that are highly relevant to this scenario. Example: [\"node1\", \"node2\"]. Return nothing else."}
+    ]
+    
+    try:
+        raw_response = call_glm(messages, temperature=0.1, timeout=90)
+        
+        # Parse out JSON block
+        import re
+        import json
+        match = re.search(r'\[.*?\]', raw_response, re.DOTALL)
+        if match:
+            node_ids = json.loads(match.group(0))
+            return {"status": "success", "matchedNodeIds": node_ids}
+        else:
+            return {"status": "error", "matchedNodeIds": []}
+    except Exception as e:
+        print(f"LLM Scenario Error: {e}")
+        return {"status": "error", "matchedNodeIds": []}
+
+@app.post("/api/knowledge-graph/rebuild")
+async def rebuild_knowledge_graph(
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(auth.require_role("admin"))
+):
+    """Admin-only: triggers batch KG rebuild for all existing documents."""
+    background_tasks.add_task(_rebuild_kg_batch)
+    return {"message": "Rebuild dimulai di background. Proses ini bisa memakan waktu 30-60 menit."}
+
+
+@app.delete("/api/knowledge-graph/document/{doc_id}")
+async def delete_doc_from_graph(
+    doc_id: str,
+    current_user: dict = Depends(auth.require_role("manajer"))
+):
+    """Removes all KG nodes and edges created by a specific document."""
+    import sqlite3
+    db_path = os.path.join(BASE_DIR, "data", "legal_metadata.db")
+    conn = sqlite3.connect(db_path, timeout=30.0)
+    c = conn.cursor()
+    c.execute("DELETE FROM kg_edges WHERE doc_id = ?", (doc_id,))
+    c.execute("DELETE FROM kg_nodes WHERE doc_id = ?", (doc_id,))
+    conn.commit()
+    conn.close()
+    return {"message": "Data graph untuk dokumen ini telah dihapus."}
+
+@app.get("/api/admin/dashboard")
+async def admin_dashboard(current_user: dict = Depends(auth.require_role("admin"))):
+    """FR-26: Admin-only dashboard with system stats and audit logs."""
+    import sqlite3
+    db_path = os.path.join(BASE_DIR, "data", "legal_metadata.db")
+    conn = sqlite3.connect(db_path, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+
+    # 1. Document Processing Status & Details
+    c.execute("SELECT id, judul, status, nomor FROM regulations")
+    all_docs = c.fetchall()
+    
+    doc_details = {
+        "Berlaku": [],
+        "Tidak Berlaku": [],
+        "Memproses": [],
+        "Gagal": []
+    }
+    
+    for d in all_docs:
+        s = (d["status"] or "").strip()
+        doc_obj = {"id": d["id"], "judul": d["judul"], "nomor": d["nomor"], "status": s}
+        
+        if s == "Memproses":
+            doc_details["Memproses"].append(doc_obj)
+        elif s.startswith("Gagal"):
+            doc_details["Gagal"].append(doc_obj)
+        elif s == "Tidak Berlaku" or "Dicabut" in s:
+            doc_details["Tidak Berlaku"].append(doc_obj)
+        else:
+            doc_details["Berlaku"].append(doc_obj)
+            
+    doc_status = {
+        "Berlaku": len(doc_details["Berlaku"]),
+        "Tidak Berlaku": len(doc_details["Tidak Berlaku"]),
+        "Memproses": len(doc_details["Memproses"]),
+        "Gagal": len(doc_details["Gagal"])
+    }
+
+    # 2. Document Volume by Klasifikasi
+    c.execute("SELECT klasifikasi, COUNT(*) as count FROM regulations WHERE klasifikasi IS NOT NULL GROUP BY klasifikasi")
+    klas_rows = c.fetchall()
+    doc_by_klasifikasi = {r["klasifikasi"]: r["count"] for r in klas_rows}
+
+    # 3. Document Volume by Jenis
+    c.execute("SELECT jenis, COUNT(*) as count FROM regulations GROUP BY jenis ORDER BY count DESC LIMIT 10")
+    jenis_rows = c.fetchall()
+    doc_by_jenis = [dict(r) for r in jenis_rows]
+
+    # 4. Active Access Grants count
+    c.execute("SELECT COUNT(*) FROM access_grants WHERE expires_at IS NULL OR expires_at = '' OR expires_at >= datetime('now')")
+    active_grants = c.fetchone()[0]
+
+    # 5. Recent Audit Logs (last 100)
+    c.execute("SELECT id, timestamp, user_id, action_type, resource_id, details FROM audit_logs ORDER BY id DESC LIMIT 100")
+    audit_rows = c.fetchall()
+    audit_logs = [dict(r) for r in audit_rows]
+
+    conn.close()
+
+    # 6. System Health
+    chroma_ok = False
+    try:
+        col = get_chroma_collection()
+        chroma_ok = col.count() >= 0
+    except:
+        pass
+
+    return {
+        "doc_status": doc_status,
+        "doc_details": doc_details,
+        "doc_by_klasifikasi": doc_by_klasifikasi,
+        "doc_by_jenis": doc_by_jenis,
+        "active_grants": active_grants,
+        "audit_logs": audit_logs,
+        "system_health": {
+            "sqlite": True,
+            "chromadb": chroma_ok
+        }
+    }
+
+@app.delete("/api/repository/document/{doc_id}")
+async def delete_document(doc_id: str, current_user: dict = Depends(auth.require_role("sekretaris perusahaan"))):
+    """Deletes a document from the repository."""
+    import sqlite3
+    db_path = os.path.join(BASE_DIR, "data", "legal_metadata.db")
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    
+    # Check if document exists
+    c.execute("SELECT id, local_path FROM regulations WHERE id = ?", (doc_id,))
+    doc = c.fetchone()
+    if not doc:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Dokumen tidak ditemukan")
+    
+    local_path = doc[1]
+    
+    # Delete physical file
+    if local_path and os.path.exists(local_path):
+        try:
+            os.remove(local_path)
+        except Exception as e:
+            print(f"Failed to delete file {local_path}: {e}")
+            
+    # Delete from DB
+    c.execute("DELETE FROM regulations WHERE id = ?", (doc_id,))
+    c.execute("DELETE FROM access_grants WHERE doc_id = ?", (doc_id,))
+    c.execute("DELETE FROM kg_edges WHERE doc_id = ?", (doc_id,))
+    c.execute("DELETE FROM kg_nodes WHERE doc_id = ?", (doc_id,))
+    
+    conn.commit()
+    conn.close()
+    
+    # Delete from ChromaDB
+    try:
+        collection = get_chroma_collection()
+        collection.delete(where={"reg_id": doc_id})
+    except Exception as e:
+        print(f"Failed to delete from ChromaDB: {e}")
+        
+    return {"message": "Dokumen berhasil dihapus"}
+
+@app.delete("/api/repository/failed")
+async def delete_failed_documents(current_user: dict = Depends(auth.require_role("manajer"))):
+    """Deletes all documents that failed processing (e.g., Duplicates)."""
+    import sqlite3
+    db_path = os.path.join(BASE_DIR, "data", "legal_metadata.db")
+    conn = sqlite3.connect(db_path, timeout=30.0)
+    c = conn.cursor()
+    
+    c.execute("SELECT id, local_path FROM regulations WHERE status LIKE 'Gagal%'")
+    failed_docs = c.fetchall()
+    
+    deleted_count = 0
+    for doc in failed_docs:
+        doc_id, local_path = doc
+        # Delete physical file
+        if local_path and os.path.exists(local_path):
+            try:
+                os.remove(local_path)
+            except Exception as e:
+                print(f"Error deleting file {local_path}: {e}")
+        # Delete from DB
+        c.execute("DELETE FROM regulations WHERE id = ?", (doc_id,))
+        deleted_count += 1
+        
+    conn.commit()
+    conn.close()
+    
+    return {"message": f"Berhasil menghapus {deleted_count} dokumen yang gagal."}
 
 @app.post("/api/upload")
 async def upload_document(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...), 
     doc_type: str = Form("regulations"),
-    klasifikasi: str = Form("Publik"),
+    klasifikasi: str = Form("Umum"),
     current_user: dict = Depends(auth.require_role("manajer"))
 ):
     if not file.filename.endswith('.pdf'):
@@ -1287,98 +2131,48 @@ async def upload_document(
         shutil.copyfileobj(file.file, buffer)
         
     try:
-        parser = LegalDocumentParser()
-        chunker = LegalChunker()
-        
-        full_text = parser.parse_pdf(file_path)
-        
-        # ── Duplicate Detection (FR-5) ──────────────────────────────────────
-        fingerprint_text = full_text[:1500]
-        collection = get_chroma_collection()
-        dup_results = collection.query(
-            query_texts=[fingerprint_text],
-            n_results=1
-        )
-        
-        if dup_results and dup_results['distances'] and len(dup_results['distances'][0]) > 0:
-            dist = dup_results['distances'][0][0]
-            if dist < 0.15:
-                # Cleanup temp file
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-                duplicate_judul = dup_results['metadatas'][0][0].get('judul', 'Dokumen Tidak Diketahui')
-                raise HTTPException(status_code=400, detail=f"Duplikat Terdeteksi: Dokumen ini sangat mirip dengan '{duplicate_judul}'.")
-
-        # ── Proceed with Saving ─────────────────────────────────────────────
+        # ── Proceed with Saving Metadata ─────────────────────────────────────
         db_path = os.path.join(BASE_DIR, "data", "legal_metadata.db")
-        conn = sqlite3.connect(db_path)
+        conn = sqlite3.connect(db_path, timeout=30.0)
         c = conn.cursor()
         c.execute('''CREATE TABLE IF NOT EXISTS regulations
-                     (id TEXT PRIMARY KEY, judul TEXT, pdf_url TEXT, 
-                      nomor TEXT, jenis TEXT, sektor TEXT, 
-                      status TEXT, detail_url TEXT, local_path TEXT)''')
+                     (id INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT, judul TEXT, 
+                      nomor TEXT, jenis TEXT, sektor TEXT, status TEXT, 
+                      detail_url TEXT, download_url TEXT, local_path TEXT, klasifikasi TEXT)''')
                       
         # Generate ID and Metadata
         doc_id = str(uuid.uuid4())[:8]
         judul = file.filename.replace('.pdf', '')
         nomor = f"CUSTOM-{doc_id}"
         
-        if doc_type == "internal":
+        if jenis_dokumen:
+            jenis = jenis_dokumen
+        elif doc_type == "internal":
             jenis = "Dokumen Internal"
             sektor = "Dokumen Internal"
         else:
             jenis = "Regulasi Custom"
             sektor = "Upload Manual"
-        status = "Berlaku"
+        
+        status = "Memproses" # Initialize with processing status
         
         c.execute('''INSERT OR REPLACE INTO regulations 
-                     (id, judul, pdf_url, nomor, jenis, sektor, status, detail_url, local_path, klasifikasi) 
+                     (judul, download_url, nomor, jenis, sektor, status, detail_url, local_path, klasifikasi, domain) 
                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                  (doc_id, judul, "", nomor, jenis, sektor, status, "", file_path, klasifikasi))
+                  (judul, "", nomor, jenis, sektor, status, "", file_path, klasifikasi, "Custom"))
+        # Get the actual auto-incremented ID
+        doc_id = str(c.lastrowid)
         conn.commit()
         conn.close()
         
-        print(f"File saved to DB. Now parsing and embedding: {file.filename}")
+        # Enqueue background processing task
+        background_tasks.add_task(process_document_background, file_path, doc_id, file.filename, nomor, jenis, sektor, status, klasifikasi)
         
-        # Vector DB Injection
-        base_metadata = {
-            "reg_id": doc_id,
-            "judul": judul,
-            "nomor": nomor,
-            "jenis": jenis,
-            "sektor": sektor,
-            "status": status
-        }
-        
-        chunks = chunker.chunk_document(full_text, base_metadata)
-        
-        documents = []
-        metadatas = []
-        ids = []
-        
-        for i, c_data in enumerate(chunks):
-            clean_metadata = {k: v for k, v in c_data["metadata"].items() if v is not None}
-            chunk_id = f"{nomor}_chunk_{i}"
-            hash_id = hashlib.md5(chunk_id.encode('utf-8')).hexdigest()
-            
-            documents.append(c_data["text"])
-            metadatas.append(clean_metadata)
-            ids.append(hash_id)
-            
-        if documents:
-            collection = get_chroma_collection()
-            collection.add(
-                documents=documents,
-                metadatas=metadatas,
-                ids=ids
-            )
-            print(f"Successfully added {len(documents)} chunks to ChromaDB!")
-        
-        return {"status": "success", "message": f"Successfully processed {len(documents)} logic chunks into knowledge base."}
+        return {"status": "success", "message": "Dokumen berhasil diunggah dan sedang diproses di latar belakang."}
         
     except Exception as e:
-        print(f"Error processing PDF: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to process PDF text: {str(e)}")
+        print(f"Upload error: {e}")
+        raise HTTPException(status_code=500, detail="Terjadi kesalahan saat memproses dokumen.")
 
 @app.post("/api/analyze")
 async def analyze_document(req: AnalyzeRequest):
@@ -1708,7 +2502,7 @@ def process_single_pasal(c, doc_type, pihak_1, pihak_2, sektor, pokok, collectio
             "ai_analysis": "", "supporting_regulations": supporting_regulations
         }
 
-def extract_text_multi_format(file_path: str, filename: str) -> str:
+def extract_text_multi_format(file_path: str, filename: str, use_ocr: bool = False) -> str:
     """
     Extracts text from various file formats: PDF, DOCX, XLSX, PPTX, JPG, PNG, TXT.
     Routes to the appropriate extractor based on the file extension.
@@ -1716,18 +2510,48 @@ def extract_text_multi_format(file_path: str, filename: str) -> str:
     ext = filename.lower().split('.')[-1]
     
     if ext == 'pdf':
-        return extract_text_hybrid(file_path, force_vlm=False)
+        if use_ocr:
+            print(f"  [OCR] Forcing traditional OCR extraction for {filename}")
+            import sys
+            if BASE_DIR not in sys.path:
+                sys.path.append(BASE_DIR)
+            from parser.pdf_parser import LegalDocumentParser
+            parser = LegalDocumentParser()
+            return parser.parse_pdf(file_path, force_ocr=True)
+        else:
+            return extract_text_hybrid(file_path, force_vlm=False)
         
     elif ext == 'txt':
         with open(file_path, 'r', encoding='utf-8') as f:
             return f.read()
             
     elif ext in ['jpg', 'jpeg', 'png']:
-        print(f"  [VLM] Image extraction for {filename}")
-        with open(file_path, "rb") as f:
-            img_b64 = base64.b64encode(f.read()).decode('utf-8')
-        vlm_text = call_glm_vision(img_b64, VLM_PAGE_PROMPT, timeout=60)
-        return vlm_text.strip()
+        if use_ocr:
+            print(f"  [OCR] Traditional image extraction for {filename}")
+            import sys
+            if BASE_DIR not in sys.path:
+                sys.path.append(BASE_DIR)
+            from parser.pdf_parser import LegalDocumentParser
+            parser = LegalDocumentParser()
+            if parser.ocr:
+                import numpy as np
+                from PIL import Image
+                img = Image.open(file_path).convert("RGB")
+                img_array = np.array(img)
+                result = parser.ocr.ocr(img_array, cls=False)
+                page_text = []
+                if result and result[0]:
+                    for line in result[0]:
+                        page_text.append(line[1][0])
+                return " ".join(page_text)
+            else:
+                return "[OCR GAGAL INISIALISASI]"
+        else:
+            print(f"  [VLM] Image extraction for {filename}")
+            with open(file_path, "rb") as f:
+                img_b64 = base64.b64encode(f.read()).decode('utf-8')
+            vlm_text = call_glm_vision(img_b64, VLM_PAGE_PROMPT, timeout=60)
+            return vlm_text.strip()
         
     elif ext == 'docx':
         try:
@@ -1781,7 +2605,7 @@ def extract_text_multi_format(file_path: str, filename: str) -> str:
 
 
 @app.post("/api/check-compliance")
-async def check_compliance(file: UploadFile = File(...)):
+async def check_compliance(file: UploadFile = File(...), use_ocr: str = Form("false")):
     """
     Accepts a document upload (PDF, DOCX, XLSX, PPTX, JPG, PNG, TXT), extracts text, 
     and uses a multi-step LLM pipeline to cross-check clauses against the OJK repository.
@@ -1801,7 +2625,8 @@ async def check_compliance(file: UploadFile = File(...)):
     try:
         # ── Pass 0: Multi-Format Extraction ──────────────────────────────────
         print(f"[Compliance] Starting extraction for: {file.filename}")
-        full_text = extract_text_multi_format(temp_path, file.filename)
+        is_ocr = use_ocr.lower() == "true"
+        full_text = extract_text_multi_format(temp_path, file.filename, use_ocr=is_ocr)
         text_snippet = full_text[:35000]
 
         if len(text_snippet.strip()) < 100:
@@ -1911,7 +2736,173 @@ async def check_compliance(file: UploadFile = File(...)):
             try: os.remove(temp_path)
             except: pass
 
+class KGExclusionCreate(BaseModel):
+    entity_name: str
+
+@app.get("/api/admin/kg-exclusions")
+async def get_kg_exclusions(current_user: dict = Depends(auth.require_role("admin"))):
+    """FR-30: Get all entity exclusions"""
+    import sqlite3
+    db_path = os.path.join(BASE_DIR, "data", "legal_metadata.db")
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    c.execute("SELECT id, entity_name, created_at FROM kg_exclusions ORDER BY created_at DESC")
+    exclusions = [{"id": row[0], "entity_name": row[1], "created_at": row[2]} for row in c.fetchall()]
+    conn.close()
+    return {"exclusions": exclusions}
+
+@app.post("/api/admin/kg-exclusions")
+async def add_kg_exclusion(req: KGExclusionCreate, current_user: dict = Depends(auth.require_role("admin"))):
+    """FR-30: Add entity exclusion and optionally delete existing nodes"""
+    import sqlite3
+    
+    entity_name = req.entity_name.strip()
+    if not entity_name:
+        raise HTTPException(status_code=400, detail="Entity name is required")
+        
+    db_path = os.path.join(BASE_DIR, "data", "legal_metadata.db")
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    try:
+        # Add to exclusion list
+        c.execute("INSERT INTO kg_exclusions (entity_name) VALUES (?)", (entity_name,))
+        
+        # Auto-cleanup: Delete any existing nodes with this exact label (case-insensitive)
+        c.execute("SELECT id FROM kg_nodes WHERE LOWER(label) = LOWER(?)", (entity_name,))
+        nodes_to_delete = [row[0] for row in c.fetchall()]
+        
+        deleted_nodes = len(nodes_to_delete)
+        deleted_edges = 0
+        
+        if nodes_to_delete:
+            placeholders = ",".join(["?"] * len(nodes_to_delete))
+            # Delete connected edges
+            c.execute(f"DELETE FROM kg_edges WHERE source_id IN ({placeholders}) OR target_id IN ({placeholders})", nodes_to_delete + nodes_to_delete)
+            deleted_edges = c.rowcount
+            # Delete the nodes
+            c.execute(f"DELETE FROM kg_nodes WHERE id IN ({placeholders})", nodes_to_delete)
+            
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.close()
+        raise HTTPException(status_code=400, detail="Entity already in exclusion list")
+    except Exception as e:
+        conn.close()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+        
+    return {"message": "Success", "deleted_nodes": deleted_nodes, "deleted_edges": deleted_edges}
+
+@app.delete("/api/admin/kg-exclusions/{exc_id}")
+async def delete_kg_exclusion(exc_id: int, current_user: dict = Depends(auth.require_role("admin"))):
+    """FR-30: Remove entity exclusion"""
+    import sqlite3
+    db_path = os.path.join(BASE_DIR, "data", "legal_metadata.db")
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    c.execute("DELETE FROM kg_exclusions WHERE id = ?", (exc_id,))
+    conn.commit()
+    conn.close()
+    return {"message": "Deleted successfully"}
+
+# ── FR-31: System Monitoring (Insinyur TI) ──────────────────────────────────
+import psutil
+import shutil
+import time
+from datetime import datetime
+
+@app.get("/api/engineer/health")
+async def get_system_health(current_user: dict = Depends(auth.require_exact_role("insinyur ti"))):
+    """FR-31: Fetch real-time system health metrics"""
+    cpu_percent = psutil.cpu_percent(interval=0.5)
+    mem = psutil.virtual_memory()
+    disk = psutil.disk_usage('/')
+    
+    # DB File sizes
+    db_metadata_path = os.path.join(BASE_DIR, "data", "legal_metadata.db")
+    db_users_path = os.path.join(BASE_DIR, "data", "users.db")
+    
+    metadata_size = os.path.getsize(db_metadata_path) if os.path.exists(db_metadata_path) else 0
+    users_size = os.path.getsize(db_users_path) if os.path.exists(db_users_path) else 0
+
+    return {
+        "cpu": cpu_percent,
+        "memory": {
+            "total": mem.total,
+            "used": mem.used,
+            "percent": mem.percent
+        },
+        "disk": {
+            "total": disk.total,
+            "used": disk.used,
+            "percent": disk.percent
+        },
+        "database": {
+            "metadata_db_mb": round(metadata_size / (1024 * 1024), 2),
+            "users_db_mb": round(users_size / (1024 * 1024), 2)
+        },
+        "uptime_seconds": int(time.time() - psutil.boot_time())
+    }
+
+@app.get("/api/engineer/queue")
+async def get_processing_queue(current_user: dict = Depends(auth.require_exact_role("insinyur ti"))):
+    """FR-31: Mock processing queue based on recent audit logs"""
+    import sqlite3
+    db_path = os.path.join(BASE_DIR, "data", "legal_metadata.db")
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    c.execute("SELECT user_id, action_type, resource_id, timestamp FROM audit_logs WHERE action_type IN ('UPLOAD_DOCUMENT', 'DELETE_DOCUMENT', 'REBUILD_GRAPH') ORDER BY timestamp DESC LIMIT 10")
+    recent_tasks = [{"user": row[0], "action": row[1], "resource": row[2], "timestamp": row[3], "status": "COMPLETED"} for row in c.fetchall()]
+    conn.close()
+    
+    return {"active_tasks": [], "recent_history": recent_tasks}
+
+@app.get("/api/engineer/backups")
+async def get_backups(current_user: dict = Depends(auth.require_exact_role("insinyur ti"))):
+    """FR-31: List existing backups in the data directory"""
+    data_dir = os.path.join(BASE_DIR, "data")
+    backups = []
+    if os.path.exists(data_dir):
+        for f in os.listdir(data_dir):
+            if f.endswith('.db') and 'backup' in f:
+                path = os.path.join(data_dir, f)
+                backups.append({
+                    "filename": f,
+                    "size_mb": round(os.path.getsize(path) / (1024 * 1024), 2),
+                    "created_at": datetime.fromtimestamp(os.path.getctime(path)).isoformat()
+                })
+    return {"backups": sorted(backups, key=lambda x: x['created_at'], reverse=True)}
+
+@app.post("/api/engineer/backup")
+async def create_backup(current_user: dict = Depends(auth.require_exact_role("insinyur ti"))):
+    """FR-31: Manually trigger SQLite database backups"""
+    import sqlite3
+    data_dir = os.path.join(BASE_DIR, "data")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    dbs = ["legal_metadata.db", "users.db"]
+    created_backups = []
+    
+    for db_name in dbs:
+        src = os.path.join(data_dir, db_name)
+        if os.path.exists(src):
+            dst_name = db_name.replace('.db', f'_backup_{timestamp}.db')
+            dst = os.path.join(data_dir, dst_name)
+            
+            # Use SQLite backup API for safe copy
+            src_conn = sqlite3.connect(src)
+            dst_conn = sqlite3.connect(dst)
+            with dst_conn:
+                src_conn.backup(dst_conn)
+            dst_conn.close()
+            src_conn.close()
+            
+            created_backups.append(dst_name)
+            
+    return {"message": "Backup successful", "files": created_backups}
+
 if __name__ == "__main__":
     import uvicorn
     # Natively running on port 8000
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
