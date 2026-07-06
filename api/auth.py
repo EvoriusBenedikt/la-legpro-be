@@ -9,9 +9,11 @@ import bcrypt
 import jwt
 
 # --- Config ---
-SECRET_KEY = os.getenv("JWT_SECRET", "super-secret-lintasarta-key-2026")
+SECRET_KEY = os.getenv("JWT_SECRET")
+if not SECRET_KEY:
+    raise RuntimeError("JWT_SECRET environment variable is not set. Cannot start without a secure key.")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7 # 7 days
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 # 24 hours
 
 security = HTTPBearer()
 
@@ -200,10 +202,12 @@ def require_exact_role(exact_role: str):
     return role_dependency
 
 # --- Schemas ---
+from pydantic import Field
+
 class UserCreate(BaseModel):
     username: str
     email: str
-    password: str
+    password: str = Field(..., min_length=8)
     role: Optional[str] = "pengguna"
 
 class UserLogin(BaseModel):
@@ -226,15 +230,15 @@ def register(user: UserCreate):
     hashed_password = get_password_hash(user.password)
     
     c.execute("INSERT INTO users (id, username, password_hash, email, role) VALUES (?, ?, ?, ?, ?)", 
-              (user_id, user.username, hashed_password, user.email, user.role.lower()))
+              (user_id, user.username, hashed_password, user.email, "pengguna"))
     conn.commit()
     conn.close()
     
     access_token = create_access_token(
-        data={"sub": user_id, "username": user.username, "email": user.email, "role": user.role.lower()}, 
+        data={"sub": user_id, "username": user.username, "email": user.email, "role": "pengguna"}, 
         expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     )
-    return {"access_token": access_token, "token_type": "bearer", "user": {"id": user_id, "username": user.username, "email": user.email, "role": user.role.lower()}}
+    return {"access_token": access_token, "token_type": "bearer", "user": {"id": user_id, "username": user.username, "email": user.email, "role": "pengguna"}}
 
 @router.post("/login")
 def login(user: UserLogin):

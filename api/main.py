@@ -436,26 +436,7 @@ def is_transient_network_error(err: Exception | None) -> bool:
     ]
     return any(marker in text for marker in transient_markers)
 
-def extract_pasal_items(text: str, max_items: int = 20, max_chars_per_pasal: int = 900) -> List[dict]:
-    """
-    Extract Pasal blocks from document text.
-    Supports both Arabic and Roman numerals, e.g., "Pasal 3" and "PASAL III".
-    """
-    # Normalize line endings and spacing around line breaks for stable regex matching.
-    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
-    normalized = re.sub(r'[ \t]+\n', '\n', normalized)
-    normalized = re.sub(r'\n{3,}', '\n\n', normalized)
 
-    # Strict heading match first (line-based)
-    pasal_matches = list(re.finditer(r'(?im)^\s*pasal\s+((?:\d+|[ivxlcdm]+))\b', normalized))
-    # Fallback for documents where line breaks are collapsed by extractor
-    if not pasal_matches:
-        pasal_matches = list(re.finditer(r'(?i)\bpasal\s+((?:\d+|[ivxlcdm]+))\b', normalized))
-
-    pasal_items = []
-    for idx, match in enumerate(pasal_matches):
-        pasal_no_raw = match.group(1).upper()
-        pasal_label = f"Pasal {pasal_no_raw}"
 def extract_pasal_items(text: str, max_items: int = 20, max_chars_per_pasal: int = 900) -> List[dict]:
     """
     Primary: regex-based Pasal extractor (fast, zero API cost).
@@ -2116,6 +2097,15 @@ async def upload_document(
     if not file.filename.endswith('.pdf'):
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
         
+    MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
+    # check file size without reading into memory completely if possible
+    file.file.seek(0, 2)
+    file_size = file.file.tell()
+    file.file.seek(0)
+    
+    if file_size > MAX_FILE_SIZE:
+        raise HTTPException(status_code=413, detail="File too large (max 50MB)")
+        
     import sqlite3
     import uuid
     from datetime import datetime
@@ -2145,9 +2135,7 @@ async def upload_document(
         judul = file.filename.replace('.pdf', '')
         nomor = f"CUSTOM-{doc_id}"
         
-        if jenis_dokumen:
-            jenis = jenis_dokumen
-        elif doc_type == "internal":
+        if doc_type == "internal":
             jenis = "Dokumen Internal"
             sektor = "Dokumen Internal"
         else:
@@ -2615,6 +2603,14 @@ async def check_compliance(file: UploadFile = File(...), use_ocr: str = Form("fa
     
     if ext not in allowed_exts:
         raise HTTPException(status_code=400, detail="Format file tidak didukung. Harap unggah PDF, DOCX, XLSX, PPTX, JPG, PNG, atau TXT.")
+        
+    MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
+    file.file.seek(0, 2)
+    file_size = file.file.tell()
+    file.file.seek(0)
+    
+    if file_size > MAX_FILE_SIZE:
+        raise HTTPException(status_code=413, detail="File too large (max 50MB)")
         
     upload_id = str(uuid.uuid4())[:8]
     temp_path = os.path.join(PDFS_DIR, f"temp_check_{upload_id}_{file.filename}")
