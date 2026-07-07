@@ -7,7 +7,7 @@ services:
       dockerfile: Dockerfile
     container_name: legpro-backend
     ports:
-      - "8000:8000"
+      - "8080:8000"
     volumes:
       # Persist SQLite and ChromaDB data
       - ./data:/app/data
