@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: legpro-backend
+    ports:
+      - "8000:8000"
+    volumes:
+      # Persist SQLite and ChromaDB data
+      - ./data:/app/data
+      # Mount .env so host changes reflect inside container
+      - ./.env:/app/.env
+    environment:
+      - PYTHONUNBUFFERED=1
