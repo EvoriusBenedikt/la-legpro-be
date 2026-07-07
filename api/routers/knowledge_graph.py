@@ -3,7 +3,6 @@ import sqlite3, os, json
 from pydantic import BaseModel
 import auth
 from services.llm_client import call_glm
-from main import get_chroma_collection, extract_and_store_graph
 
 router = APIRouter(prefix="/api/knowledge-graph", tags=["kg"])
 
@@ -55,6 +54,7 @@ async def get_knowledge_graph(
 
 
 def _rebuild_kg_batch():
+    from api.main import get_chroma_collection, extract_and_store_graph
     """Background worker: rebuilds KG by pulling text from ChromaDB chunks.
     Used for documents ingested via the scraper that have no local PDF files.
     """

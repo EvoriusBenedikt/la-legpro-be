@@ -1,0 +1,39 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: legpro-backend
+    ports:
+      - "8000:8000"
+    volumes:
+      # Persist SQLite and ChromaDB data
+      - ./data:/app/data
+      # Mount .env so host changes reflect inside container
+      - ./.env:/app/.env
+    # Optionally mount source code for hot-reloading if you run uvicorn with --reload
+    # - .:/app
+    environment:
+      - PYTHONUNBUFFERED=1
+
+  frontend:
+    build:
+      context: ../la-legpro-fe
+      dockerfile: Dockerfile
+    container_name: legpro-frontend
+    ports:
+      - "5173:5173"
+    volumes:
+      # Mount source for Vite HMR (Hot Module Replacement)
+      - ../la-legpro-fe/src:/app/src
+      - ../la-legpro-fe/public:/app/public
+      - ../la-legpro-fe/index.html:/app/index.html
+      - ../la-legpro-fe/vite.config.ts:/app/vite.config.ts
+    environment:
+      # Vite requires CHOKIDAR_USEPOLLING=true in some Docker Windows environments for HMR
+      - CHOKIDAR_USEPOLLING=true
+      - VITE_API_URL=http://localhost:8000
+    depends_on:
+      - backend

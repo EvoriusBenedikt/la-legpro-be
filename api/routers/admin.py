@@ -94,7 +94,7 @@ async def admin_dashboard(current_user: dict = Depends(auth.require_role("admin"
         }
     }
 
-@app.delete("/api/repository/document/{doc_id}")
+@router.delete("/repository/document/{doc_id}")
 async def delete_document(doc_id: str, current_user: dict = Depends(auth.require_role("sekretaris perusahaan"))):
     """Deletes a document from the repository."""
     import sqlite3
@@ -116,7 +116,7 @@ async def get_kg_exclusions(current_user: dict = Depends(auth.require_role("admi
     return {"exclusions": exclusions}
 
 @router.post("/kg-exclusions")
-async def add_kg_exclusion(req: KGExclusionCreate, current_user: dict = Depends(auth.require_role("admin"))):
+async def add_kg_exclusion(req: KGExclusion, current_user: dict = Depends(auth.require_role("admin"))):
     """FR-30: Add entity exclusion and optionally delete existing nodes"""
     import sqlite3
     

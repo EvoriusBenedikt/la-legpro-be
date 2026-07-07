@@ -8,7 +8,7 @@ router = APIRouter(prefix="/api", tags=["repository"])
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-class GrantAccessRequest(BaseModel):
+class AccessGrantRequest(BaseModel):
     target_user_id: int
     expires_in_days: int = 7
 
