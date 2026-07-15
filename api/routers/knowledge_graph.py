@@ -6,7 +6,7 @@ from services.llm_client import call_glm
 
 router = APIRouter(prefix="/api/knowledge-graph", tags=["kg"])
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 class ScenarioRequest(BaseModel):
     scenario: str

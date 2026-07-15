@@ -1,21 +1,41 @@
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, BackgroundTasks
-import sqlite3, os, json, time, re
+import sqlite3, os, json, time, re, uuid, shutil, base64
+from datetime import datetime
+from dateutil.relativedelta import relativedelta
+import concurrent.futures
 from typing import List, Optional, Any
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 import auth
 import chromadb
 from services.llm_client import call_glm
+from services.llm_client import call_glm
 
 router = APIRouter(prefix="/api", tags=["compliance"])
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+PDFS_DIR = os.path.join(BASE_DIR, "data", "pdfs")
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+CHROMA_DB_DIR = os.path.join(BASE_DIR, "data", "chroma_db")
+
+def get_chroma_collection():
+    client = chromadb.PersistentClient(path=CHROMA_DB_DIR)
+    return client.get_or_create_collection(
+        name="ojk_regulations",
+        metadata={"hnsw:space": "cosine"}
+    )
 
 class AnalyzeRequest(BaseModel):
-    doc_id: int
+    reg_id: Optional[str] = None
+    nomor: str
+    judul: str
+    filename: Optional[str] = None
 
-class PasalAnalyzeRequest(BaseModel):
-    doc_id: int
-    pasals: List[str]
+    @field_validator('reg_id', 'nomor', 'judul', mode='before')
+    @classmethod
+    def coerce_to_str(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        return str(v)
 
 @router.post("/upload")
 async def upload_document(
@@ -84,7 +104,8 @@ async def upload_document(
         conn.commit()
         conn.close()
         
-        # Enqueue background processing task
+        # Launch async background task for actual text extraction and chunking
+        from routers.repository import process_document_background
         background_tasks.add_task(process_document_background, file_path, doc_id, file.filename, nomor, jenis, sektor, status, klasifikasi)
         
         return {"status": "success", "message": "Dokumen berhasil diunggah dan sedang diproses di latar belakang."}
@@ -311,6 +332,7 @@ def process_single_pasal(c, doc_type, pihak_1, pihak_2, sektor, pokok, collectio
     relevant_refs = []
 
     if sr and sr.get('documents') and len(sr['documents'][0]) > 0:
+        from main import is_regulation_relevant
         for i in range(len(sr['documents'][0])):
             dist = sr['distances'][0][i]
             if dist < COSINE_THRESHOLD:
@@ -422,6 +444,7 @@ def process_single_pasal(c, doc_type, pihak_1, pihak_2, sektor, pokok, collectio
         }
 
 def extract_text_multi_format(file_path: str, filename: str, use_ocr: bool = False) -> str:
+    from main import extract_text_hybrid, call_glm_vision, VLM_PAGE_PROMPT
     """
     Extracts text from various file formats: PDF, DOCX, XLSX, PPTX, JPG, PNG, TXT.
     Routes to the appropriate extractor based on the file extension.
@@ -550,7 +573,8 @@ async def check_compliance(file: UploadFile = File(...), use_ocr: str = Form("fa
         shutil.copyfileobj(file.file, buffer)
         
     try:
-        # ── Pass 0: Multi-Format Extraction ──────────────────────────────────
+        # 🔍 Pass 0: Multi-Format Extraction 🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍
+        from main import understand_document, extract_signing_date, extract_duration_months, extract_explicit_end_date, extract_pasal_items, llm_extract_pasal_items
         print(f"[Compliance] Starting extraction for: {file.filename}")
         is_ocr = use_ocr.lower() == "true"
         full_text = extract_text_multi_format(temp_path, file.filename, use_ocr=is_ocr)
@@ -663,8 +687,3 @@ async def check_compliance(file: UploadFile = File(...), use_ocr: str = Form("fa
             try: os.remove(temp_path)
             except: pass
 
-class KGExclusionCreate(BaseModel):
-    entity_name: str
-    import uvicorn
-    # Natively running on port 8000
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)

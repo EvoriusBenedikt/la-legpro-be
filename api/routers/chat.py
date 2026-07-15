@@ -8,19 +8,18 @@ from services.llm_client import call_glm
 
 router = APIRouter(prefix="/api", tags=["chat"])
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 class ChatMessage(BaseModel):
     role: str
     content: str
 
 class ChatRequest(BaseModel):
-    message: str
-    history: List[ChatMessage] = []
+    messages: List[ChatMessage] = []
 
 class ChatResponse(BaseModel):
-    response: str
-    citations: List[dict] = []
+    answer: str
+    sources: List[dict] = []
 
 class SessionRequest(BaseModel):
     title: str
@@ -40,11 +39,12 @@ async def chat_endpoint(req: ChatRequest, current_user: dict = Depends(auth.get_
     if not req.messages:
         raise HTTPException(status_code=400, detail="Messages array cannot be empty")
         
-    last_user_message = next((m["content"] for m in reversed(req.messages) if m["role"] == "user"), None)
+    last_user_message = next((m.content for m in reversed(req.messages) if m.role == "user"), None)
     if not last_user_message:
         raise HTTPException(status_code=400, detail="Missing user message")
 
     # 1. Retrieve Semantic Context
+    from main import retrieve_contexts, retrieve_graph_contexts, log_audit
     contexts = retrieve_contexts(last_user_message, current_user=current_user)
     
     # FR-16: 1.5 Retrieve Graph Context
@@ -54,14 +54,14 @@ async def chat_endpoint(req: ChatRequest, current_user: dict = Depends(auth.get_
     context_str = ""
     sources_to_return = []
     for i, c in enumerate(contexts):
-        sources_to_return.append(Source(
-            id=c['id'],
-            jenis=c['jenis'],
-            nomor=c['nomor'],
-            sektor=c['sektor'],
-            judul=c['judul'],
-            snippet=c['text']
-        ))
+        sources_to_return.append({
+            "id": c['id'],
+            "jenis": c['jenis'],
+            "nomor": c['nomor'],
+            "sektor": c['sektor'],
+            "judul": c['judul'],
+            "snippet": c['text']
+        })
         context_str += f"SUMBER [{i+1}]: {c['jenis']} Nomor {c['nomor']}\nTEKS:\n{c['text']}\n\n"
 
     if graph_context:

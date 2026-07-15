@@ -6,7 +6,8 @@ import auth
 
 router = APIRouter(prefix="/api", tags=["repository"])
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+PDFS_DIR = os.path.join(BASE_DIR, "data", "pdfs")
 
 class AccessGrantRequest(BaseModel):
     target_user_id: int
@@ -20,7 +21,7 @@ async def serve_pdf(filename: str):
     The frontend decodes the base64 and creates a blob:// URL to render in an iframe.
     """
     import base64
-    safe_filename = os.path.basename(filename)  # prevent path traversal
+    safe_filename = os.path.basename(filename.replace("\\", "/"))  # prevent path traversal
     file_path = os.path.join(PDFS_DIR, safe_filename)
     if not os.path.isfile(file_path):
         raise HTTPException(status_code=404, detail=f"PDF '{safe_filename}' not found")
@@ -169,6 +170,7 @@ async def grant_document_access(
     conn.close()
     
     # FR-25: Audit log the grant
+    from main import log_audit
     log_audit(current_user.get("id", ""), "GRANT_ACCESS", doc_id, 
               f"Diberikan kepada: {req.granted_to}, Dokumen: {doc_judul}, Alasan: {req.reason}")
     
@@ -228,11 +230,13 @@ async def revoke_grant(grant_id: str, current_user: dict = Depends(auth.get_curr
     conn.commit()
     conn.close()
     
+    from main import log_audit
     log_audit(current_user.get("id", ""), "REVOKE_ACCESS", row[0], f"Akses dicabut dari: {row[1]}")
     return {"message": "Akses berhasil dicabut."}
 
 def process_document_background(file_path: str, doc_id: str, filename: str, nomor: str, jenis: str, sektor: str, status: str, klasifikasi: str):
     try:
+        from pdf_parser import LegalDocumentParser
         parser = LegalDocumentParser()
         full_text = parser.parse_pdf(file_path)
         
@@ -244,6 +248,7 @@ def process_document_background(file_path: str, doc_id: str, filename: str, nomo
         
         recommended_klasifikasi = "Umum"
         try:
+            from main import call_glm
             raw_content = call_glm(messages, temperature=0.1, timeout=30)
             raw_content = raw_content.lower()
             if "terbatas" in raw_content:
@@ -276,6 +281,7 @@ def process_document_background(file_path: str, doc_id: str, filename: str, nomo
 
 def ingest_document_background(file_path: str, doc_id: str, filename: str, nomor: str, jenis: str, sektor: str, status: str, klasifikasi: str):
     try:
+        from pdf_parser import LegalDocumentParser, LegalChunker
         parser = LegalDocumentParser()
         chunker = LegalChunker()
         
@@ -283,6 +289,7 @@ def ingest_document_background(file_path: str, doc_id: str, filename: str, nomor
         
         # ── Duplicate Detection (FR-5) ──────────────────────────────────────
         fingerprint_text = full_text[:1500]
+        from main import get_chroma_collection
         collection = get_chroma_collection()
         dup_results = collection.query(
             query_texts=[fingerprint_text],
@@ -348,6 +355,7 @@ def ingest_document_background(file_path: str, doc_id: str, filename: str, nomor
         # ── Knowledge Graph Extraction (real-time, FR-KG) ───────────────────
         judul = filename.replace('.pdf', '')
         try:
+            from main import extract_and_store_graph
             extract_and_store_graph(doc_id, full_text, nomor, judul, jenis)
         except Exception as kg_err:
             print(f"[KG] Non-fatal extraction error for {nomor}: {kg_err}")
@@ -368,3 +376,61 @@ def ingest_document_background(file_path: str, doc_id: str, filename: str, nomor
 # Knowledge Graph Endpoints
 # ─────────────────────────────────────────────────────────────────────────────
 
+
+@router.delete(/repository/document/{doc_id})
+async def delete_document(doc_id: str, current_user: dict = Depends(auth.require_role(sekretaris perusahaan))):
+    "Deletes a document from the repository."
+    import sqlite3
+    db_path = os.path.join(BASE_DIR, data, legal_metadata.db)
+    conn = sqlite3.connect(db_path, timeout=30.0)
+    c = conn.cursor()
+    
+    # Check if doc exists
+    c.execute(SELECT id, local_path, judul FROM regulations WHERE id = ?, (doc_id,))
+    doc = c.fetchone()
+    if not doc:
+        conn.close()
+        raise HTTPException(status_code=404, detail=Dokumen tidak ditemukan.)
+    
+    local_path = doc[1]
+    judul = doc[2]
+    
+    # 1. Delete physical PDF
+    if local_path and os.path.exists(local_path):
+        try:
+            os.remove(local_path)
+        except Exception as e:
+            print(fError deleting file {local_path}: {e})
+            
+    # 2. Delete from ChromaDB
+    try:
+        from main import get_chroma_collection
+        collection = get_chroma_collection()
+        collection.delete(where={reg_id: doc_id})
+    except Exception as e:
+        print(fError deleting from ChromaDB: {e})
+        
+    # 3. Delete from Knowledge Graph
+    try:
+        c.execute(DELETE FROM kg_nodes WHERE doc_id = ?, (doc_id,))
+        c.execute(DELETE FROM kg_edges WHERE source_doc_id = ? OR target_doc_id = ?, (doc_id, doc_id))
+    except Exception as e:
+        print(fError deleting from KG: {e})
+        
+    # 4. Delete Access Grants
+    try:
+        c.execute(DELETE FROM access_grants WHERE doc_id = ?, (doc_id,))
+    except Exception as e:
+        pass
+        
+    # 5. Delete Document Record
+    c.execute(DELETE FROM regulations WHERE id = ?, (doc_id,))
+    
+    conn.commit()
+    conn.close()
+    
+    # 6. Audit Log
+    from main import log_audit
+    log_audit(current_user.get(id, "), DELETE_DOCUMENT, doc_id, fMenghapus dokumen: {judul})
+ 
+ return {message: Dokumen berhasil dihapus.}

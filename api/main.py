@@ -294,6 +294,13 @@ app.include_router(history.router, prefix="/api", tags=["history"])
 app.include_router(internal_docs.router, prefix="/api", tags=["internal_docs"])
 app.include_router(templates.router, prefix="/api", tags=["templates"])
 
+app.include_router(admin.router)
+app.include_router(engineer.router)
+app.include_router(chat.router)
+app.include_router(repository.router)
+app.include_router(knowledge_graph.router)
+app.include_router(compliance.router)
+
 # Serve local PDFs as static files
 PDFS_DIR = os.path.join(BASE_DIR, "data", "pdfs")
 os.makedirs(PDFS_DIR, exist_ok=True)
@@ -368,6 +375,7 @@ async def confirm_pending_document(
     conn.close()
     
     # Trigger vector DB injection and KG asynchronously
+    from routers.repository import ingest_document_background
     filename = os.path.basename(local_path)
     background_tasks.add_task(ingest_document_background, local_path, doc_id, filename, nomor, jenis, sektor, 'Berlaku', req.klasifikasi)
     
@@ -1167,6 +1175,7 @@ def retrieve_contexts(query: str, current_user: dict, n_results=5, doc_category=
     # 2. Fetch Explicit Access Grants & Document Classification Map
     granted_doc_ids = set()
     doc_klasifikasi_map = {}
+    import sqlite3
     db_path = os.path.join(BASE_DIR, "data", "legal_metadata.db")
     try:
         conn = sqlite3.connect(db_path)
