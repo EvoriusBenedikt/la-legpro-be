@@ -60,7 +60,8 @@ async def chat_endpoint(req: ChatRequest, current_user: dict = Depends(auth.get_
             "nomor": c['nomor'],
             "sektor": c['sektor'],
             "judul": c['judul'],
-            "snippet": c['text']
+            "snippet": c['text'],
+            "rerank_score": c.get('rerank_score')
         })
         context_str += f"SUMBER [{i+1}]: {c['jenis']} Nomor {c['nomor']}\nTEKS:\n{c['text']}\n\n"
 
