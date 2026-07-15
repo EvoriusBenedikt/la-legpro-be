@@ -1,0 +1,7 @@
+Peraturan Pemerintah Nomor 5 Tahun 2021 tentang Penyelenggaraan Perizinan Berusaha Berbasis Risiko (OSS-RBA)
+
+PP ini mengatur sistem perizinan berusaha berbasis risiko melalui sistem OSS (Online Single Submission).
+
+Klasifikasi risiko usaha: Risiko Rendah mendapat Nomor Induk Berusaha (NIB); Risiko Menengah Rendah mendapat NIB + Sertifikat Standar; Risiko Menengah Tinggi mendapat NIB + Sertifikat Standar terverifikasi; Risiko Tinggi mendapat NIB + Izin.
+
+NIB berlaku sebagai: Tanda Daftar Perusahaan (TDP), Angka Pengenal Impor (API), dan Hak Akses Kepabeanan.

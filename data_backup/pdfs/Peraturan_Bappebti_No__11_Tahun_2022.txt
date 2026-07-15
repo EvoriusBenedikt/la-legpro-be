@@ -1,0 +1,6 @@
+Peraturan Bappebti tentang Penetapan Daftar Aset Kripto yang Diperdagangkan di Pasar Fisik Aset Kripto
+
+BAB I KETENTUAN UMUM
+1. Perdagangan Berjangka Komoditi diawasi oleh Badan Pengawas Perdagangan Berjangka Komoditi (Bappebti).
+2. Aset Kripto (Crypto Asset) adalah Komoditi tidak berwujud yang berbentuk digital, menggunakan kriptografi, dan jaringan peer-to-peer.
+3. Apakah aset kripto diawasi oleh OJK atau Bappebti? Pengawasan dan pengaturan perdagangan Aset Kripto di Indonesia berada di bawah kewenangan Bappebti, bukan Otoritas Jasa Keuangan (OJK).

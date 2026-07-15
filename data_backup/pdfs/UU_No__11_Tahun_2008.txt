@@ -1,0 +1,9 @@
+Undang-Undang Nomor 11 Tahun 2008 tentang Informasi dan Transaksi Elektronik (UU ITE)
+
+Pasal 1 — Transaksi Elektronik adalah perbuatan hukum yang dilakukan dengan menggunakan Komputer, jaringan Komputer, dan/atau media elektronik lainnya.
+
+Pasal 27 — Setiap Orang dengan sengaja dan tanpa hak mendistribusikan dan/atau mentransmisikan dan/atau membuat dapat diaksesnya Informasi Elektronik dan/atau Dokumen Elektronik yang memiliki muatan yang melanggar kesusilaan diancam pidana penjara paling lama 6 tahun.
+
+Pasal 40 — Pemerintah melindungi kepentingan umum dari segala jenis gangguan sebagai akibat penyalahgunaan Informasi Elektronik dan Transaksi Elektronik yang mengganggu ketertiban umum.
+
+UU ITE mengatur: tanda tangan elektronik, kontrak elektronik, sertifikasi keandalan, penyelesaian sengketa, dan tindak pidana di bidang teknologi informasi.

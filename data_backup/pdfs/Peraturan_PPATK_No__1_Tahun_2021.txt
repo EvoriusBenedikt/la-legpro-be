@@ -1,0 +1,14 @@
+Peraturan PPATK tentang Prinsip Mengenali Pengguna Jasa (Know Your Customer / KYC)
+
+Customer Due Diligence (CDD) atau Prinsip Mengenali Pengguna Jasa mencakup:
+a. Identifikasi pengguna jasa dan/atau beneficial owner;
+b. Verifikasi identitas pengguna jasa menggunakan dokumen yang sah;
+c. Pemahaman tujuan hubungan usaha;
+d. Pemantauan transaksi secara berkelanjutan.
+
+Enhanced Due Diligence (EDD) wajib diterapkan untuk:
+- Nasabah Politically Exposed Person (PEP);
+- Transaksi lintas batas negara berisiko tinggi;
+- Nasabah dengan profil berisiko tinggi.
+
+Transaksi Keuangan Mencurigakan (TKM) harus dilaporkan ke PPATK dalam 3 hari kerja setelah diketahui.
