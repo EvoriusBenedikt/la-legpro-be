@@ -1,0 +1,9 @@
+Undang-Undang Nomor 8 Tahun 2010 tentang Pencegahan dan Pemberantasan Tindak Pidana Pencucian Uang (TPPU)
+
+Pasal 1 — Pencucian Uang adalah segala perbuatan yang memenuhi unsur-unsur tindak pidana sesuai dengan ketentuan dalam Undang-Undang ini.
+
+Pasal 3 — Setiap Orang yang menempatkan, mentransfer, mengalihkan, membelanjakan, membayarkan, menghibahkan, menitipkan, membawa ke luar negeri, mengubah bentuk, menukarkan dengan mata uang atau surat berharga atau perbuatan lain atas Harta Kekayaan yang diketahuinya atau patut diduganya merupakan hasil tindak pidana dipidana penjara paling lama 20 tahun.
+
+Pasal 17 — Pihak Pelapor wajib: menerapkan Prinsip Mengenali Pengguna Jasa (KYC/CDD); melaporkan Transaksi Keuangan Mencurigakan (TKM); melaporkan Transaksi Keuangan Tunai (TKT) di atas Rp500 juta.
+
+Pihak Pelapor meliputi: Penyedia Jasa Keuangan (PJK), Penyedia Barang dan/atau Jasa lain (PBJ) seperti agen properti, dealer otomotif, pedagang emas permata, notaris, pengacara, dan akuntan.
