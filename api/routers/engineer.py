@@ -7,7 +7,7 @@ import auth
 
 router = APIRouter(prefix="/api/engineer", tags=["engineer"])
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 @router.get("/health")

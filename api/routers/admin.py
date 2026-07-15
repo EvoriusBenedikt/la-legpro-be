@@ -7,7 +7,7 @@ import auth
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 class KGExclusion(BaseModel):
     entity_name: str
@@ -76,10 +76,12 @@ async def admin_dashboard(current_user: dict = Depends(auth.require_role("admin"
     # 6. System Health
     chroma_ok = False
     try:
-        col = get_chroma_collection()
+        import chromadb
+        client = chromadb.PersistentClient(path=os.path.join(BASE_DIR, "data", "chroma_db"))
+        col = client.get_or_create_collection("ojk_regulations")
         chroma_ok = col.count() >= 0
-    except:
-        pass
+    except Exception as e:
+        print(f"Chroma health check failed: {e}")
 
     return {
         "doc_status": doc_status,
@@ -93,15 +95,6 @@ async def admin_dashboard(current_user: dict = Depends(auth.require_role("admin"
             "chromadb": chroma_ok
         }
     }
-
-@router.delete("/repository/document/{doc_id}")
-async def delete_document(doc_id: str, current_user: dict = Depends(auth.require_role("sekretaris perusahaan"))):
-    """Deletes a document from the repository."""
-    import sqlite3
-    db_path = os.path.join(BASE_DIR, "data", "legal_metadata.db")
-    conn = sqlite3.connect(db_path)
-    c = conn.cursor()
-    
 
 @router.get("/kg-exclusions")
 async def get_kg_exclusions(current_user: dict = Depends(auth.require_role("admin"))):
