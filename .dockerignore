@@ -1,8 +1,5 @@
 data/
-__pycache__/
-*.pyc
-.env
-.venv/
 venv/
-env/
+__pycache__/
+.env
 .git/

@@ -91,46 +91,79 @@ class LegalDocumentParser:
 
 class LegalChunker:
     def __init__(self):
-        # We split by 'BAB' followed by Roman numerals OR 'Pasal' followed by numbers
-        # The positive lookahead (?=...) keeps the delimiter in the chunk
-        self.split_pattern = re.compile(r'(?=\b(?:BAB\s+[IVXLCDM]+|Pasal\s+\d+)\b)', flags=re.IGNORECASE | re.MULTILINE)
+        # We will split text into sentences for fine-grained chunking
+        self.sentence_pattern = re.compile(r'(?<=[.!?])\s+')
 
-    def chunk_document(self, text, doc_metadata=None):
+    def chunk_document(self, text, doc_metadata=None, document_summary=""):
         """
-        Splits the document logically by BAB or Pasal.
+        Splits the document into small indexed chunks (approx 100 tokens / 500 chars)
+        but attaches a large surrounding context window (approx 400 tokens / 2000 chars)
+        to the metadata for retrieval. Also prepends the document summary to the indexed text.
         """
-        raw_chunks = self.split_pattern.split(text)
+        # Split into raw sentences and filter empties
+        sentences = [s.strip() for s in self.sentence_pattern.split(text) if s.strip()]
         
         chunks = []
-        current_chunk = ""
+        SMALL_CHUNK_TARGET = 500  # approx 100 tokens
+        WINDOW_TARGET = 2000      # approx 400 tokens
+
+        # Precompute character lengths for fast window sliding
+        lengths = [len(s) for s in sentences]
         
-        for c in raw_chunks:
-            c_strip = c.strip()
-            if not c_strip:
+        i = 0
+        while i < len(sentences):
+            # 1. Build the small indexed chunk
+            small_chunk_text = ""
+            small_chunk_sentences = 0
+            while i + small_chunk_sentences < len(sentences) and len(small_chunk_text) < SMALL_CHUNK_TARGET:
+                small_chunk_text += sentences[i + small_chunk_sentences] + " "
+                small_chunk_sentences += 1
+                
+            if not small_chunk_text.strip():
+                i += 1
                 continue
                 
-            # If the chunk is too small, just append to current (it might be a false positive or just a header)
-            if len(c_strip) < 50 and not re.search(r'\b(?:BAB\s+|Pasal\s+)', c_strip, re.IGNORECASE):
-                current_chunk += " " + c_strip
-            else:
-                if current_chunk:
-                    chunks.append(self._clean_chunk(current_chunk, doc_metadata))
-                current_chunk = c_strip
-                
-        if current_chunk:
-            chunks.append(self._clean_chunk(current_chunk, doc_metadata))
+            # 2. Build the surrounding window context
+            # We want to grab sentences before and after to reach WINDOW_TARGET
+            window_text = small_chunk_text
+            left_idx = i - 1
+            right_idx = i + small_chunk_sentences
+            
+            # Expand outwards until window size is reached
+            while len(window_text) < WINDOW_TARGET and (left_idx >= 0 or right_idx < len(sentences)):
+                if left_idx >= 0:
+                    window_text = sentences[left_idx] + " " + window_text
+                    left_idx -= 1
+                if len(window_text) >= WINDOW_TARGET:
+                    break
+                if right_idx < len(sentences):
+                    window_text = window_text + " " + sentences[right_idx]
+                    right_idx += 1
+
+            # 3. Apply Contextual Enrichment
+            enriched_indexed_text = small_chunk_text.strip()
+            if document_summary:
+                enriched_indexed_text = f"RINGKASAN DOKUMEN: {document_summary}\n\nPOTONGAN TEKS: {enriched_indexed_text}"
+
+            # 4. Save the chunk
+            meta = doc_metadata.copy() if doc_metadata else {}
+            meta["window_context"] = window_text.strip()
+            
+            chunks.append({
+                "text": enriched_indexed_text,
+                "metadata": meta
+            })
+            
+            # Move forward by the small chunk size (this creates natural overlap 
+            # in the window_context but unique indexed anchors)
+            i += max(1, small_chunk_sentences)
             
         return chunks
-        
+
     def _clean_chunk(self, chunk_text, metadata):
-        """Clean up the chunk and attach metadata."""
-        # Clean extra spaces
+        # Kept for backward compatibility if needed, though unused in new flow
         clean_text = re.sub(r'\s+', ' ', chunk_text).strip()
-        
-        return {
-            "text": clean_text,
-            "metadata": metadata or {}
-        }
+        return {"text": clean_text, "metadata": metadata or {}}
 
 if __name__ == "__main__":
     import glob

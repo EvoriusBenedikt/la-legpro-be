@@ -287,7 +287,7 @@ def ingest_document_background(file_path: str, doc_id: str, filename: str, nomor
         
         full_text = parser.parse_pdf(file_path)
         
-        # ── Duplicate Detection (FR-5) ──────────────────────────────────────
+        # Duplicate Detection (FR-5) 
         fingerprint_text = full_text[:1500]
         from main import get_chroma_collection
         collection = get_chroma_collection()
@@ -296,6 +296,9 @@ def ingest_document_background(file_path: str, doc_id: str, filename: str, nomor
             n_results=1
         )
         
+        import sqlite3
+        import os
+        BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         db_path = os.path.join(BASE_DIR, "data", "legal_metadata.db")
         conn = sqlite3.connect(db_path, timeout=30.0)
         c = conn.cursor()
@@ -313,6 +316,21 @@ def ingest_document_background(file_path: str, doc_id: str, filename: str, nomor
 
         print(f"File saved to DB. Now parsing and embedding: {filename}")
         
+        # Contextual Enrichment - Generate Global Document Summary
+        document_summary = ""
+        try:
+            from main import call_glm
+            summary_prompt = (
+                "Buatlah ringkasan singkat (maksimal 2 kalimat) yang menjelaskan tentang apa dokumen ini, "
+                "siapa pihak yang terlibat, dan apa topik utamanya. "
+                "Tujuan ringkasan ini adalah untuk memberikan konteks global pada potongan-potongan kecil teks dokumen.\\n\\n"
+                f"TEKS DOKUMEN (Bagian Awal):\\n{full_text[:4000]}"
+            )
+            document_summary = call_glm([{"role": "user", "content": summary_prompt}], temperature=0.1, timeout=30)
+            print(f"Generated contextual summary: {document_summary}")
+        except Exception as e:
+            print(f"Warning: Failed to generate document summary: {e}")
+
         # Vector DB Injection
         base_metadata = {
             "reg_id": doc_id,
@@ -323,7 +341,7 @@ def ingest_document_background(file_path: str, doc_id: str, filename: str, nomor
             "status": status
         }
         
-        chunks = chunker.chunk_document(full_text, base_metadata)
+        chunks = chunker.chunk_document(full_text, base_metadata, document_summary=document_summary)
         
         documents = []
         metadatas = []
@@ -347,12 +365,22 @@ def ingest_document_background(file_path: str, doc_id: str, filename: str, nomor
                 ids=ids
             )
             print(f"Successfully added {len(documents)} chunks to ChromaDB!")
+            
+            # Sparse Retrieval Injection (BM25 FTS5)
+            try:
+                fts_records = []
+                for idx, c_data in zip(ids, chunks):
+                    w_ctx = c_data["metadata"].get("window_context", "")
+                    fts_records.append((idx, doc_id, c_data["text"], w_ctx))
+                c.executemany("INSERT INTO chunks_fts (chunk_id, doc_id, text, window_context) VALUES (?, ?, ?, ?)", fts_records)
+            except Exception as e:
+                print(f"Failed to inject into chunks_fts: {e}")
         
         c.execute("UPDATE regulations SET status = 'Berlaku' WHERE id = ?", (doc_id,))
         conn.commit()
         conn.close()
 
-        # ── Knowledge Graph Extraction (real-time, FR-KG) ───────────────────
+        # Knowledge Graph Extraction (real-time, FR-KG)
         judul = filename.replace('.pdf', '')
         try:
             from main import extract_and_store_graph
@@ -364,6 +392,9 @@ def ingest_document_background(file_path: str, doc_id: str, filename: str, nomor
     except Exception as e:
         print(f"Error processing PDF: {e}")
         try:
+            import sqlite3
+            import os
+            BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
             conn = sqlite3.connect(os.path.join(BASE_DIR, "data", "legal_metadata.db"), timeout=30.0)
             c = conn.cursor()
             c.execute("UPDATE regulations SET status = 'Gagal - Error' WHERE id = ?", (doc_id,))
@@ -377,60 +408,61 @@ def ingest_document_background(file_path: str, doc_id: str, filename: str, nomor
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-@router.delete(/repository/document/{doc_id})
-async def delete_document(doc_id: str, current_user: dict = Depends(auth.require_role(sekretaris perusahaan))):
-    "Deletes a document from the repository."
+@router.delete("/repository/document/{doc_id}")
+async def delete_document(doc_id: str, current_user: dict = Depends(auth.require_role("sekretaris perusahaan"))):
+    """Deletes a document from the repository."""
     import sqlite3
-    db_path = os.path.join(BASE_DIR, data, legal_metadata.db)
+    db_path = os.path.join(BASE_DIR, "data", "legal_metadata.db")
     conn = sqlite3.connect(db_path, timeout=30.0)
     c = conn.cursor()
     
     # Check if doc exists
-    c.execute(SELECT id, local_path, judul FROM regulations WHERE id = ?, (doc_id,))
-    doc = c.fetchone()
-    if not doc:
+    c.execute("SELECT local_path, judul FROM regulations WHERE id = ?", (doc_id,))
+    row = c.fetchone()
+    if not row:
         conn.close()
-        raise HTTPException(status_code=404, detail=Dokumen tidak ditemukan.)
+        raise HTTPException(status_code=404, detail="Not Found")
+        
+    local_path, judul = row
     
-    local_path = doc[1]
-    judul = doc[2]
-    
-    # 1. Delete physical PDF
+    # 1. Delete physical file
     if local_path and os.path.exists(local_path):
         try:
             os.remove(local_path)
         except Exception as e:
-            print(fError deleting file {local_path}: {e})
+            print(f"Error deleting file {local_path}: {e}")
             
-    # 2. Delete from ChromaDB
+    # 2. Delete from ChromaDB & FTS
     try:
         from main import get_chroma_collection
         collection = get_chroma_collection()
-        collection.delete(where={reg_id: doc_id})
+        collection.delete(where={"reg_id": doc_id})
+        
+        c.execute("DELETE FROM chunks_fts WHERE doc_id = ?", (doc_id,))
     except Exception as e:
-        print(fError deleting from ChromaDB: {e})
+        print(f"Error deleting from ChromaDB/FTS: {e}")
         
     # 3. Delete from Knowledge Graph
     try:
-        c.execute(DELETE FROM kg_nodes WHERE doc_id = ?, (doc_id,))
-        c.execute(DELETE FROM kg_edges WHERE source_doc_id = ? OR target_doc_id = ?, (doc_id, doc_id))
+        c.execute("DELETE FROM kg_nodes WHERE doc_id = ?", (doc_id,))
+        c.execute("DELETE FROM kg_edges WHERE source_doc_id = ? OR target_doc_id = ?", (doc_id, doc_id))
     except Exception as e:
-        print(fError deleting from KG: {e})
+        print(f"Error deleting from KG: {e}")
         
     # 4. Delete Access Grants
     try:
-        c.execute(DELETE FROM access_grants WHERE doc_id = ?, (doc_id,))
+        c.execute("DELETE FROM access_grants WHERE doc_id = ?", (doc_id,))
     except Exception as e:
         pass
         
     # 5. Delete Document Record
-    c.execute(DELETE FROM regulations WHERE id = ?, (doc_id,))
+    c.execute("DELETE FROM regulations WHERE id = ?", (doc_id,))
     
     conn.commit()
     conn.close()
     
     # 6. Audit Log
     from main import log_audit
-    log_audit(current_user.get(id, "), DELETE_DOCUMENT, doc_id, fMenghapus dokumen: {judul})
+    log_audit(current_user.get("id", ""), "DELETE_DOCUMENT", doc_id, f"Menghapus dokumen: {judul}")
  
- return {message: Dokumen berhasil dihapus.}
+    return {"message": "Dokumen berhasil dihapus."}

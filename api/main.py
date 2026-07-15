@@ -152,6 +152,10 @@ def init_main_db():
         for dt in default_types:
             c.execute("INSERT INTO document_taxonomy (name) VALUES (?)", (dt,))
 
+    # Sparse Retrieval Index (BM25)
+    c.execute('''CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+        chunk_id, doc_id UNINDEXED, text, window_context UNINDEXED
+    )''')
     
     conn.commit()
     conn.close()
@@ -404,6 +408,18 @@ def get_chroma_collection():
             metadata={"hnsw:space": "cosine"}
         )
     return _collection
+
+_cross_encoder = None
+
+def get_reranker():
+    global _cross_encoder
+    if _cross_encoder is None:
+        import os
+        from sentence_transformers import CrossEncoder
+        model_name = os.environ.get("RERANKER_MODEL_NAME", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+        print(f"Initializing CrossEncoder reranker: {model_name}")
+        _cross_encoder = CrossEncoder(model_name, max_length=512)
+    return _cross_encoder
 
 def get_glm_session() -> requests.Session:
     """Build a reusable HTTP session with transport-level retries."""
@@ -1251,39 +1267,136 @@ def retrieve_contexts(query: str, current_user: dict, n_results=5, doc_category=
                         return contexts
                     # If it exceeds 25,000 chars, we DO NOT return contexts here. 
                     # We let it fall through to the standard chunk-based RAG below so the LLM gets the most relevant snippets instead of just the first 25k chars.
-                    
-    # Fallback to standard chunk-based RAG
-    results = collection.query(
+    # Fallback to Hybrid Retrieval (Dense + BM25 Sparse) & RRF
+    chunk_data = {}
+    dense_ranks = {}
+    sparse_ranks = {}
+    
+    # --- 1. Dense Retrieval (ChromaDB) ---
+    dense_res = collection.query(
         query_texts=[query],
         n_results=overfetch_n,
         where=where_clause
     )
     
-    if results and results['documents']:
-        for i in range(len(results['documents'][0])):
-            meta = results['metadatas'][0][i]
+    dense_rank = 1
+    if dense_res and dense_res['documents']:
+        for i in range(len(dense_res['documents'][0])):
+            meta = dense_res['metadatas'][0][i]
             reg_id = meta.get("reg_id")
             
-            # Apply Security Filter (FR-17)
             if not is_allowed(reg_id):
                 continue
                 
-            doc = results['documents'][0][i]
-            id_str = results['ids'][0][i]
+            chunk_id = dense_res['ids'][0][i]
+            base_doc = dense_res['documents'][0][i]
+            window_doc = meta.get('window_context', base_doc)
             
-            contexts.append({
-                "id": id_str,
-                "text": doc,
+            dense_ranks[chunk_id] = dense_rank
+            chunk_data[chunk_id] = {
+                "id": chunk_id,
+                "text": window_doc,
                 "jenis": meta.get('jenis', ''),
                 "nomor": meta.get('nomor', ''),
                 "sektor": meta.get('sektor', ''),
                 "judul": meta.get('judul', '')
-            })
+            }
+            dense_rank += 1
+
+    # --- 2. Sparse Retrieval (SQLite FTS5 BM25) ---
+    import string
+    # Clean query for FTS MATCH syntax to avoid OperationalErrors
+    safe_query = query.replace('"', '').replace("'", "")
+    safe_query = " OR ".join([word for word in safe_query.split() if len(word) > 2])
+    
+    try:
+        conn = sqlite3.connect(db_path, timeout=5.0)
+        c = conn.cursor()
+        
+        # We fetch extra because we still need to filter by is_allowed
+        c.execute("""
+            SELECT chunk_id, doc_id, text, window_context
+            FROM chunks_fts 
+            WHERE chunks_fts MATCH ? 
+            ORDER BY rank 
+            LIMIT ?
+        """, (safe_query, overfetch_n * 2))
+        
+        sparse_rank = 1
+        for row in c.fetchall():
+            chunk_id, doc_id, text, window_context = row
+            if not is_allowed(doc_id):
+                continue
+                
+            sparse_ranks[chunk_id] = sparse_rank
             
-            # Stop once we have enough authorized chunks
-            if len(contexts) >= n_results:
-                break
+            # If Chroma didn't find this chunk, we need to populate its data
+            if chunk_id not in chunk_data:
+                # To get metadata like 'judul', we query the main table
+                c.execute("SELECT judul, nomor, jenis, sektor FROM regulations WHERE id = ?", (doc_id,))
+                reg_row = c.fetchone()
+                if reg_row:
+                    judul, nomor, jenis, sektor = reg_row
+                    chunk_data[chunk_id] = {
+                        "id": chunk_id,
+                        "text": window_context if window_context else text,
+                        "jenis": jenis or '',
+                        "nomor": nomor or '',
+                        "sektor": sektor or '',
+                        "judul": judul or ''
+                    }
+            sparse_rank += 1
             
+        conn.close()
+    except Exception as e:
+        print(f"BM25 Sparse Retrieval Error: {e}")
+
+    # --- 3. Reciprocal Rank Fusion (RRF) ---
+    k = 60
+    rrf_scores = {}
+    
+    unique_chunk_ids = set(dense_ranks.keys()).union(set(sparse_ranks.keys()))
+    for cid in unique_chunk_ids:
+        score = 0.0
+        if cid in dense_ranks:
+            score += 1.0 / (k + dense_ranks[cid])
+        if cid in sparse_ranks:
+            score += 1.0 / (k + sparse_ranks[cid])
+        rrf_scores[cid] = score
+        
+    # Sort by descending RRF score, take top 15 for Reranking
+    ranked_chunks = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)[:15]
+    
+    # Extract candidate dictionaries
+    candidates = []
+    for cid, score in ranked_chunks:
+        if cid in chunk_data:
+            candidates.append(chunk_data[cid])
+            
+    # --- 4. Cross-Encoder Reranking ---
+    if candidates:
+        try:
+            reranker = get_reranker()
+            # Prepare pairs: (query, text)
+            # Use the base text or window_context for scoring
+            pairs = [[query, cand["text"]] for cand in candidates]
+            
+            # Predict scores
+            scores = reranker.predict(pairs)
+            
+            # Attach scores to candidates
+            for idx, score in enumerate(scores):
+                candidates[idx]["rerank_score"] = float(score)
+                
+            # Sort candidates by rerank_score descending
+            candidates = sorted(candidates, key=lambda x: x.get("rerank_score", 0), reverse=True)
+        except Exception as e:
+            print(f"Reranking failed, falling back to RRF sort: {e}")
+            
+    # Build final context list
+    for cand in candidates[:n_results]:
+        contexts.append(cand)
+        
     return contexts
 
 def retrieve_graph_contexts(query: str, current_user: dict, max_nodes=10) -> str:
