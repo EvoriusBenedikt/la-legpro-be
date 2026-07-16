@@ -212,3 +212,50 @@ def delete_compliance_report(report_id: str, current_user: dict = Depends(get_cu
     conn.commit()
     conn.close()
     return {"status": "deleted"}
+
+@router.post("/trigger-compliance-alerts")
+def test_alerts(current_user: dict = Depends(get_current_user)):
+    from services.alert_scheduler import check_expiring_contracts
+    try:
+        check_expiring_contracts()
+        return {"message": "Alerts check completed successfully. Check logs/email."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/compliance-history/{report_id}/calendar")
+def export_calendar(report_id: str, current_user: dict = Depends(get_current_user)):
+    from fastapi.responses import Response
+    import datetime
+    
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT company_name, expiration_date FROM compliance_history WHERE id = ? AND user_id = ?", 
+              (report_id, current_user["id"]))
+    row = c.fetchone()
+    conn.close()
+    
+    if not row or not row["expiration_date"]:
+        raise HTTPException(status_code=404, detail="Expiration date not found for this report.")
+        
+    company_name = row["company_name"] or "Contract"
+    expiry_date_str = row["expiration_date"]
+    
+    try:
+        dt = datetime.datetime.strptime(expiry_date_str, "%Y-%m-%d")
+        dt_start = dt.strftime("%Y%m%d")
+        dt_end = (dt + datetime.timedelta(days=1)).strftime("%Y%m%d")
+        now_str = datetime.datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
+        
+        ics_content = f"BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//LegalAnalyzer//ContractMonitor//EN\n"
+        ics_content += f"BEGIN:VEVENT\nUID:{report_id}@legal-analyzer.com\nDTSTAMP:{now_str}\n"
+        ics_content += f"DTSTART;VALUE=DATE:{dt_start}\nDTEND;VALUE=DATE:{dt_end}\n"
+        ics_content += f"SUMMARY:Contract Expiry: {company_name}\n"
+        ics_content += f"DESCRIPTION:Contract with {company_name} is expiring on {expiry_date_str}.\n"
+        ics_content += f"END:VEVENT\nEND:VCALENDAR"
+
+        return Response(content=ics_content, media_type="text/calendar", headers={
+            "Content-Disposition": f"attachment; filename=contract_expiry_{company_name.replace(' ', '_')}.ics"
+        })
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format in database")
+

@@ -72,6 +72,11 @@ from pdf_parser import LegalDocumentParser, LegalChunker
 # Setup FastAPI App
 app = FastAPI(title="Legal Analyzer API")
 
+@app.on_event("startup")
+def startup_event():
+    from services.alert_scheduler import start_scheduler
+    start_scheduler()
+
 # ── Init DB for metadata ────────────────────────────────────────────────────
 def init_main_db():
     import sqlite3
