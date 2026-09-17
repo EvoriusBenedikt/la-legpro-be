@@ -228,6 +228,15 @@ def require_exact_role(exact_role: str):
 # --- Schemas ---
 from pydantic import Field, field_validator
 
+def validate_password_strength(v: str) -> str:
+    """Shared rule: at least one number and one symbol (no length floor)."""
+    import re
+    if not re.search(r"\d", v):
+        raise ValueError("Password must contain at least one number")
+    if not re.search(r"[^A-Za-z0-9]", v):
+        raise ValueError("Password must contain at least one symbol")
+    return v
+
 class UserCreate(BaseModel):
     username: str
     email: str
@@ -237,12 +246,16 @@ class UserCreate(BaseModel):
     @field_validator("password")
     @classmethod
     def password_must_have_symbol_and_number(cls, v: str) -> str:
-        import re
-        if not re.search(r"\d", v):
-            raise ValueError("Password must contain at least one number")
-        if not re.search(r"[^A-Za-z0-9]", v):
-            raise ValueError("Password must contain at least one symbol")
-        return v
+        return validate_password_strength(v)
+
+class PasswordChange(BaseModel):
+    old_password: str
+    new_password: str = Field(...)
+
+    @field_validator("new_password")
+    @classmethod
+    def new_password_must_have_symbol_and_number(cls, v: str) -> str:
+        return validate_password_strength(v)
 
 class UserLogin(BaseModel):
     username: str
@@ -298,6 +311,24 @@ def login(user: UserLogin):
         expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     )
     return {"access_token": access_token, "token_type": "bearer", "user": {"id": row["id"], "username": row["username"], "email": row["email"], "role": role}}
+
+@router.post("/change-password")
+def change_password(data: PasswordChange, current_user: dict = Depends(get_current_user)):
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT password_hash FROM users WHERE id = ?", (current_user["id"],))
+    row = c.fetchone()
+    if not row or not verify_password(data.old_password, row["password_hash"]):
+        conn.close()
+        raise HTTPException(status_code=401, detail="Current password is incorrect")
+    if verify_password(data.new_password, row["password_hash"]):
+        conn.close()
+        raise HTTPException(status_code=400, detail="New password must be different from the current password")
+    c.execute("UPDATE users SET password_hash = ? WHERE id = ?",
+              (get_password_hash(data.new_password), current_user["id"]))
+    conn.commit()
+    conn.close()
+    return {"message": "Password updated successfully"}
 
 @router.get("/me")
 def read_users_me(current_user: dict = Depends(get_current_user)):

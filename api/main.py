@@ -17,7 +17,7 @@ from pydantic import BaseModel, field_validator
 import auth
 from routers import admin, engineer
 from routers import chat, repository, knowledge_graph
-from routers import compliance
+from routers import compliance, taxonomy
 from typing import List, Optional, Any
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -72,10 +72,121 @@ from pdf_parser import LegalDocumentParser, LegalChunker
 # Setup FastAPI App
 app = FastAPI(title="Legal Analyzer API")
 
+# ── In-memory API stats for monitoring (FR-31) ──────────────────────────────
+API_STATS: dict = {}  # {route: {"total": int, "errors": int}}
+ACTIVE_TASKS: dict = {} # {task_id: {"name": str, "status": str, "start_time": datetime, "end_time": Optional[datetime]}}
+
+@app.middleware("http")
+async def track_api_stats(request, call_next):
+    route = request.url.path
+    if route not in API_STATS:
+        API_STATS[route] = {"total": 0, "errors": 0}
+    API_STATS[route]["total"] += 1
+    response = await call_next(request)
+    if response.status_code >= 400:
+        API_STATS[route]["errors"] += 1
+    return response
+
 @app.on_event("startup")
 def startup_event():
     from services.alert_scheduler import start_scheduler
     start_scheduler()
+
+import asyncio
+import psutil
+
+async def system_metrics_loop():
+    # Initial pause to let startup finish
+    await asyncio.sleep(10)
+    while True:
+        try:
+            cpu = psutil.cpu_percent(interval=None)
+            mem = psutil.virtual_memory()
+            disk = psutil.disk_usage('/')
+            
+            db_metadata_path = os.path.join(BASE_DIR, "data", "legal_metadata.db")
+            db_users_path = os.path.join(BASE_DIR, "data", "users.db")
+            
+            metadata_size = os.path.getsize(db_metadata_path) / (1024 * 1024) if os.path.exists(db_metadata_path) else 0
+            users_size = os.path.getsize(db_users_path) / (1024 * 1024) if os.path.exists(db_users_path) else 0
+            
+            import sqlite3
+            conn = sqlite3.connect(db_metadata_path)
+            c = conn.cursor()
+            c.execute("INSERT INTO system_metrics (cpu, ram, disk, metadata_db_mb, users_db_mb) VALUES (?, ?, ?, ?, ?)", 
+                      (cpu, mem.percent, disk.percent, metadata_size, users_size))
+            conn.commit()
+            
+            # Keep only last 2880 records (48 hours at 1 minute intervals)
+            c.execute("DELETE FROM system_metrics WHERE id NOT IN (SELECT id FROM system_metrics ORDER BY id DESC LIMIT 2880)")
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"Metrics loop error: {e}")
+            
+        await asyncio.sleep(60)
+
+async def backup_scheduler_loop():
+    await asyncio.sleep(20)
+    while True:
+        try:
+            config_path = os.path.join(BASE_DIR, "data", "backup_config.json")
+            if os.path.exists(config_path):
+                with open(config_path, "r") as f:
+                    config = json.load(f)
+                
+                # Format: {"frequency": "daily", "time": "02:00", "retention_count": 5}
+                now = datetime.now()
+                target_time = config.get("time", "02:00")
+                if now.strftime("%H:%M") == target_time:
+                    # check if we already backed up today
+                    data_dir = os.path.join(BASE_DIR, "data")
+                    today = now.strftime("%Y%m%d")
+                    already_backed_up = False
+                    for file in os.listdir(data_dir):
+                        if today in file and 'backup' in file:
+                            already_backed_up = True
+                            break
+                            
+                    if not already_backed_up:
+                        timestamp = now.strftime("%Y%m%d_%H%M%S")
+                        dbs = ["legal_metadata.db", "users.db"]
+                        import sqlite3
+                        for db_name in dbs:
+                            src = os.path.join(data_dir, db_name)
+                            if os.path.exists(src):
+                                dst_name = db_name.replace('.db', f'_backup_{timestamp}.db')
+                                dst = os.path.join(data_dir, dst_name)
+                                src_conn = sqlite3.connect(src)
+                                dst_conn = sqlite3.connect(dst)
+                                with dst_conn:
+                                    src_conn.backup(dst_conn)
+                                dst_conn.close()
+                                src_conn.close()
+                                
+                        # Delete older backups exceeding retention
+                        retention = int(config.get("retention_count", 5))
+                        backups = []
+                        for file in os.listdir(data_dir):
+                            if 'backup' in file and file.endswith('.db'):
+                                backups.append(file)
+                        backups.sort(reverse=True) # newest first
+                        
+                        # Note: we have 2 files per backup run (metadata and users). Retention 5 means 10 files.
+                        max_files = retention * 2
+                        if len(backups) > max_files:
+                            for old_file in backups[max_files:]:
+                                os.remove(os.path.join(data_dir, old_file))
+                                
+        except Exception as e:
+            print(f"Backup loop error: {e}")
+            
+        await asyncio.sleep(60)
+
+@app.on_event("startup")
+async def async_startup_event():
+    asyncio.create_task(system_metrics_loop())
+    asyncio.create_task(backup_scheduler_loop())
 
 # ── Init DB for metadata ────────────────────────────────────────────────────
 def init_main_db():
@@ -130,6 +241,36 @@ def init_main_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         entity_name TEXT UNIQUE NOT NULL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )''')
+    
+    # FR-31: System metrics for history
+    c.execute('''CREATE TABLE IF NOT EXISTS system_metrics (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        cpu REAL,
+        ram REAL,
+        disk REAL,
+        metadata_db_mb REAL,
+        users_db_mb REAL
+    )''')
+    
+    # FR-31: LLM Tracking & KG History (Nice to Have)
+    c.execute('''CREATE TABLE IF NOT EXISTS llm_metrics (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        endpoint TEXT NOT NULL,
+        tokens_used INTEGER,
+        latency_ms INTEGER,
+        cost_estimate REAL,
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS kg_rebuild_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        start_time TIMESTAMP,
+        end_time TIMESTAMP,
+        duration_s INTEGER,
+        nodes_changed INTEGER,
+        edges_changed INTEGER,
+        status TEXT
     )''')
     
     # FR-29: Document Taxonomy
@@ -309,6 +450,7 @@ app.include_router(chat.router)
 app.include_router(repository.router)
 app.include_router(knowledge_graph.router)
 app.include_router(compliance.router)
+app.include_router(taxonomy.router, prefix="/api", tags=["taxonomy"])
 
 # Serve local PDFs as static files
 PDFS_DIR = os.path.join(BASE_DIR, "data", "pdfs")
@@ -316,10 +458,21 @@ os.makedirs(PDFS_DIR, exist_ok=True)
 # NOTE: We do NOT use app.mount(StaticFiles) because Starlette mounts bypass CORS middleware.
 # Instead we use a regular route below (/api/pdf/{filename}) which correctly gets CORS headers.
 
-# Setup CORS to allow frontend communication
+# Setup CORS to allow frontend communication.
+# Tightened: explicit origins (wildcard "*" is rejected by browsers when
+# allow_credentials=True, so credentials never worked cross-origin anyway).
+# Override per environment, e.g. ALLOWED_ORIGINS="https://app.example.com,http://localhost:5173"
+ALLOWED_ORIGINS = [
+    o.strip()
+    for o in os.getenv(
+        "ALLOWED_ORIGINS",
+        "https://legal-analyzer.lintasarta.dev,http://localhost:5173,http://localhost:3000,http://localhost",
+    ).split(",")
+    if o.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # For prototype purposes
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -940,9 +1093,22 @@ def call_glm_vision(image_b64: str, prompt: str, timeout: int = 90) -> str:
         "temperature": 0.0,
         "stream": False
     }
+    import time, sqlite3
+    start_time = time.time()
     resp = get_glm_session().post(url, json=payload, headers=headers, timeout=(15, timeout))
+    latency_ms = int((time.time() - start_time) * 1000)
+
     if resp.ok:
-        return resp.json()["choices"][0]["message"]["content"]
+        data = resp.json()
+        tokens = data.get("usage", {}).get("total_tokens", 0)
+        cost = (tokens / 1000.0) * 0.001
+        try:
+            db_path = os.path.join(BASE_DIR, "data", "legal_metadata.db")
+            with sqlite3.connect(db_path) as conn:
+                conn.execute("INSERT INTO llm_metrics (endpoint, tokens_used, latency_ms, cost_estimate) VALUES (?, ?, ?, ?)", ("vlm_vision", tokens, latency_ms, cost))
+        except Exception:
+            pass
+        return data["choices"][0]["message"]["content"]
     print(f"VLM page extraction failed: {resp.status_code} {resp.text[:200]}")
     return ""
 
@@ -1144,8 +1310,11 @@ def call_glm(messages: list, temperature: float = 0.1, timeout: int = 90) -> str
 
     for attempt in range(1, max_attempts + 1):
         try:
+            import time, sqlite3
+            start_time = time.time()
             # Tuple timeout: (connect_timeout, read_timeout)
             resp = session.post(url, json=payload, headers=headers, timeout=(15, timeout))
+            latency_ms = int((time.time() - start_time) * 1000)
 
             if not resp.ok:
                 # Include truncated upstream body to speed up debugging bad credentials/model/payload.
@@ -1156,7 +1325,16 @@ def call_glm(messages: list, temperature: float = 0.1, timeout: int = 90) -> str
                     detail=GENERIC_GLM_ERROR_MESSAGE
                 )
 
-            return resp.json()["choices"][0]["message"]["content"]
+            data = resp.json()
+            tokens = data.get("usage", {}).get("total_tokens", 0)
+            cost = (tokens / 1000.0) * 0.001
+            try:
+                db_path = os.path.join(BASE_DIR, "data", "legal_metadata.db")
+                with sqlite3.connect(db_path) as conn:
+                    conn.execute("INSERT INTO llm_metrics (endpoint, tokens_used, latency_ms, cost_estimate) VALUES (?, ?, ?, ?)", ("chat_completions", tokens, latency_ms, cost))
+            except Exception:
+                pass
+            return data["choices"][0]["message"]["content"]
         except HTTPException:
             raise
         except requests.exceptions.RequestException as e:
