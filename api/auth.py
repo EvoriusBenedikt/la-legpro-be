@@ -94,6 +94,17 @@ def init_db():
     except sqlite3.OperationalError:
         pass
 
+    # FR-31: Active Session Tracking
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS active_sessions (
+            user_id TEXT PRIMARY KEY,
+            username TEXT,
+            role TEXT,
+            last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            ip_address TEXT
+        )
+    ''')
+
     # Seed dummy templates if empty
     c.execute('SELECT COUNT(*) FROM document_templates')
     if c.fetchone()[0] == 0:
@@ -161,12 +172,25 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         user_id: str = payload.get("sub")
         if user_id is None:
             raise HTTPException(status_code=401, detail="Invalid authentication credentials")
-        return {
-            "id": user_id, 
-            "username": payload.get("username"), 
+        user_data = {
+            "id": user_id,
+            "username": payload.get("username"),
             "email": payload.get("email"),
             "role": payload.get("role", "pengguna")
         }
+        # FR-31: Refresh last_seen for active session tracking
+        try:
+            conn = get_db_connection()
+            conn.execute(
+                "INSERT INTO active_sessions (user_id, username, role, last_seen) VALUES (?, ?, ?, CURRENT_TIMESTAMP) "
+                "ON CONFLICT(user_id) DO UPDATE SET last_seen=CURRENT_TIMESTAMP, role=excluded.role, username=excluded.username",
+                (user_id, user_data["username"], user_data["role"])
+            )
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+        return user_data
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token has expired")
     except jwt.PyJWTError:
@@ -202,13 +226,23 @@ def require_exact_role(exact_role: str):
     return role_dependency
 
 # --- Schemas ---
-from pydantic import Field
+from pydantic import Field, field_validator
 
 class UserCreate(BaseModel):
     username: str
     email: str
-    password: str = Field(..., min_length=8)
+    password: str = Field(...)
     role: Optional[str] = "pengguna"
+
+    @field_validator("password")
+    @classmethod
+    def password_must_have_symbol_and_number(cls, v: str) -> str:
+        import re
+        if not re.search(r"\d", v):
+            raise ValueError("Password must contain at least one number")
+        if not re.search(r"[^A-Za-z0-9]", v):
+            raise ValueError("Password must contain at least one symbol")
+        return v
 
 class UserLogin(BaseModel):
     username: str
