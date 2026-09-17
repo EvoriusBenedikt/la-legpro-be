@@ -127,15 +127,17 @@ LegalAnalyzer/
 ├── run_all_scrapers.py         # Master runner: all scrapers + fast ingest
 ├── evaluate_accuracy.py        # 20-question golden test suite
 ├── check_db.py                 # Database inspection utility
-├── query_llm.py                # CLI tool for direct RAG queries
 │
 ├── api/                        # FastAPI backend
-│   ├── main.py                 # All endpoints, VLM extractor, compliance checker
-│   ├── auth.py                 # JWT authentication
+│   ├── main.py                 # App entry point: CORS, router mounts, RAG/compliance core
+│   ├── auth.py                 # JWT auth + RBAC, register/login, change-password
 │   ├── history.py              # Conversation history persistence
 │   ├── internal_docs.py        # Internal document upload/management
-│   ├── requirements.txt        # Python dependencies
-│   └── server.log              # Runtime log file (auto-created)
+│   ├── templates.py            # Document template generation
+│   ├── routers/                # Domain routers: chat, compliance, repository,
+│   │                           #   knowledge_graph, admin, engineer, taxonomy
+│   ├── services/               # Shared services (LLM client, schedulers)
+│   └── requirements.txt        # Python dependencies
 │
 ├── parser/
 │   └── pdf_parser.py           # LegalDocumentParser, LegalChunker (PyMuPDF + PaddleOCR)
@@ -179,18 +181,24 @@ LegalAnalyzer/
     │   ├── App.tsx             # Root component, tab router
     │   ├── index.css           # Global design system (dark theme)
     │   ├── components/
-    │   │   ├── LegalOpinion.tsx      # RAG chat interface
-    │   │   ├── LegalRepository.tsx   # Regulation browser + Word exporter
-    │   │   ├── DocumentMaker.tsx     # AI compliance checker
-    │   │   ├── ContractMonitor.tsx   # Document dashboard & expiry tracking
-    │   │   ├── DocumentDrawer.tsx    # PDF viewer drawer
-    │   │   ├── Auth.tsx             # Login / register
-    │   │   ├── Account.tsx          # User profile
-    │   │   ├── ActivityFeed.tsx     # Right sidebar activity panel
-    │   │   ├── Sidebar.tsx          # Left icon navigation
-    │   │   └── TopBar.tsx           # Search + notifications bar
-    │   └── context/
-    │       └── AuthContext.tsx      # JWT auth state management
+│   │   ├── LegalOpinion.tsx      # RAG chat interface
+│   │   ├── LegalRepository.tsx   # Regulation browser + Word exporter
+│   │   ├── DocumentMaker.tsx     # AI compliance checker (+ results viewer)
+│   │   ├── ContractMonitor.tsx   # Document dashboard & expiry tracking
+│   │   ├── AnalyzedDocumentsDashboard.tsx  # Analyzed docs + calendar export
+│   │   ├── KnowledgeGraph.tsx    # Regulation relationship visualizer
+│   │   ├── SystemMonitoring.tsx  # IT engineer health/metrics dashboard
+│   │   ├── AdminDashboard.tsx    # Admin: dashboard, KG exclusions
+│   │   ├── TaxonomyManager.tsx   # Document taxonomy CRUD
+│   │   ├── DocumentDrawer.tsx    # PDF viewer drawer
+│   │   ├── Auth.tsx             # Login / register (symbol+number rule)
+│   │   ├── Account.tsx          # Profile + change-password form
+│   │   ├── ActivityFeed.tsx     # Right sidebar activity panel
+│   │   ├── Sidebar.tsx          # Left icon navigation
+│   │   └── TopBar.tsx           # Search + notifications bar
+│   ├── context/
+│   │   └── AuthContext.tsx      # JWT auth state management
+│   └── config.ts                # API_BASE: single API host for the whole app
     └── package.json
 ```
 
@@ -210,7 +218,9 @@ LegalAnalyzer/
 | **OCR Fallback** | PaddleOCR + EasyOCR | Scanned page fallback |
 | **VLM Extraction** | llama-4-maverick vision | Corrupted/scanned pages |
 | **Database** | SQLite (`legal_metadata.db`) | Regulation metadata |
-| **Auth** | JWT (python-jose) | User sessions |
+| **Auth** | JWT + RBAC (`auth.py`) | Sessions, roles, change-password endpoint |
+| **Prod serving** | nginx (multi-stage Docker) | Serves Vite `dist/`, SPA fallback, no dev server |
+| **CORS** | `ALLOWED_ORIGINS` env list | Explicit origins (no wildcard with credentials) |
 
 ---
 
@@ -243,9 +253,13 @@ npm install
 Copy `.env.example` to `.env` and fill in your values:
 
 ```env
-GLM_BASE_URL=https://console.labahasa.ai/v1
-GLM_API_KEY=your_key_here
-GLM_MODEL=llama-4-maverick-instruct
+JWT_SECRET=generate_via_openssl_rand_hex_32
+MODEL_BASE_URL=https://console.labahasa.ai/v1
+MODEL_API_KEY=your_key_here
+LLAMA_MODEL=llama-4-maverick-instruct
+GLM_MAX_ATTEMPTS=5
+GLM_RETRY_BACKOFF_BASE=0.8
+ALLOWED_ORIGINS=https://legal-analyzer.lintasarta.dev,http://localhost:5173,http://localhost:3000,http://localhost
 ```
 
 > The Labahasa API is OpenAI-compatible. Any OpenAI-compatible endpoint works here.
@@ -444,10 +458,15 @@ POST /api/generate-document
 ### 7.5 Authentication
 
 ```
-POST /api/auth/register   # {username, email, password}
-POST /api/auth/login      # {username, password} → {access_token}
-GET  /api/auth/me         # Returns current user info
+POST /api/auth/register          # {username, email, password} → role forced to "pengguna"
+POST /api/auth/login             # {username, password} → {access_token}
+GET  /api/auth/me                # Returns current user info
+POST /api/auth/change-password   # {old_password, new_password} (Bearer required)
 ```
+
+**Password rule:** at least one number + one symbol (enforced server-side in
+`auth.py` and client-side in `Auth.tsx` / Account Security tab). Reuse of the
+current password is rejected. Tokens expire after 24 hours.
 
 ---
 
@@ -469,7 +488,9 @@ npm run dev
 | **Legal Opinion** | `LegalOpinion.tsx` | RAG chat — ask legal questions, get cited answers |
 | **Legal Repository** | `LegalRepository.tsx` | Browse indexed regulations; generate drafts & Export to Word (.doc) |
 | **Compliance Checker** | `DocumentMaker.tsx` | Upload PDFs for 5-pass clause compliance extraction |
-| **Account** | `Account.tsx` | Profile, password change |
+| **Knowledge Graph** | `KnowledgeGraph.tsx` | Visual regulation relationships + CSV/JSON export |
+| **System Monitoring** | `SystemMonitoring.tsx` | Health, metrics, audit logs (Insinyur TI) |
+| **Account** | `Account.tsx` | Profile + Security tab with change-password form |
 
 ### Design System
 
@@ -505,12 +526,26 @@ python main.py
 # Uvicorn starts on http://localhost:8000
 ```
 
-**Terminal 2 — Frontend:**
+**Terminal 2 — Frontend (local dev):**
 ```bash
 cd LegalAnalyzer/frontend
 npm run dev
-# Vite starts on http://localhost:3000
+# Vite dev server (default http://localhost:5173)
 ```
+
+### Production frontend build (what actually gets deployed)
+
+The deployed image serves the static production bundle via nginx — never the
+Vite dev server:
+
+```bash
+cd la-legpro-fe
+docker build --build-arg VITE_API_URL=https://legal-analyzer.lintasarta.dev .
+```
+
+`VITE_API_URL` is baked into the JS at build time (a runtime env var cannot
+change it). The single API host for all components lives in `src/config.ts`
+(`API_BASE`). See also `nginx.conf` (SPA fallback) and `docker-compose.yml`.
 
 ### First-time knowledge base build
 
