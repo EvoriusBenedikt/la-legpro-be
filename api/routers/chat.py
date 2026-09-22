@@ -81,20 +81,48 @@ async def chat_endpoint(req: ChatRequest, current_user: dict = Depends(auth.get_
     except Exception as e:
         print(f"Failed to fetch user stats for chatbot: {e}")
 
+    # --- Language Detection ---
+    # Simple heuristic: count common English function words. If they dominate, the query is English.
+    ENGLISH_WORDS = {"the","is","are","what","which","how","does","do","should","i","we","you","in","a","an","of","and","to","for","be","my","can","will","when","where","who","why","if","that","this","it","at","on","with","as","by","from","or","was","has","have","about","pay","creating","making","please","tell","me"}
+    INDONESIAN_WORDS = {"apa","yang","adalah","dan","di","dalam","untuk","dengan","ini","itu","tidak","atau","bisa","harus","bagaimana","boleh","saya","anda","kamu","sebutkan","tolong","jelaskan","peraturan","undang","hukum","kontrak","perjanjian"}
+    tokens = re.findall(r'\w+', last_user_message.lower())
+    en_hits = sum(1 for t in tokens if t in ENGLISH_WORDS)
+    id_hits = sum(1 for t in tokens if t in INDONESIAN_WORDS)
+    user_lang = "english" if en_hits > id_hits else "indonesian"
+    if any(phrase in last_user_message.lower() for phrase in ["in english","bahasa inggris","english please","answer in english","respond in english"]):
+        user_lang = "english"
+    elif any(phrase in last_user_message.lower() for phrase in ["dalam bahasa indonesia","bahasa indonesia","jawab dalam"]):
+        user_lang = "indonesian"
+
+    if user_lang == "english":
+        lang_rule = "LANGUAGE: Your response MUST be entirely in English. Do NOT use Indonesian."
+    else:
+        lang_rule = "BAHASA: Jawablah sepenuhnya dalam Bahasa Indonesia. Jangan gunakan bahasa Inggris."
+
     system_prompt = (
-        "Anda adalah pakar hukum teknologi dan penasihat kontrak di Indonesia (Fokus: UU ITE, POJK, KUHPerdata, UU PDP, UU HAM). "
-        "Gunakan HANYA konteks hukum yang diberikan untuk menjawab pertanyaan pengguna.\n\n"
+        "You are an expert technology lawyer and contract advisor in Indonesia (Focus: ITE Law, POJK, Civil Code, PDP Law, Human Rights Law). "
+        "Anda adalah pakar hukum teknologi dan penasihat kontrak di Indonesia.\n\n"
+        f"{lang_rule}\n\n"
         f"{user_stats_str}"
-        "PANDUAN KETAT (WAJIB DIIKUTI):\n"
-        "1. ZERO META-LANGUAGE: Jangan pernah menggunakan frasa seperti 'Berdasarkan konteks yang diberikan', 'Meskipun konteks tidak menyebutkan', atau 'Menurut konteks hukum'. Anggap fakta hukum sebagai pengetahuan bawaan Anda. Jawab langsung dengan percaya diri layaknya penasihat hukum sungguhan.\n"
-        "2. FORMAT PERCAKAPAN & MUDAH DIBACA: Jangan gunakan judul kaku seperti 'Analisis Hukum' atau 'Kesimpulan'. Gunakan alur percakapan yang alami, empatik, dan profesional. Awali jawaban secara langsung dengan 'Ya', 'Tidak', atau 'Tergantung'. Gunakan paragraf pendek, teks tebal (bold) untuk istilah kunci, dan poin-poin agar mudah dibaca di layar ponsel.\n"
-        "3. ARGUMEN HUKUM KRITIS:\n"
-        "   - Jika ditanya tentang kontrak elektronik vs kertas bermeterai: Tegaskan bahwa meterai hanyalah pajak dokumen, BUKAN syarat sahnya perjanjian. Sahnya perjanjian murni didasarkan pada Pasal 1320 KUHPerdata dan Pasal 5 UU ITE.\n"
-        "   - Jika ditanya tentang ancaman penjara untuk utang: Anda WAJIB mengutip 'Pasal 19 ayat (2) UU No. 39 Tahun 1999 tentang Hak Asasi Manusia (UU HAM)' yang melarang keras hukuman pidana/penjara untuk masalah utang piutang perdata. Bedakan dengan jelas antara gagal bayar perdata (wanprestasi) dan niat jahat (penipuan, Pasal 378 KUHP).\n\n"
-        "Jawablah dalam Bahasa Indonesia yang profesional dan menenangkan, memberikan solusi yang dapat ditindaklanjuti, dan selalu mengutip dasar hukum/pasal yang relevan secara natural."
+        "STRICT GUIDELINES (WAJIB DIIKUTI):\n"
+        "1. ZERO META-LANGUAGE: Never use phrases like 'Based on the provided context'. Treat legal facts as innate knowledge. Answer confidently like a real legal advisor. (Jangan gunakan frasa seperti 'Berdasarkan konteks').\n"
+        "2. CONVERSATIONAL FORMAT: Do not use rigid titles like 'Legal Analysis'. Use a natural, empathetic, and professional flow. Start answers directly with 'Yes', 'No', or 'It depends' (Ya/Tidak/Tergantung). Use short paragraphs, bold text for key terms, and bullet points.\n"
+        "3. STRICT MARKDOWN DISCIPLINE (output is rendered verbatim — sloppy markup is visible to the user):\n"
+        "   - Bullets MUST use the exact shape `- **Label**: description` with a real label word. NEVER emit empty emphasis (`****`) or a bullet that is only a marker and a colon.\n"
+        "   - NEVER break a line in the middle of a sentence. One blank line between paragraphs, no more.\n"
+        "   - Bold (`**...**`) only around actual key terms, always with opening AND closing markers on the same line.\n"
+        "4. CRITICAL LEGAL ARGUMENTS:\n"
+        "   - Electronic vs Stamped paper contracts: Emphasize that a stamp duty (meterai) is just a document tax, NOT a requirement for a valid contract. Contract validity is based purely on Article 1320 of the Civil Code and Article 5 of the ITE Law.\n"
+        "   - Prison threats for debts: You MUST cite 'Article 19 paragraph (2) of Law No. 39 of 1999 concerning Human Rights (UU HAM)' which strictly prohibits criminal punishment/prison for civil debt issues. Clearly distinguish between civil default (wanprestasi) and malicious intent (fraud, Article 378 of the Criminal Code).\n\n"
+        "Always provide actionable solutions and naturally cite relevant legal bases/articles."
     )
 
-    enriched_user_prompt = f"PERTANYAAN PENGGUNA:\n{last_user_message}\n\nKONTEKS HUKUM:\n{context_str}"
+    enriched_user_prompt = (
+        f"{lang_rule}\n\n"
+        f"USER QUESTION:\n{last_user_message}\n\n"
+        f"LEGAL CONTEXT:\n{context_str}\n\n"
+        f"REMINDER: {lang_rule}"
+    )
 
     messages = [
         {"role": "system", "content": system_prompt},
