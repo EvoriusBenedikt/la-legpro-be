@@ -74,6 +74,28 @@ def startup_event():
 async def async_startup_event():
     start_background_loops()
 
+# ── Startup: warm ML singletons in the background (2026-09-29 RAG audit) ────
+# The embedder (~10 s) and cross-encoder reranker (~2 s) are lazy singletons;
+# without warmup the first chat query after every restart paid both loads.
+# A background thread keeps readiness fast; the double-checked locks in
+# embed_service.get_embedder / rag_service.get_reranker make a concurrent
+# first query wait for the warm load instead of double-loading.
+@app.on_event("startup")
+def warm_ml_models():
+    import threading
+
+    def _warm():
+        try:
+            from services.embed_service import embed_query
+            embed_query("warmup")
+            from services.rag_service import get_reranker
+            get_reranker().predict([["warmup", "warmup"]])
+            print("[Startup] ML models warm (embedder + reranker).")
+        except Exception as e:
+            print(f"[Startup] ML warmup failed (models will lazy-load on first use): {e}")
+
+    threading.Thread(target=_warm, daemon=True).start()
+
 # ── Shutdown: release the PG connection pool (Migration M3) ─────────────────
 @app.on_event("shutdown")
 def shutdown_event():

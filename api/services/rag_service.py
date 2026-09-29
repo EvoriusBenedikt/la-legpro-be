@@ -10,6 +10,7 @@ on chunks.content_tsv instead of SQLite FTS5 chunks_fts.
 import os
 import re
 import json
+import threading
 from typing import List
 from datetime import datetime
 import auth
@@ -24,15 +25,38 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fil
 # and retrieve_contexts below) query PG directly via services.pg_service.
 
 _cross_encoder = None
+_reranker_lock = threading.Lock()
+
+# Guardrail (2026-09-29 RAG audit): chunk rows are not size-bounded -- the
+# corpus contains a single 8.8 MB "chunk" (doc 653) and ~140 chunks >25k
+# chars. Uncapped text reaching retrieval output would be fed verbatim to the
+# cross-encoder tokenizer, the LLM prompt (chat.py concatenates every source
+# text) and the FE snippet field. Contexts are grounding passages, not whole
+# documents, so they are capped at the single point where the hybrid path
+# builds source text. The CAG early-return has its own documented 25k
+# whole-document budget and is intentionally left alone.
+MAX_CONTEXT_CHARS = 6000
+
+
+def _cap_context_text(text):
+    """Truncate oversized chunk text used as LLM/reranker/UI context."""
+    if text and len(text) > MAX_CONTEXT_CHARS:
+        return text[:MAX_CONTEXT_CHARS] + " […]"
+    return text
+
 
 def get_reranker():
+    # Double-checked locking (2026-09-29 RAG audit): the startup warm thread
+    # and a concurrent first query must not load the model twice.
     global _cross_encoder
     if _cross_encoder is None:
-        import os
-        from sentence_transformers import CrossEncoder
-        model_name = os.environ.get("RERANKER_MODEL_NAME", "cross-encoder/ms-marco-MiniLM-L-6-v2")
-        print(f"Initializing CrossEncoder reranker: {model_name}")
-        _cross_encoder = CrossEncoder(model_name, max_length=512)
+        with _reranker_lock:
+            if _cross_encoder is None:
+                import os
+                from sentence_transformers import CrossEncoder
+                model_name = os.environ.get("RERANKER_MODEL_NAME", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+                print(f"Initializing CrossEncoder reranker: {model_name}")
+                _cross_encoder = CrossEncoder(model_name, max_length=512)
     return _cross_encoder
 
 def extract_pasal_items(text: str, max_items: int = 20, max_chars_per_pasal: int = 900) -> List[dict]:
@@ -674,6 +698,12 @@ def retrieve_contexts(query: str, current_user: dict, n_results=5, doc_category=
         query_vec = embed_query(query)
         with pg_service.get_conn() as conn:
             conn.execute("SET LOCAL hnsw.ef_search = 100")
+            # (2026-09-29 RAG audit: with the global hnsw.iterative_scan=off,
+            # the filtered ANN scan exhausted its ef candidates before the
+            # LIMIT -- a LIMIT 50 returned only 41 rows. strict_order keeps
+            # exact distance ordering while continuing the index scan until
+            # the LIMIT is met. Requires pgvector >= 0.8; stack is 0.8.6.)
+            conn.execute("SET LOCAL hnsw.iterative_scan = strict_order")
             cur = conn.execute(
                 "SELECT id, doc_id, jenis, nomor, sektor, judul "
                 "FROM chunks "
@@ -701,9 +731,19 @@ def retrieve_contexts(query: str, current_user: dict, n_results=5, doc_category=
                 # (Migration M3: ORDER BY seq reproduces the legacy Chroma
                 # insertion order -- 004_chunks_seq.sql assigned seq in the
                 # original collection order.)
+                # (2026-09-29 RAG audit: SUM-guard in SQL -- pulling
+                # multi-megabyte docs (the corpus holds an 8.8 MB single
+                # chunk) into Python just to discover they exceed the CAG
+                # budget wasted serious work whenever such a doc won
+                # discovery. Over-budget docs now return zero rows and fall
+                # through; the exact len(full_text) check below remains the
+                # authoritative gate.)
                 doc_results = pg_service.query(
-                    "SELECT text FROM chunks WHERE doc_id = %s ORDER BY seq",
-                    (best_reg_id,))
+                    "SELECT text FROM chunks WHERE doc_id = %s "
+                    "AND (SELECT COALESCE(SUM(LENGTH(text)), 0) FROM chunks "
+                    "     WHERE doc_id = %s) <= 25000 "
+                    "ORDER BY seq",
+                    (best_reg_id, best_reg_id))
                 
                 if doc_results:
                     # Reconstruct full text
@@ -734,6 +774,7 @@ def retrieve_contexts(query: str, current_user: dict, n_results=5, doc_category=
         query_vec = embed_query(query)
     with pg_service.get_conn() as conn:
         conn.execute("SET LOCAL hnsw.ef_search = 100")
+        conn.execute("SET LOCAL hnsw.iterative_scan = strict_order")  # see discovery pass above
         cur = conn.execute(
             "SELECT id, doc_id, text, window_context, jenis, nomor, sektor, judul "
             "FROM chunks "
@@ -752,7 +793,7 @@ def retrieve_contexts(query: str, current_user: dict, n_results=5, doc_category=
                 continue
                 
             chunk_id = meta["id"]
-            window_doc = meta["window_context"] if meta["window_context"] else meta["text"]
+            window_doc = _cap_context_text(meta["window_context"] if meta["window_context"] else meta["text"])
             
             dense_ranks[chunk_id] = dense_rank
             chunk_data[chunk_id] = {
@@ -765,12 +806,17 @@ def retrieve_contexts(query: str, current_user: dict, n_results=5, doc_category=
             }
             dense_rank += 1
 
-    # --- 2. Sparse Retrieval (PG tsvector over legacy FTS rows) ---
+    # --- 2. Sparse Retrieval (PG tsvector, full corpus) ---
     # (Migration M3: replaces SQLite FTS5 BM25 on chunks_fts. The " OR "-joined
     # word string feeds websearch_to_tsquery, which parses the OR operator
     # exactly like the old MATCH syntax and never raises on stray punctuation.
-    # Only sparse_legacy=TRUE rows -- the migrated chunks_fts corpus -- take
-    # part, matching legacy index membership.)
+    # 2026-09-29 RAG audit: the sparse_legacy=TRUE gate is gone. It confined
+    # BM25 to the 1,269-row migrated FTS corpus (2% of chunks) even though
+    # content_tsv is populated on 100% of rows, so the "hybrid" half was
+    # effectively dead weight and its hits were the small legacy docs. On
+    # Indonesian legal text the lexical side is exactly what catches precise
+    # terms (nomor, pasal, istilah) that the English-centric MiniLM embedder
+    # misses. sparse_legacy remains as a lineage marker only.)
     # Clean query for FTS syntax to avoid errors
     safe_query = query.replace('"', '').replace("'", "")
     safe_query = " OR ".join([word for word in safe_query.split() if len(word) > 2])
@@ -778,41 +824,37 @@ def retrieve_contexts(query: str, current_user: dict, n_results=5, doc_category=
     try:
         # We fetch extra because we still need to filter by is_allowed
         sparse_rows = pg_service.query(
-            "SELECT id, doc_id, text, window_context "
-            "FROM chunks "
-            "WHERE sparse_legacy "
-            "AND content_tsv @@ websearch_to_tsquery('simple', %s) "
-            "ORDER BY ts_rank_cd(content_tsv, websearch_to_tsquery('simple', %s)) DESC "
+            "SELECT c.id, c.doc_id, c.text, c.window_context, "
+            "r.judul, r.nomor, r.jenis, r.sektor "
+            "FROM chunks c "
+            "JOIN regulations r ON r.id::text = c.doc_id "
+            "WHERE c.content_tsv @@ websearch_to_tsquery('simple', %s) "
+            "ORDER BY ts_rank_cd(c.content_tsv, websearch_to_tsquery('simple', %s)) DESC "
             "LIMIT %s",
             (safe_query, safe_query, overfetch_n * 2))
         
         sparse_rank = 1
         for row in sparse_rows:
             chunk_id, doc_id = row["id"], row["doc_id"]
-            text, window_context = row["text"], row["window_context"]
             if not is_allowed(doc_id):
                 continue
                 
             sparse_ranks[chunk_id] = sparse_rank
             
             # If the dense pass didn't find this chunk, we need to populate its data
+            # (2026-09-29 RAG audit: metadata now rides the JOIN above -- the
+            # old per-row regulations query_one was an N+1 through an
+            # unindexable id::text cast, and the INNER JOIN preserves the old
+            # drop-orphan-chunks behavior since orphans have no regulations row.)
             if chunk_id not in chunk_data:
-                # To get metadata like 'judul', we query the main table
-                # (chunks.doc_id is TEXT; regulations.id is int -> ::text)
-                reg_row = pg_service.query_one(
-                    "SELECT judul, nomor, jenis, sektor FROM regulations "
-                    "WHERE id::text = %s", (doc_id,))
-                if reg_row:
-                    judul, nomor, jenis, sektor = (reg_row["judul"], reg_row["nomor"],
-                                                   reg_row["jenis"], reg_row["sektor"])
-                    chunk_data[chunk_id] = {
-                        "id": chunk_id,
-                        "text": window_context if window_context else text,
-                        "jenis": jenis or '',
-                        "nomor": nomor or '',
-                        "sektor": sektor or '',
-                        "judul": judul or ''
-                    }
+                chunk_data[chunk_id] = {
+                    "id": chunk_id,
+                    "text": _cap_context_text(row["window_context"] or row["text"]),
+                    "jenis": row["jenis"] or '',
+                    "nomor": row["nomor"] or '',
+                    "sektor": row["sektor"] or '',
+                    "judul": row["judul"] or ''
+                }
             sparse_rank += 1
     except Exception as e:
         print(f"Sparse Retrieval Error: {e}")

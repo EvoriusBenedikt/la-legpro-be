@@ -15,6 +15,7 @@ casts -- no pgvector Python package needed, same convention as the M2
 migration scripts.
 """
 import os
+import threading
 
 from services.pg_service import vector_literal
 
@@ -23,15 +24,22 @@ from services.pg_service import vector_literal
 EMBEDDER_MODEL_NAME = os.environ.get("EMBEDDER_MODEL_NAME", "all-MiniLM-L6-v2")
 
 _embedder = None
+_embedder_lock = threading.Lock()
 
 
 def get_embedder():
-    """Return the process-wide SentenceTransformer, loading it on first use."""
+    """Return the process-wide SentenceTransformer, loading it on first use.
+
+    Double-checked locking (2026-09-29 RAG audit): the startup warm thread and
+    a concurrent first query must not load the model twice.
+    """
     global _embedder
     if _embedder is None:
-        from sentence_transformers import SentenceTransformer
-        print(f"Initializing SentenceTransformer embedder: {EMBEDDER_MODEL_NAME}")
-        _embedder = SentenceTransformer(EMBEDDER_MODEL_NAME)
+        with _embedder_lock:
+            if _embedder is None:
+                from sentence_transformers import SentenceTransformer
+                print(f"Initializing SentenceTransformer embedder: {EMBEDDER_MODEL_NAME}")
+                _embedder = SentenceTransformer(EMBEDDER_MODEL_NAME)
     return _embedder
 
 
