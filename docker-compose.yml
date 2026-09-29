@@ -4,6 +4,10 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: legpro-backend
+    # Deployment readiness (2026-09-29): survive Docker Desktop restarts/reboots
+    # without manual `compose up` (FE already had restart: always; BE came up
+    # Exited(255) after an engine restart during the pull-test verification).
+    restart: unless-stopped
     ports:
       - "8080:8000"
     volumes:
@@ -43,6 +47,7 @@ services:
   postgres:
     image: pgvector/pgvector:pg16
     container_name: legpro-postgres
+    restart: unless-stopped
     environment:
       - POSTGRES_DB=legpro
       - POSTGRES_USER=legpro
