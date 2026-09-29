@@ -2,7 +2,13 @@
 run_all_scrapers.py
 ====================
 Master runner that executes all JDIH scrapers in sequence,
-then fast-ingests all new .txt files into ChromaDB.
+then fast-ingests all new .txt files into the PG chunks store.
+
+Migration M4: the scrapers now write to PostgreSQL (public.regulations) and
+fast_ingest_txt.py embeds into the unified chunks table -- run this inside
+the backend container so psycopg, the embedder and the vendored MiniLM
+weights are available:
+    docker exec legpro-backend python /app/run_all_scrapers.py
 """
 import os, sys, time
 
@@ -17,7 +23,7 @@ SCRAPERS = [
     ("PPATK",              "ppatk",            "PPATKScraper"),
     ("LPS",                "lps",              "LPSScraper"),
     ("DPR",                "dpr",              "DPRScraper"),
-    ("Kemenko Ekon",       "kemenko_ekon",     "KemenkoEkonomiScraper"),
+    ("Kemenko Ekon",       "kemenko_ekon",     "KemenkoEkonScraper"),
     ("Mahkamah Agung",     "mahkamah_agung",   "MahkamahAgungScraper"),
     # Previously built
     ("Bank Indonesia",     "bi",               "BIScraper"),

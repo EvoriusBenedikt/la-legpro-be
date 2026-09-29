@@ -1,5 +1,16 @@
+# Build-context exclusions.
+# M5: fixed the `venv/`-vs-`.venv/` typo and added data_backup/ -- together they
+# baked ~3 GB of dead weight into the image (verified: /app/.venv 660 MB,
+# /app/data_backup 2.3 GB present in the pre-M5 image). Everything listed here is
+# either runtime-mounted by docker-compose.yml (data/, .env), host-only
+# (.venv/, .git/), or a frozen legacy snapshot that must never ship
+# (data_backup/ -- pre-migration copies, kept on the host until sign-off).
 data/
 venv/
+.venv/
 __pycache__/
+**/__pycache__/
+**/*.pyc
 .env
 .git/
+data_backup/

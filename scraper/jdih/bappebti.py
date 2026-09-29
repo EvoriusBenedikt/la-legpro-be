@@ -1,8 +1,6 @@
 import os
-import sys
 import time
 
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from base_scraper import BaseJDIHScraper
 
 class BappebtiScraper(BaseJDIHScraper):

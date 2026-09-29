@@ -1,6 +1,4 @@
 """DPR JDIH Scraper — Foundational UU: Perseroan Terbatas, Pasar Modal, Perbankan, OJK"""
-import os, sys
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from base_scraper import BaseJDIHScraper
 
 class DPRScraper(BaseJDIHScraper):

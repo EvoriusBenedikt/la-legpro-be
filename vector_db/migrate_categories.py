@@ -2,6 +2,13 @@
 migrate_categories.py
 Assigns doc_category="PKS" to all existing metadata in the ojk_regulations ChromaDB collection
 that don't already have a doc_category.
+
+RETIRED (Migration M4, 2026-09-26): one-shot backfill against the ChromaDB
+collection, which no longer exists -- the corpus lives in the PG `chunks`
+table now (its doc_category values were carried over verbatim by the M2 data
+migration) and the chromadb dependency was removed from requirements.txt, so
+this script fails with ImportError by design. Kept unported as a historical
+record of the backfill; do not run.
 """
 
 import chromadb

@@ -1,13 +1,24 @@
 import requests
-from bs4 import BeautifulSoup
 import urllib3
-import json
-import sqlite3
+import psycopg
+from lxml import html as lxml_html
 import os
+import sys
 import time
 import re
 
 urllib3.disable_warnings()
+
+# (Migration M4: rows go to the legpro PostgreSQL database -- the
+# scraper.regulations schema/table migrated from ojk_metadata.db in M2. The
+# legacy BeautifulSoup dependency was never in requirements.txt (the script
+# could not run in the container at all); the two small parse jobs below use
+# lxml, which is already a dependency.)
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+import script_env
+script_env.bootstrap(needs_api=False)
 
 # Configuration
 BASE_URL = "http://jdih.ojk.go.id"
@@ -25,30 +36,16 @@ JENIS_PERATURAN = {
     "09": "SEOJK"
 }
 
-OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "pdfs")
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "ojk_metadata.db")
+OUTPUT_DIR = os.path.join(BASE_DIR, "data", "pdfs")
 
 # Setup dirs
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS regulations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            judul TEXT,
-            nomor TEXT,
-            jenis TEXT,
-            sektor TEXT,
-            status TEXT,
-            detail_url TEXT UNIQUE,
-            download_url TEXT,
-            local_path TEXT
-        )
-    ''')
-    conn.commit()
-    return conn
+    # The legacy CREATE TABLE IF NOT EXISTS bootstrap is gone: scraper.regulations
+    # is owned by migrations/001_schema.sql. autocommit mirrors the legacy
+    # per-statement sqlite3 behaviour.
+    return psycopg.connect(os.environ["DATABASE_URL"], autocommit=True)
 
 def get_detail_and_download(session, detail_url, output_path):
     """Hits the detail page, finds the 'Unduh' link, and downloads the PDF."""
@@ -58,13 +55,21 @@ def get_detail_and_download(session, detail_url, output_path):
             
         response = session.get(detail_url, verify=False, timeout=10)
         response.raise_for_status()
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        unduh_link = soup.find('a', string=lambda s: s and 'unduh' in s.lower())
-        if not unduh_link:
-            unduh_link = soup.find('a', href=lambda h: h and 'DownloadDokumen' in h)
-            
-        if unduh_link and unduh_link.get('href'):
+        # (Migration M4: lxml replaces BeautifulSoup -- same two-step search:
+        # first an <a> whose visible text contains 'unduh', then any <a> whose
+        # href contains 'DownloadDokumen'.)
+        tree = lxml_html.fromstring(response.text)
+
+        unduh_link = None
+        for a in tree.xpath('//a'):
+            if 'unduh' in (a.text_content() or '').lower():
+                unduh_link = a
+                break
+        if unduh_link is None:
+            hits = tree.xpath('//a[contains(@href, "DownloadDokumen")]')
+            unduh_link = hits[0] if hits else None
+
+        if unduh_link is not None and unduh_link.get('href'):
             download_url = BASE_URL + unduh_link.get('href')
             
             # Download the actual file
@@ -113,14 +118,15 @@ def scrape_ojk(limit_per_category=100):
                     nomor = str(row[1]).strip()
                     status = str(row[7]).strip()
                     
-                    # Parse the link and title
-                    soup = BeautifulSoup(html_col, 'html.parser')
-                    a_tag = soup.find('a')
-                    if not a_tag:
+                    # Parse the link and title (Migration M4: lxml; the aaData
+                    # cell is an HTML fragment whose root may BE the <a> tag)
+                    fragment = lxml_html.fromstring(html_col)
+                    a_tag = fragment if fragment.tag == 'a' else fragment.find('.//a')
+                    if a_tag is None:
                         continue
-                        
+
                     detail_url = a_tag.get('href')
-                    judul = a_tag.text.strip()
+                    judul = (a_tag.text_content() or '').strip()
                     
                     if not detail_url.startswith('http'):
                         full_detail_url = BASE_URL + detail_url
@@ -133,7 +139,7 @@ def scrape_ojk(limit_per_category=100):
                     filepath = os.path.join(OUTPUT_DIR, filename)
                     
                     # Check if already in DB
-                    c.execute('SELECT id FROM regulations WHERE detail_url = ?', (full_detail_url,))
+                    c.execute('SELECT id FROM scraper.regulations WHERE detail_url = %s', (full_detail_url,))
                     if c.fetchone():
                         print(f"Skipping (already in DB): {nomor}")
                         continue
@@ -142,11 +148,14 @@ def scrape_ojk(limit_per_category=100):
                     download_url, success = get_detail_and_download(session, full_detail_url, filepath)
                     
                     if success:
+                        # ON CONFLICT guards the UNIQUE detail_url so one late
+                        # duplicate cannot abort the whole sector loop (the
+                        # connection is autocommit -- no conn.commit() needed).
                         c.execute('''
-                            INSERT INTO regulations (judul, nomor, jenis, sektor, status, detail_url, download_url, local_path)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            INSERT INTO scraper.regulations (judul, nomor, jenis, sektor, status, detail_url, download_url, local_path)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (detail_url) DO NOTHING
                         ''', (judul, nomor, jenis_name, sektor_name, status, full_detail_url, download_url, filepath))
-                        conn.commit()
                         print("Saved PDF successfully.")
                     else:
                         print("Failed to download PDF.")

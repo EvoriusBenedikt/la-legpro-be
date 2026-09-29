@@ -1,9 +1,7 @@
 """Kemenko Perekonomian Scraper — Koordinasi ekonomi, KEK, investasi"""
-import os, sys
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from base_scraper import BaseJDIHScraper
 
-class KemenkoEkonomiScraper(BaseJDIHScraper):
+class KemenkoEkonScraper(BaseJDIHScraper):
     def __init__(self):
         super().__init__("Kemenko_Perekonomian")
 
@@ -60,4 +58,4 @@ class KemenkoEkonomiScraper(BaseJDIHScraper):
         print(f"  Done: {injected} items\n")
 
 if __name__ == "__main__":
-    KemenkoEkonomiScraper().scrape()
+    KemenkoEkonScraper().scrape()

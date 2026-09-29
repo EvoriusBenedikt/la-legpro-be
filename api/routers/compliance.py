@@ -1,28 +1,22 @@
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, BackgroundTasks
-import sqlite3, os, json, time, re, uuid, shutil, base64
+import os, json, re, uuid, shutil, base64
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
 import concurrent.futures
-from typing import List, Optional, Any
+from typing import Optional, Any
 from pydantic import BaseModel, field_validator
 import auth
-import chromadb
-from services.llm_client import call_glm
-from services.llm_client import call_glm
+from services import pg_service
+from services.llm_client import call_glm, extract_json
+
+# M3 migration note: SQLite (legal_metadata.db) and ChromaDB are replaced by
+# PostgreSQL + pgvector. Regulation metadata lives in `regulations`; chunks +
+# embeddings live in the unified `chunks` table (schema owned by migrations/,
+# document text ordered by seq).
 
 router = APIRouter(prefix="/api", tags=["compliance"])
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 PDFS_DIR = os.path.join(BASE_DIR, "data", "pdfs")
-
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-CHROMA_DB_DIR = os.path.join(BASE_DIR, "data", "chroma_db")
-
-def get_chroma_collection():
-    client = chromadb.PersistentClient(path=CHROMA_DB_DIR)
-    return client.get_or_create_collection(
-        name="ojk_regulations",
-        metadata={"hnsw:space": "cosine"}
-    )
 
 class AnalyzeRequest(BaseModel):
     reg_id: Optional[str] = None
@@ -57,9 +51,7 @@ async def upload_document(
     if file_size > MAX_FILE_SIZE:
         raise HTTPException(status_code=413, detail="File too large (max 50MB)")
         
-    import sqlite3
     import uuid
-    from datetime import datetime
     
     # Setup directories
     pdfs_dir = os.path.join(BASE_DIR, "data", "pdfs")
@@ -72,14 +64,7 @@ async def upload_document(
         shutil.copyfileobj(file.file, buffer)
         
     try:
-        # ── Proceed with Saving Metadata ─────────────────────────────────────
-        db_path = os.path.join(BASE_DIR, "data", "legal_metadata.db")
-        conn = sqlite3.connect(db_path, timeout=30.0)
-        c = conn.cursor()
-        c.execute('''CREATE TABLE IF NOT EXISTS regulations
-                     (id INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT, judul TEXT, 
-                      nomor TEXT, jenis TEXT, sektor TEXT, status TEXT, 
-                      detail_url TEXT, download_url TEXT, local_path TEXT, klasifikasi TEXT)''')
+        # ── Proceed with Saving Metadata (schema owned by migrations/) ───────
                       
         # Generate ID and Metadata
         doc_id = str(uuid.uuid4())[:8]
@@ -95,14 +80,17 @@ async def upload_document(
         
         status = "Memproses" # Initialize with processing status
         
-        c.execute('''INSERT OR REPLACE INTO regulations 
-                     (judul, download_url, nomor, jenis, sektor, status, detail_url, local_path, klasifikasi, domain) 
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                  (judul, "", nomor, jenis, sektor, status, "", file_path, klasifikasi, "Custom"))
-        # Get the actual auto-incremented ID
-        doc_id = str(c.lastrowid)
-        conn.commit()
-        conn.close()
+        # detail_url stays NULL (not ""): regulations.detail_url is UNIQUE and
+        # an empty string would collide across custom uploads (legacy bug:
+        # the second custom upload always failed). NULL never violates UNIQUE.
+        rows = pg_service.execute_returning(
+            '''INSERT INTO regulations 
+               (judul, download_url, nomor, jenis, sektor, status, detail_url, local_path, klasifikasi, domain) 
+               VALUES (%s, %s, %s, %s, %s, %s, NULL, %s, %s, %s)
+               RETURNING id''',
+            (judul, "", nomor, jenis, sektor, status, file_path, klasifikasi, "Custom"))
+        # Get the actual generated ID
+        doc_id = str(rows[0]["id"])
         
         # Launch async background task for actual text extraction and chunking
         from routers.repository import process_document_background
@@ -116,25 +104,22 @@ async def upload_document(
 
 @router.post("/analyze")
 async def analyze_document(req: AnalyzeRequest):
-    """Analyzes a document from ChromaDB chunks + LLM for overview and status."""
-    collection = get_chroma_collection()
+    """Analyzes a document from regulation chunks + LLM for overview and status."""
     
     # Step 1: Fetch all chunks for this specific document
     # Prefer reg_id (unique) but fall back to nomor if not available
     try:
         if req.reg_id:
-            results = collection.get(
-                where={"reg_id": req.reg_id},
-                include=["documents"]
-            )
+            rows = pg_service.query(
+                "SELECT text FROM chunks WHERE doc_id = %s ORDER BY seq",
+                (req.reg_id,))
         else:
-            results = collection.get(
-                where={"nomor": req.nomor},
-                include=["documents"]
-            )
-        chunks = results.get("documents", [])
+            rows = pg_service.query(
+                "SELECT text FROM chunks WHERE nomor = %s ORDER BY seq",
+                (req.nomor,))
+        chunks = [r["text"] for r in rows]
     except Exception as e:
-        print(f"ChromaDB fetch error: {e}")
+        print(f"Chunks fetch error: {e}")
         chunks = []
     
     if not chunks:
@@ -203,8 +188,7 @@ async def analyze_document(req: AnalyzeRequest):
     
     try:
         raw_content = call_glm(messages_llm, temperature=0.1, timeout=60)
-        raw_content = re.sub(r'```json|```', '', raw_content).strip()
-        parsed = json.loads(raw_content)
+        parsed = extract_json(raw_content)
         overview = parsed.get("overview", overview)
         dicabut = parsed.get("dicabut", [])
         diubah_dengan = parsed.get("diubah_dengan", [])
@@ -226,16 +210,16 @@ async def analyze_pasals(req: AnalyzeRequest):
     Deep analysis: uses LLM to analyze each Pasal individually,
     producing status, perbandingan (comparison), and hubungan (hierarchy).
     """
-    collection = get_chroma_collection()
-
     try:
         if req.reg_id:
-            results = collection.get(where={"reg_id": req.reg_id}, include=["documents"])
+            rows = pg_service.query(
+                "SELECT text FROM chunks WHERE doc_id = %s ORDER BY seq", (req.reg_id,))
         else:
-            results = collection.get(where={"nomor": req.nomor}, include=["documents"])
-        chunks = results.get("documents", [])
+            rows = pg_service.query(
+                "SELECT text FROM chunks WHERE nomor = %s ORDER BY seq", (req.nomor,))
+        chunks = [r["text"] for r in rows]
     except Exception as e:
-        print(f"ChromaDB error: {e}")
+        print(f"Chunks fetch error: {e}")
         chunks = []
 
     if not chunks:
@@ -283,10 +267,10 @@ async def analyze_pasals(req: AnalyzeRequest):
             {"role": "system", "content": system_prompt},
             {"role": "user",   "content": user_prompt},
         ], temperature=0.1, timeout=180)
-        raw = re.sub(r'```json|```', '', raw).strip()
 
         # The LLM might return an object {"pasals":[...]} OR a bare array [...]
-        parsed = json.loads(raw)
+        # (M4: extract_json also survives prose around the JSON body)
+        parsed = extract_json(raw)
         if isinstance(parsed, dict):
             items = parsed.get("pasals", parsed.get("data", []))
         elif isinstance(parsed, list):
@@ -311,7 +295,7 @@ async def analyze_pasals(req: AnalyzeRequest):
         return {"pasals": [], "error": str(e)}
 
 
-def process_single_pasal(c, doc_type, pihak_1, pihak_2, sektor, pokok, collection, COSINE_THRESHOLD):
+def process_single_pasal(c, doc_type, pihak_1, pihak_2, sektor, pokok, COSINE_THRESHOLD):
     pasal_label = c.get("pasal", "Pasal")
     desc = c.get("deskripsi", "")
     if not desc or len(desc) < 10:
@@ -322,30 +306,36 @@ def process_single_pasal(c, doc_type, pihak_1, pihak_2, sektor, pokok, collectio
 
     # Enrich the search query with document context for better RAG retrieval
     search_query = f"[{doc_type}] [{sektor}] {desc[:400]}"
-    sr = collection.query(
-        query_texts=[search_query], 
-        n_results=3,
-        where={"doc_category": {"$in": [doc_cat, "UMUM"]}}
-    )
+    from services.embed_service import embed_query
+    query_vec = embed_query(search_query)
+    with pg_service.get_conn() as conn:
+        conn.execute("SET LOCAL hnsw.ef_search = 100")
+        cur = conn.execute(
+            "SELECT text, jenis, nomor, sektor, "
+            "embedding <=> %s::vector AS dist "
+            "FROM chunks "
+            "WHERE embedding IS NOT NULL AND doc_category = ANY(%s) "
+            "ORDER BY embedding <=> %s::vector LIMIT 3",
+            (query_vec, [doc_cat, "UMUM"], query_vec))
+        sr_rows = cur.fetchall()
 
     supporting_regulations = []
     relevant_refs = []
 
-    if sr and sr.get('documents') and len(sr['documents'][0]) > 0:
-        from main import is_regulation_relevant
-        for i in range(len(sr['documents'][0])):
-            dist = sr['distances'][0][i]
+    if sr_rows:
+        from services.rag_service import is_regulation_relevant
+        for row in sr_rows:
+            dist = float(row["dist"])
             if dist < COSINE_THRESHOLD:
-                doc_text = sr['documents'][0][i]
-                meta = sr['metadatas'][0][i]
-                reg_name = f"{meta.get('jenis', 'Aturan')} Nomor {meta.get('nomor', 'N/A')}"
+                doc_text = row["text"]
+                reg_name = f"{row['jenis'] or 'Aturan'} Nomor {row['nomor'] or 'N/A'}"
 
                 # Relevance confirmation micro-call
                 if is_regulation_relevant(desc, doc_text, reg_name):
                     supporting_regulations.append({
-                        "jenis": meta.get('jenis', 'Aturan'),
-                        "nomor": meta.get('nomor', 'N/A'),
-                        "sektor": meta.get('sektor', 'Umum'),
+                        "jenis": row['jenis'] or 'Aturan',
+                        "nomor": row['nomor'] or 'N/A',
+                        "sektor": row['sektor'] or 'Umum',
                         "teks": doc_text
                     })
                     relevant_refs.append(f"--- {reg_name} ---\n{doc_text[:700]}")
@@ -404,8 +394,7 @@ def process_single_pasal(c, doc_type, pihak_1, pihak_2, sektor, pokok, collectio
             temperature=0.1,
             timeout=90
         )
-        raw_v = re.sub(r'```json|```', '', raw_v).strip()
-        ans = json.loads(raw_v)
+        ans = extract_json(raw_v)
 
         status_raw = str(ans.get("status", "BERESIKO")).upper()
         if "SESUAI" in status_raw:       status_final = "SESUAI"
@@ -444,7 +433,8 @@ def process_single_pasal(c, doc_type, pihak_1, pihak_2, sektor, pokok, collectio
         }
 
 def extract_text_multi_format(file_path: str, filename: str, use_ocr: bool = False) -> str:
-    from main import extract_text_hybrid, call_glm_vision, VLM_PAGE_PROMPT
+    from services.rag_service import extract_text_hybrid
+    from services.llm_client import call_glm_vision, VLM_PAGE_PROMPT
     """
     Extracts text from various file formats: PDF, DOCX, XLSX, PPTX, JPG, PNG, TXT.
     Routes to the appropriate extractor based on the file extension.
@@ -452,14 +442,14 @@ def extract_text_multi_format(file_path: str, filename: str, use_ocr: bool = Fal
     ext = filename.lower().split('.')[-1]
     
     if ext == 'pdf':
+        # (R1 bugfix: use_ocr=true used to force the traditional-OCR parser,
+        # which was dead in every shipped image -- scanned pages came back as
+        # "[HALAMAN BERUPA GAMBAR - OCR GAGAL]" placeholders. Both toggle
+        # states now route through the hybrid extractor; true = force_vlm,
+        # the documented "compliance mode". See la-legpro-doc/bug_reports.md.)
         if use_ocr:
-            print(f"  [OCR] Forcing traditional OCR extraction for {filename}")
-            import sys
-            if BASE_DIR not in sys.path:
-                sys.path.append(BASE_DIR)
-            from parser.pdf_parser import LegalDocumentParser
-            parser = LegalDocumentParser()
-            return parser.parse_pdf(file_path, force_ocr=True)
+            print(f"  [OCR->VLM] Forcing VLM extraction for {filename}")
+            return extract_text_hybrid(file_path, force_vlm=True)
         else:
             return extract_text_hybrid(file_path, force_vlm=False)
         
@@ -468,32 +458,14 @@ def extract_text_multi_format(file_path: str, filename: str, use_ocr: bool = Fal
             return f.read()
             
     elif ext in ['jpg', 'jpeg', 'png']:
-        if use_ocr:
-            print(f"  [OCR] Traditional image extraction for {filename}")
-            import sys
-            if BASE_DIR not in sys.path:
-                sys.path.append(BASE_DIR)
-            from parser.pdf_parser import LegalDocumentParser
-            parser = LegalDocumentParser()
-            if parser.ocr:
-                import numpy as np
-                from PIL import Image
-                img = Image.open(file_path).convert("RGB")
-                img_array = np.array(img)
-                result = parser.ocr.ocr(img_array, cls=False)
-                page_text = []
-                if result and result[0]:
-                    for line in result[0]:
-                        page_text.append(line[1][0])
-                return " ".join(page_text)
-            else:
-                return "[OCR GAGAL INISIALISASI]"
-        else:
-            print(f"  [VLM] Image extraction for {filename}")
-            with open(file_path, "rb") as f:
-                img_b64 = base64.b64encode(f.read()).decode('utf-8')
-            vlm_text = call_glm_vision(img_b64, VLM_PAGE_PROMPT, timeout=60)
-            return vlm_text.strip()
+        # (R1 bugfix: the traditional-OCR image path was dead in every shipped
+        # image -- parser.ocr was always None, so use_ocr=true returned
+        # "[OCR GAGAL INISIALISASI]". Both toggle states now use the VLM path.)
+        print(f"  [VLM] Image extraction for {filename}")
+        with open(file_path, "rb") as f:
+            img_b64 = base64.b64encode(f.read()).decode('utf-8')
+        vlm_text = call_glm_vision(img_b64, VLM_PAGE_PROMPT, timeout=60)
+        return vlm_text.strip()
         
     elif ext == 'docx':
         try:
@@ -574,7 +546,7 @@ async def check_compliance(file: UploadFile = File(...), use_ocr: str = Form("fa
         
     try:
         # 🔍 Pass 0: Multi-Format Extraction 🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍
-        from main import understand_document, extract_signing_date, extract_duration_months, extract_explicit_end_date, extract_pasal_items, llm_extract_pasal_items
+        from services.rag_service import understand_document, extract_signing_date, extract_duration_months, extract_explicit_end_date, extract_pasal_items, llm_extract_pasal_items
         print(f"[Compliance] Starting extraction for: {file.filename}")
         is_ocr = use_ocr.lower() == "true"
         full_text = extract_text_multi_format(temp_path, file.filename, use_ocr=is_ocr)
@@ -635,12 +607,11 @@ async def check_compliance(file: UploadFile = File(...), use_ocr: str = Form("fa
         print(f"[Compliance] Found {len(pasal_items)} clauses. Running analysis...")
 
         # ── Pass 2: Per-clause RAG + LLM Compliance Check ──────────────────
-        collection = get_chroma_collection()
         results = []
         COSINE_THRESHOLD = 0.45  # tightened from 0.60 to reduce wrong-domain citations
 
         def worker(c):
-            return process_single_pasal(c, doc_type, pihak_1, pihak_2, sektor, pokok, collection, COSINE_THRESHOLD)
+            return process_single_pasal(c, doc_type, pihak_1, pihak_2, sektor, pokok, COSINE_THRESHOLD)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
             for res in executor.map(worker, pasal_items[:20]):

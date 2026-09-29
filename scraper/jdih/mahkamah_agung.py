@@ -1,6 +1,4 @@
 """Mahkamah Agung JDIH Scraper — PERMA, yurisprudensi, prosedur pengadilan"""
-import os, sys
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from base_scraper import BaseJDIHScraper
 
 class MahkamahAgungScraper(BaseJDIHScraper):

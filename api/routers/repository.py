@@ -1,8 +1,9 @@
-from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import FileResponse
-import sqlite3, os
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+import os
 from pydantic import BaseModel
+from typing import Optional
 import auth
+from services import pg_service
 
 router = APIRouter(prefix="/api", tags=["repository"])
 
@@ -10,8 +11,9 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fil
 PDFS_DIR = os.path.join(BASE_DIR, "data", "pdfs")
 
 class AccessGrantRequest(BaseModel):
-    target_user_id: int
-    expires_in_days: int = 7
+    granted_to: str
+    reason: str
+    expires_at: Optional[str] = None
 
 @router.get("/pdf/{filename}")
 async def serve_pdf(filename: str):
@@ -34,10 +36,8 @@ async def get_repository(current_user: dict = Depends(auth.get_current_user)):
     # FR-24: Admin cannot access document repository
     if current_user.get("role", "pengguna").lower() == "admin":
         raise HTTPException(status_code=403, detail="Admin sistem tidak memiliki kewenangan untuk mengakses repositori dokumen.")
-    import sqlite3
-    db_path = os.path.join(BASE_DIR, "data", "legal_metadata.db")
-    if not os.path.exists(db_path):
-        return {"documents": []}
+    # (Migration M3: the SQLite file-existence short-circuit is gone -- PG is
+    # the only store now, and connectivity failures raise loudly.)
         
     user_id = current_user.get("id")
     role_level = auth.get_role_level(current_user.get("role", "pengguna"))
@@ -48,34 +48,37 @@ async def get_repository(current_user: dict = Depends(auth.get_current_user)):
     if role_level >= 3:
         allowed_klasifikasi.append("Terbatas")
         
-    klas_str = ", ".join(f"'{k}'" for k in allowed_klasifikasi)
-        
-    conn = sqlite3.connect(db_path)
-    c = conn.cursor()
+    # (Migration M3: the klasifikasi filter now uses ANY(%s) -- no inline
+    # string building)
     
     # Query regulations where klasifikasi is allowed OR explicitly granted
-    query = f"""
-        SELECT id, judul, nomor, jenis, sektor, status, local_path, klasifikasi 
-        FROM regulations 
-        WHERE local_path IS NOT NULL AND local_path != ''
-        AND status != 'Menunggu Konfirmasi'
-        AND (
-            klasifikasi IN ({klas_str}) 
-            OR id IN (
-                SELECT doc_id FROM access_grants 
-                WHERE granted_to = ? 
-                AND (expires_at IS NULL OR expires_at = '' OR expires_at >= datetime('now'))
-            )
-        )
-    """
-    c.execute(query, (user_id,))
-    records = c.fetchall()
+    # (Migration M3: ANY(%s) replaces the inline IN-list; access_grants.doc_id
+    # is TEXT while regulations.id is int -> id::text comparison.)
+    records = pg_service.query(
+        "SELECT id, judul, nomor, jenis, sektor, status, local_path, klasifikasi "
+        "FROM regulations "
+        "WHERE local_path IS NOT NULL AND local_path != '' "
+        "AND status != 'Menunggu Konfirmasi' "
+        "AND ( "
+        "    klasifikasi = ANY(%s) "
+        "    OR id::text IN ( "
+        "        SELECT doc_id FROM access_grants "
+        "        WHERE granted_to = %s "
+        "        AND (expires_at IS NULL OR expires_at >= NOW()) "
+        "    ) "
+        ")",
+        (allowed_klasifikasi, user_id))
     
     docs = []
     for row in records:
-        # Depending on schema, klasifikasi might be at index 7. Handle safely.
-        reg_id, judul, nomor, jenis, sektor, status, local_path = row[:7]
-        klasifikasi = row[7] if len(row) > 7 else "Umum"
+        reg_id = row["id"]
+        judul = row["judul"]
+        nomor = row["nomor"]
+        jenis = row["jenis"]
+        sektor = row["sektor"]
+        status = row["status"]
+        local_path = row["local_path"]
+        klasifikasi = row["klasifikasi"]
         filename = os.path.basename(local_path) if local_path else None
         docs.append({
             "id": str(reg_id) if reg_id is not None else None,
@@ -87,30 +90,26 @@ async def get_repository(current_user: dict = Depends(auth.get_current_user)):
             "klasifikasi": str(klasifikasi) if klasifikasi else "Umum",
             "filename": filename
         })
-    conn.close()
-    
     return {"documents": docs}
 
 
 @router.get("/repository/pending")
 async def get_pending_repository(current_user: dict = Depends(auth.require_role("sekretaris perusahaan"))):
-    import sqlite3
-    db_path = os.path.join(BASE_DIR, "data", "legal_metadata.db")
-    conn = sqlite3.connect(db_path, timeout=30.0)
-    c = conn.cursor()
-    
-    query = """
-        SELECT id, judul, nomor, jenis, sektor, status, local_path, klasifikasi 
-        FROM regulations 
-        WHERE status = 'Menunggu Konfirmasi'
-    """
-    c.execute(query)
-    records = c.fetchall()
+    records = pg_service.query(
+        "SELECT id, judul, nomor, jenis, sektor, status, local_path, klasifikasi "
+        "FROM regulations "
+        "WHERE status = 'Menunggu Konfirmasi'")
     
     docs = []
     for row in records:
-        reg_id, judul, nomor, jenis, sektor, status, local_path = row[:7]
-        klasifikasi = row[7] if len(row) > 7 else "Umum"
+        reg_id = row["id"]
+        judul = row["judul"]
+        nomor = row["nomor"]
+        jenis = row["jenis"]
+        sektor = row["sektor"]
+        status = row["status"]
+        local_path = row["local_path"]
+        klasifikasi = row["klasifikasi"]
         filename = os.path.basename(local_path) if local_path else None
         docs.append({
             "id": str(reg_id) if reg_id is not None else None,
@@ -122,8 +121,6 @@ async def get_pending_repository(current_user: dict = Depends(auth.require_role(
             "klasifikasi": str(klasifikasi) if klasifikasi else "Umum",
             "filename": filename
         })
-    conn.close()
-    
     return {"documents": docs}
 
 @router.post("/documents/{doc_id}/grant-access")
@@ -138,39 +135,35 @@ async def grant_document_access(
     if user_level < 2:
         raise HTTPException(status_code=403, detail="Hanya Manajer, Direktur, atau Sekretaris Perusahaan yang dapat memberikan akses.")
         
-    import sqlite3
     import uuid
-    db_path = os.path.join(BASE_DIR, "data", "legal_metadata.db")
-    conn = sqlite3.connect(db_path, timeout=30.0)
-    c = conn.cursor()
     
-    c.execute("SELECT klasifikasi, judul FROM regulations WHERE id = ?", (doc_id,))
-    doc = c.fetchone()
+    # (Migration M3: id::text -- doc_id arrives as a URL string; non-numeric
+    # ids match nothing, exactly like SQLite's type affinity did.)
+    doc = pg_service.query_one(
+        "SELECT klasifikasi, judul FROM regulations WHERE id::text = %s", (doc_id,))
     if not doc:
-        conn.close()
         raise HTTPException(status_code=404, detail="Dokumen tidak ditemukan")
         
-    klasifikasi = doc[0] if doc[0] else "Umum"
-    doc_judul = doc[1] if doc[1] else doc_id
+    klasifikasi = doc["klasifikasi"] if doc["klasifikasi"] else "Umum"
+    doc_judul = doc["judul"] if doc["judul"] else doc_id
     
     # FR-22: Manajer cannot grant access to Terbatas documents
     if klasifikasi == "Terbatas" and user_level < 3:
-        conn.close()
         raise HTTPException(status_code=403, detail="Manajer tidak dapat memberikan akses untuk dokumen Terbatas. Hanya Direktur atau Sekretaris Perusahaan yang berwenang.")
         
     if not req.reason or len(req.reason.strip()) < 5:
-        conn.close()
         raise HTTPException(status_code=400, detail="Alasan wajib diisi (minimal 5 karakter).")
         
     grant_id = str(uuid.uuid4())
-    c.execute('''INSERT INTO access_grants (id, doc_id, granted_by, granted_to, reason, expires_at)
-                 VALUES (?, ?, ?, ?, ?, ?)''',
-              (grant_id, doc_id, current_user["id"], req.granted_to, req.reason, req.expires_at))
-    conn.commit()
-    conn.close()
+    # expires_at: '' (legacy empty string) becomes NULL -- TIMESTAMPTZ cannot
+    # store empty strings.
+    pg_service.execute(
+        "INSERT INTO access_grants (id, doc_id, granted_by, granted_to, reason, expires_at) "
+        "VALUES (%s, %s, %s, %s, %s, %s)",
+        (grant_id, doc_id, current_user["id"], req.granted_to, req.reason, req.expires_at or None))
     
     # FR-25: Audit log the grant
-    from main import log_audit
+    from services.db_service import log_audit
     log_audit(current_user.get("id", ""), "GRANT_ACCESS", doc_id, 
               f"Diberikan kepada: {req.granted_to}, Dokumen: {doc_judul}, Alasan: {req.reason}")
     
@@ -184,30 +177,25 @@ async def get_all_grants(current_user: dict = Depends(auth.get_current_user)):
     if user_level < 2:
         raise HTTPException(status_code=403, detail="Akses ditolak.")
     
-    import sqlite3
-    db_path = os.path.join(BASE_DIR, "data", "legal_metadata.db")
-    conn = sqlite3.connect(db_path, timeout=30.0)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
+    # (Migration M3: to_char keeps the legacy TEXT timestamp format for the FE;
+    # the join needs r.id::text because ag.doc_id is TEXT.)
+    base_sql = (
+        "SELECT ag.id, ag.doc_id, ag.granted_by, ag.granted_to, ag.reason, "
+        "to_char(ag.expires_at, 'YYYY-MM-DD HH24:MI:SS') AS expires_at, "
+        "to_char(ag.created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at, "
+        "r.judul, r.klasifikasi "
+        "FROM access_grants ag "
+        "LEFT JOIN regulations r ON ag.doc_id = r.id::text ")
     
     # FR-23: Sekretaris Perusahaan sees everything; others see only what they granted
     if user_level >= 5:  # Sekretaris Perusahaan
-        c.execute('''SELECT ag.id, ag.doc_id, ag.granted_by, ag.granted_to, ag.reason, 
-                            ag.expires_at, ag.created_at, r.judul, r.klasifikasi
-                     FROM access_grants ag
-                     LEFT JOIN regulations r ON ag.doc_id = r.id
-                     ORDER BY ag.created_at DESC''')
+        rows = pg_service.query(base_sql + "ORDER BY ag.created_at DESC")
     else:
-        c.execute('''SELECT ag.id, ag.doc_id, ag.granted_by, ag.granted_to, ag.reason, 
-                            ag.expires_at, ag.created_at, r.judul, r.klasifikasi
-                     FROM access_grants ag
-                     LEFT JOIN regulations r ON ag.doc_id = r.id
-                     WHERE ag.granted_by = ?
-                     ORDER BY ag.created_at DESC''', (current_user["id"],))
+        rows = pg_service.query(
+            base_sql + "WHERE ag.granted_by = %s ORDER BY ag.created_at DESC",
+            (current_user["id"],))
     
-    rows = c.fetchall()
-    conn.close()
-    return {"grants": [dict(r) for r in rows]}
+    return {"grants": rows}
 
 @router.delete("/repository/grant/{grant_id}")
 async def revoke_grant(grant_id: str, current_user: dict = Depends(auth.get_current_user)):
@@ -216,29 +204,27 @@ async def revoke_grant(grant_id: str, current_user: dict = Depends(auth.get_curr
     if user_level < 5:  # Only Sekretaris Perusahaan
         raise HTTPException(status_code=403, detail="Hanya Sekretaris Perusahaan yang dapat mencabut pemberian akses.")
     
-    import sqlite3
-    db_path = os.path.join(BASE_DIR, "data", "legal_metadata.db")
-    conn = sqlite3.connect(db_path, timeout=30.0)
-    c = conn.cursor()
-    c.execute("SELECT doc_id, granted_to FROM access_grants WHERE id = ?", (grant_id,))
-    row = c.fetchone()
+    row = pg_service.query_one(
+        "SELECT doc_id, granted_to FROM access_grants WHERE id = %s", (grant_id,))
     if not row:
-        conn.close()
         raise HTTPException(status_code=404, detail="Grant tidak ditemukan.")
     
-    c.execute("DELETE FROM access_grants WHERE id = ?", (grant_id,))
-    conn.commit()
-    conn.close()
+    pg_service.execute("DELETE FROM access_grants WHERE id = %s", (grant_id,))
     
-    from main import log_audit
-    log_audit(current_user.get("id", ""), "REVOKE_ACCESS", row[0], f"Akses dicabut dari: {row[1]}")
+    from services.db_service import log_audit
+    log_audit(current_user.get("id", ""), "REVOKE_ACCESS", row["doc_id"], f"Akses dicabut dari: {row['granted_to']}")
     return {"message": "Akses berhasil dicabut."}
 
 def process_document_background(file_path: str, doc_id: str, filename: str, nomor: str, jenis: str, sektor: str, status: str, klasifikasi: str):
+    from services.app_state import ACTIVE_TASKS
+    from datetime import datetime
+    task_id = f"task_{doc_id}"
+    ACTIVE_TASKS[task_id] = {"name": f"Parsing (AI Review): {filename}", "status": "RUNNING", "start_time": datetime.now(), "end_time": None}
     try:
-        from pdf_parser import LegalDocumentParser
-        parser = LegalDocumentParser()
-        full_text = parser.parse_pdf(file_path)
+        # (R1 bugfix: hybrid PyMuPDF+VLM extraction replaces the dead
+        # PaddleOCR chain; see la-legpro-doc/bug_reports.md.)
+        from services.rag_service import extract_text_hybrid
+        full_text = extract_text_hybrid(file_path)
         
         # ── AI Recommendation (FR-4) ──────────────────────────────────────
         messages = [
@@ -248,7 +234,7 @@ def process_document_background(file_path: str, doc_id: str, filename: str, nomo
         
         recommended_klasifikasi = "Umum"
         try:
-            from main import call_glm
+            from services.llm_client import call_glm
             raw_content = call_glm(messages, temperature=0.1, timeout=30)
             raw_content = raw_content.lower()
             if "terbatas" in raw_content:
@@ -258,60 +244,67 @@ def process_document_background(file_path: str, doc_id: str, filename: str, nomo
         except Exception as llm_err:
             print(f"LLM classification error: {llm_err}")
             
-        import sqlite3
-        db_path = os.path.join(BASE_DIR, "data", "legal_metadata.db")
-        conn = sqlite3.connect(db_path, timeout=30.0)
-        c = conn.cursor()
-        c.execute("UPDATE regulations SET status = 'Menunggu Konfirmasi', klasifikasi = ? WHERE id = ?", (recommended_klasifikasi, doc_id))
-        conn.commit()
-        conn.close()
+        pg_service.execute(
+            "UPDATE regulations SET status = 'Menunggu Konfirmasi', klasifikasi = %s "
+            "WHERE id::text = %s",
+            (recommended_klasifikasi, doc_id))
         print(f"Document {doc_id} set to Pending Confirmation with AI Recommendation: {recommended_klasifikasi}")
+        ACTIVE_TASKS[task_id]["status"] = "COMPLETED"
+        ACTIVE_TASKS[task_id]["end_time"] = datetime.now()
         
     except Exception as e:
+        ACTIVE_TASKS[task_id]["status"] = "FAILED"
+        ACTIVE_TASKS[task_id]["end_time"] = datetime.now()
         print(f"Error in process_document_background: {e}")
         try:
-            import sqlite3
-            conn = sqlite3.connect(os.path.join(BASE_DIR, "data", "legal_metadata.db"), timeout=30.0)
-            c = conn.cursor()
-            c.execute("UPDATE regulations SET status = 'Gagal - Error' WHERE id = ?", (doc_id,))
-            conn.commit()
-            conn.close()
+            pg_service.execute(
+                "UPDATE regulations SET status = 'Gagal - Error' WHERE id::text = %s", (doc_id,))
         except:
             pass
 
 def ingest_document_background(file_path: str, doc_id: str, filename: str, nomor: str, jenis: str, sektor: str, status: str, klasifikasi: str):
+    from services.app_state import ACTIVE_TASKS
+    from datetime import datetime
+    task_id = f"task_{doc_id}"
+    ACTIVE_TASKS[task_id] = {"name": f"Ingesting (Vector+KG): {filename}", "status": "RUNNING", "start_time": datetime.now(), "end_time": None}
     try:
-        from pdf_parser import LegalDocumentParser, LegalChunker
-        parser = LegalDocumentParser()
+        from pdf_parser import LegalChunker
+        from services.rag_service import extract_text_hybrid
         chunker = LegalChunker()
         
-        full_text = parser.parse_pdf(file_path)
+        # (R1 bugfix: hybrid PyMuPDF+VLM extraction replaces the dead
+        # PaddleOCR chain; see la-legpro-doc/bug_reports.md.)
+        full_text = extract_text_hybrid(file_path)
         
-        # Duplicate Detection (FR-5) 
+        # Duplicate Detection (FR-5)
+        # (Migration M3: pgvector cosine distance `<=>` replaces the Chroma
+        # query -- same cosine metric, same 0.15 threshold.)
         fingerprint_text = full_text[:1500]
-        from main import get_chroma_collection
-        collection = get_chroma_collection()
-        dup_results = collection.query(
-            query_texts=[fingerprint_text],
-            n_results=1
-        )
+        from services.embed_service import embed_query
+        fp_vec = embed_query(fingerprint_text)
+        with pg_service.get_conn() as conn_dup:
+            conn_dup.execute("SET LOCAL hnsw.ef_search = 100")
+            cur_dup = conn_dup.execute(
+                "SELECT embedding <=> %s::vector AS dist FROM chunks "
+                "WHERE embedding IS NOT NULL "
+                "ORDER BY embedding <=> %s::vector LIMIT 1",
+                (fp_vec, fp_vec))
+            dup_row = cur_dup.fetchone()
         
-        import sqlite3
         import os
         BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        db_path = os.path.join(BASE_DIR, "data", "legal_metadata.db")
-        conn = sqlite3.connect(db_path, timeout=30.0)
-        c = conn.cursor()
         
-        if dup_results and dup_results['distances'] and len(dup_results['distances'][0]) > 0:
-            dist = dup_results['distances'][0][0]
+        if dup_row and dup_row["dist"] is not None:
+            dist = dup_row["dist"]
             if dist < 0.15:
                 # Cleanup temp file
                 if os.path.exists(file_path):
                     os.remove(file_path)
-                c.execute("UPDATE regulations SET status = 'Gagal - Duplikat' WHERE id = ?", (doc_id,))
-                conn.commit()
-                conn.close()
+                pg_service.execute(
+                    "UPDATE regulations SET status = 'Gagal - Duplikat' WHERE id::text = %s",
+                    (doc_id,))
+                ACTIVE_TASKS[task_id]["status"] = "FAILED"
+                ACTIVE_TASKS[task_id]["end_time"] = datetime.now()
                 return
 
         print(f"File saved to DB. Now parsing and embedding: {filename}")
@@ -319,7 +312,7 @@ def ingest_document_background(file_path: str, doc_id: str, filename: str, nomor
         # Contextual Enrichment - Generate Global Document Summary
         document_summary = ""
         try:
-            from main import call_glm
+            from services.llm_client import call_glm
             summary_prompt = (
                 "Buatlah ringkasan singkat (maksimal 2 kalimat) yang menjelaskan tentang apa dokumen ini, "
                 "siapa pihak yang terlibat, dan apa topik utamanya. "
@@ -358,48 +351,55 @@ def ingest_document_background(file_path: str, doc_id: str, filename: str, nomor
             ids.append(hash_id)
             
         if documents:
-            collection = get_chroma_collection()
-            collection.add(
-                documents=documents,
-                metadatas=metadatas,
-                ids=ids
-            )
-            print(f"Successfully added {len(documents)} chunks to ChromaDB!")
+            # (Migration M3: one unified chunks-table insert replaces BOTH the
+            # Chroma collection.add and the chunks_fts injection below -- the
+            # row carries the embedding (dense half) and sparse_legacy=TRUE
+            # marks it for the PG full-text index (sparse half), exactly like
+            # the legacy dual write.)
+            from services.embed_service import embed_documents
+            embeddings = embed_documents(documents)
+            with pg_service.get_conn() as conn_ins:
+                for chunk_id, text, meta, emb in zip(ids, documents, metadatas, embeddings):
+                    conn_ins.execute(
+                        "INSERT INTO chunks (id, doc_id, text, window_context, domain, "
+                        "jenis, judul, nomor, sektor, status, filename, doc_category, "
+                        "visibility, user_id, embedding, sparse_legacy) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
+                        "%s::vector, TRUE) "
+                        "ON CONFLICT (id) DO UPDATE SET text = EXCLUDED.text, "
+                        "window_context = EXCLUDED.window_context, "
+                        "embedding = EXCLUDED.embedding",
+                        (chunk_id, meta.get("reg_id"), text, meta.get("window_context"),
+                         meta.get("domain"), meta.get("jenis"), meta.get("judul"),
+                         meta.get("nomor"), meta.get("sektor"), meta.get("status"),
+                         meta.get("filename"), meta.get("doc_category"),
+                         meta.get("visibility"), meta.get("user_id"), emb))
+            print(f"Successfully added {len(documents)} chunks to the PG store!")
             
-            # Sparse Retrieval Injection (BM25 FTS5)
-            try:
-                fts_records = []
-                for idx, c_data in zip(ids, chunks):
-                    w_ctx = c_data["metadata"].get("window_context", "")
-                    fts_records.append((idx, doc_id, c_data["text"], w_ctx))
-                c.executemany("INSERT INTO chunks_fts (chunk_id, doc_id, text, window_context) VALUES (?, ?, ?, ?)", fts_records)
-            except Exception as e:
-                print(f"Failed to inject into chunks_fts: {e}")
+            # (the legacy chunks_fts injection is gone -- sparse_legacy=TRUE on
+            # the rows above already puts them in the PG full-text index)
         
-        c.execute("UPDATE regulations SET status = 'Berlaku' WHERE id = ?", (doc_id,))
-        conn.commit()
-        conn.close()
+        pg_service.execute("UPDATE regulations SET status = 'Berlaku' WHERE id::text = %s", (doc_id,))
 
         # Knowledge Graph Extraction (real-time, FR-KG)
         judul = filename.replace('.pdf', '')
         try:
-            from main import extract_and_store_graph
+            from services.kg_service import extract_and_store_graph
             extract_and_store_graph(doc_id, full_text, nomor, judul, jenis)
         except Exception as kg_err:
             print(f"[KG] Non-fatal extraction error for {nomor}: {kg_err}")
+            
+        ACTIVE_TASKS[task_id]["status"] = "COMPLETED"
+        ACTIVE_TASKS[task_id]["end_time"] = datetime.now()
         return
         
     except Exception as e:
+        ACTIVE_TASKS[task_id]["status"] = "FAILED"
+        ACTIVE_TASKS[task_id]["end_time"] = datetime.now()
         print(f"Error processing PDF: {e}")
         try:
-            import sqlite3
-            import os
-            BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-            conn = sqlite3.connect(os.path.join(BASE_DIR, "data", "legal_metadata.db"), timeout=30.0)
-            c = conn.cursor()
-            c.execute("UPDATE regulations SET status = 'Gagal - Error' WHERE id = ?", (doc_id,))
-            conn.commit()
-            conn.close()
+            pg_service.execute(
+                "UPDATE regulations SET status = 'Gagal - Error' WHERE id::text = %s", (doc_id,))
         except:
             pass
 
@@ -411,19 +411,29 @@ def ingest_document_background(file_path: str, doc_id: str, filename: str, nomor
 @router.delete("/repository/document/{doc_id}")
 async def delete_document(doc_id: str, current_user: dict = Depends(auth.require_role("sekretaris perusahaan"))):
     """Deletes a document from the repository."""
-    import sqlite3
-    db_path = os.path.join(BASE_DIR, "data", "legal_metadata.db")
-    conn = sqlite3.connect(db_path, timeout=30.0)
-    c = conn.cursor()
     
     # Check if doc exists
-    c.execute("SELECT local_path, judul FROM regulations WHERE id = ?", (doc_id,))
-    row = c.fetchone()
+    row = pg_service.query_one(
+        "SELECT local_path, judul FROM regulations WHERE id::text = %s", (doc_id,))
     if not row:
-        conn.close()
         raise HTTPException(status_code=404, detail="Not Found")
-        
-    local_path, judul = row
+
+    # (M4 hardening: refuse the delete while this document's background task
+    # (AI parse or vector+KG ingest) is still RUNNING. Legacy let the delete
+    # race the ingest: the ingest's later INSERTs recreated chunks/KG rows for
+    # the already-deleted doc, leaving orphans in the vector index. Observed
+    # live during the M3 smokes (doc 983 -> 8 orphan chunks); see the
+    # bug_reports.md entry "Deleting a document while its background ingest is
+    # running". The tiny window between confirm returning and the task thread
+    # registering itself remains -- the guard shrinks it from ~20s to ~ms.)
+    from services.app_state import ACTIVE_TASKS
+    task = ACTIVE_TASKS.get(f"task_{doc_id}")
+    if task and task.get("status") == "RUNNING":
+        raise HTTPException(
+            status_code=409,
+            detail="Dokumen sedang diproses (ingest berjalan). Coba hapus lagi beberapa saat.")
+
+    local_path, judul = row["local_path"], row["judul"]
     
     # 1. Delete physical file
     if local_path and os.path.exists(local_path):
@@ -432,37 +442,94 @@ async def delete_document(doc_id: str, current_user: dict = Depends(auth.require
         except Exception as e:
             print(f"Error deleting file {local_path}: {e}")
             
-    # 2. Delete from ChromaDB & FTS
+    # 2-5. Delete chunks + KG + grants + the regulation row in ONE transaction
+    # (Migration M3: the unified chunks table replaces both the Chroma delete
+    # and the chunks_fts delete. NOTE: the legacy kg_edges cleanup referenced
+    # source_doc_id/target_doc_id -- columns that do not exist in the live
+    # schema -- so it always failed silently and left orphaned edges; this
+    # now deletes by kg_edges.doc_id, the column that actually exists. The
+    # legacy code also committed steps 2-5 together at the end, so a single
+    # transaction preserves that all-or-nothing behavior.)
     try:
-        from main import get_chroma_collection
-        collection = get_chroma_collection()
-        collection.delete(where={"reg_id": doc_id})
-        
-        c.execute("DELETE FROM chunks_fts WHERE doc_id = ?", (doc_id,))
+        with pg_service.get_conn() as conn:
+            conn.execute("DELETE FROM chunks WHERE doc_id = %s", (doc_id,))
+            conn.execute("DELETE FROM kg_edges WHERE doc_id = %s", (doc_id,))
+            conn.execute("DELETE FROM kg_nodes WHERE doc_id = %s", (doc_id,))
+            conn.execute("DELETE FROM access_grants WHERE doc_id = %s", (doc_id,))
+            conn.execute("DELETE FROM regulations WHERE id::text = %s", (doc_id,))
     except Exception as e:
-        print(f"Error deleting from ChromaDB/FTS: {e}")
+        print(f"Error during document deletion cascade: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
         
-    # 3. Delete from Knowledge Graph
-    try:
-        c.execute("DELETE FROM kg_nodes WHERE doc_id = ?", (doc_id,))
-        c.execute("DELETE FROM kg_edges WHERE source_doc_id = ? OR target_doc_id = ?", (doc_id, doc_id))
-    except Exception as e:
-        print(f"Error deleting from KG: {e}")
+    # (steps 3-4 were folded into the single transaction above)
         
-    # 4. Delete Access Grants
-    try:
-        c.execute("DELETE FROM access_grants WHERE doc_id = ?", (doc_id,))
-    except Exception as e:
-        pass
-        
-    # 5. Delete Document Record
-    c.execute("DELETE FROM regulations WHERE id = ?", (doc_id,))
-    
-    conn.commit()
-    conn.close()
+    # (step 5 likewise -- the regulation row is deleted in the transaction above)
     
     # 6. Audit Log
-    from main import log_audit
+    from services.db_service import log_audit
     log_audit(current_user.get("id", ""), "DELETE_DOCUMENT", doc_id, f"Menghapus dokumen: {judul}")
  
     return {"message": "Dokumen berhasil dihapus."}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pending confirmation & failed-document cleanup endpoints
+# (moved verbatim from api/main.py during the Phase 2 refactor — same paths,
+#  same auth; /api prefix comes from this router)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ConfirmPendingRequest(BaseModel):
+    klasifikasi: str
+
+@router.post("/repository/pending/{doc_id}/confirm")
+async def confirm_pending_document(
+    doc_id: str,
+    req: ConfirmPendingRequest,
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(auth.require_role("sekretaris perusahaan"))
+):
+    doc = pg_service.query_one(
+        "SELECT local_path, nomor, judul, jenis, sektor FROM regulations "
+        "WHERE id::text = %s AND status = 'Menunggu Konfirmasi'", (doc_id,))
+    
+    if not doc:
+        raise HTTPException(status_code=404, detail="Dokumen pending tidak ditemukan.")
+
+    local_path, nomor, judul, jenis, sektor = (doc["local_path"], doc["nomor"],
+                                               doc["judul"], doc["jenis"], doc["sektor"])
+    
+    # Update DB
+    pg_service.execute(
+        "UPDATE regulations SET status = 'Berlaku', klasifikasi = %s WHERE id::text = %s",
+        (req.klasifikasi, doc_id))
+    
+    # Trigger vector DB injection and KG asynchronously
+    filename = os.path.basename(local_path)
+    background_tasks.add_task(ingest_document_background, local_path, doc_id, filename, nomor, jenis, sektor, 'Berlaku', req.klasifikasi)
+    
+    return {"message": "Dokumen berhasil dikonfirmasi dan dimasukkan ke repositori."}
+
+@router.delete("/repository/failed")
+async def delete_failed_documents(current_user: dict = Depends(auth.require_role("manajer"))):
+    """Deletes all documents that failed processing (e.g., Duplicates)."""
+    # (no params passed -> psycopg performs no %-substitution; LIKE 'Gagal%'
+    # is safe as a literal)
+    failed_docs = pg_service.query(
+        "SELECT id, local_path FROM regulations WHERE status LIKE 'Gagal%'")
+    
+    deleted_count = 0
+    # Single transaction for all deletes (Migration M3); the file removals
+    # stay interleaved exactly like the legacy loop.
+    with pg_service.get_conn() as conn:
+        for doc in failed_docs:
+            doc_id, local_path = doc["id"], doc["local_path"]
+            # Delete physical file
+            if local_path and os.path.exists(local_path):
+                try:
+                    os.remove(local_path)
+                except Exception as e:
+                    print(f"Error deleting file {local_path}: {e}")
+            # Delete from DB
+            conn.execute("DELETE FROM regulations WHERE id = %s", (doc_id,))
+            deleted_count += 1
+    
+    return {"message": f"Berhasil menghapus {deleted_count} dokumen yang gagal."}

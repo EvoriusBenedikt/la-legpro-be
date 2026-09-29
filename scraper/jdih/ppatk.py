@@ -1,6 +1,4 @@
 """PPATK Scraper — Anti-money laundering, KYC, TPPU, pelaporan transaksi"""
-import os, sys
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from base_scraper import BaseJDIHScraper
 
 class PPATKScraper(BaseJDIHScraper):

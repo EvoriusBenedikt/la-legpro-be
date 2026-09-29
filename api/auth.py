@@ -1,12 +1,13 @@
 import os
-import sqlite3
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any
+from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 import bcrypt
 import jwt
+
+from services import pg_service
 
 # --- Config ---
 SECRET_KEY = os.getenv("JWT_SECRET")
@@ -18,123 +19,42 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 # 24 hours
 security = HTTPBearer()
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DB_PATH = os.path.join(BASE_DIR, "data", "users.db")
 
 router = APIRouter()
 
 # --- Database Setup ---
+# Migration M3 (cutover): the users.db DDL and ALTER-based column migrations
+# init_db() used to carry are owned by migrations/001-004 in PostgreSQL
+# (applied by the postgres container on first init, and by the M2/M5
+# migration tooling on existing installs). Only the idempotent dummy
+# template seed remains, still run at import time exactly as before.
 def init_db():
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    # Users
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            id TEXT PRIMARY KEY,
-            username TEXT UNIQUE,
-            password_hash TEXT,
-            email TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    """Seed the dummy document templates on a fresh database (idempotent)."""
+    if pg_service.query_one("SELECT 1 FROM document_templates LIMIT 1") is not None:
+        return
+    dummy_templates = [
+        (
+            "tpl_pks_01",
+            "Perjanjian Kerja Sama (PKS) Standar",
+            "Template PKS standar untuk kerja sama B2B umum dengan penyedia layanan teknologi.",
+            "# PERJANJIAN KERJA SAMA\n\nPada hari ini, dibuat kesepakatan antara:\n1. PIHAK PERTAMA: [Nama Perusahaan 1]\n2. PIHAK KEDUA: [Nama Perusahaan 2]\n\n## PASAL 1 - RUANG LINGKUP\nKerja sama ini mencakup [Deskripsi Layanan].\n\n## PASAL 2 - JANGKA WAKTU\nPerjanjian ini berlaku selama [Durasi Bulan/Tahun].",
+            "PKS"
+        ),
+        (
+            "tpl_nda_01",
+            "Non-Disclosure Agreement (NDA)",
+            "Template perjanjian kerahasiaan dua arah untuk diskusi awal komersial.",
+            "# NON-DISCLOSURE AGREEMENT\n\nPerjanjian kerahasiaan ini ditandatangani oleh:\n1. PIHAK PENGUNGKAP: [Nama Pengungkap]\n2. PIHAK PENERIMA: [Nama Penerima]\n\n## PASAL 1 - INFORMASI RAHASIA\nInformasi yang dilindungi adalah [Jenis Informasi Rahasia].",
+            "NDA"
         )
-    ''')
-    # Chats
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS chat_sessions (
-            id TEXT PRIMARY KEY,
-            user_id TEXT,
-            title TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS chat_messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT,
-            role TEXT,
-            content TEXT,
-            sources_json TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    # Compliance
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS compliance_history (
-            id TEXT PRIMARY KEY,
-            user_id TEXT,
-            filename TEXT,
-            results_json TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    # Document Templates
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS document_templates (
-            id TEXT PRIMARY KEY,
-            title TEXT,
-            description TEXT,
-            content_template TEXT,
-            category TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    # Migrations for compliance_history
-    try:
-        c.execute('ALTER TABLE compliance_history ADD COLUMN company_name TEXT')
-    except sqlite3.OperationalError:
-        pass
-    try:
-        c.execute('ALTER TABLE compliance_history ADD COLUMN expiration_date TEXT')
-    except sqlite3.OperationalError:
-        pass
-    try:
-        c.execute('ALTER TABLE users ADD COLUMN role TEXT DEFAULT "pengguna"')
-    except sqlite3.OperationalError:
-        pass
-
-    # FR-31: Active Session Tracking
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS active_sessions (
-            user_id TEXT PRIMARY KEY,
-            username TEXT,
-            role TEXT,
-            last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            ip_address TEXT
-        )
-    ''')
-
-    # Seed dummy templates if empty
-    c.execute('SELECT COUNT(*) FROM document_templates')
-    if c.fetchone()[0] == 0:
-        dummy_templates = [
-            (
-                "tpl_pks_01",
-                "Perjanjian Kerja Sama (PKS) Standar",
-                "Template PKS standar untuk kerja sama B2B umum dengan penyedia layanan teknologi.",
-                "# PERJANJIAN KERJA SAMA\n\nPada hari ini, dibuat kesepakatan antara:\n1. PIHAK PERTAMA: [Nama Perusahaan 1]\n2. PIHAK KEDUA: [Nama Perusahaan 2]\n\n## PASAL 1 - RUANG LINGKUP\nKerja sama ini mencakup [Deskripsi Layanan].\n\n## PASAL 2 - JANGKA WAKTU\nPerjanjian ini berlaku selama [Durasi Bulan/Tahun].",
-                "PKS"
-            ),
-            (
-                "tpl_nda_01",
-                "Non-Disclosure Agreement (NDA)",
-                "Template perjanjian kerahasiaan dua arah untuk diskusi awal komersial.",
-                "# NON-DISCLOSURE AGREEMENT\n\nPerjanjian kerahasiaan ini ditandatangani oleh:\n1. PIHAK PENGUNGKAP: [Nama Pengungkap]\n2. PIHAK PENERIMA: [Nama Penerima]\n\n## PASAL 1 - INFORMASI RAHASIA\nInformasi yang dilindungi adalah [Jenis Informasi Rahasia].",
-                "NDA"
-            )
-        ]
-        c.executemany("INSERT INTO document_templates (id, title, description, content_template, category) VALUES (?, ?, ?, ?, ?)", dummy_templates)
-
-    conn.commit()
-    conn.close()
+    ]
+    pg_service.execute_many(
+        "INSERT INTO document_templates (id, title, description, content_template, category) "
+        "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (id) DO NOTHING",
+        dummy_templates,
+    )
 
 init_db()
-
-def get_db_connection():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
 
 # --- Security Utils & RBAC ---
 ROLE_LEVELS = {
@@ -180,14 +100,13 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         }
         # FR-31: Refresh last_seen for active session tracking
         try:
-            conn = get_db_connection()
-            conn.execute(
-                "INSERT INTO active_sessions (user_id, username, role, last_seen) VALUES (?, ?, ?, CURRENT_TIMESTAMP) "
-                "ON CONFLICT(user_id) DO UPDATE SET last_seen=CURRENT_TIMESTAMP, role=excluded.role, username=excluded.username",
+            pg_service.execute(
+                "INSERT INTO active_sessions (user_id, username, role, last_seen) "
+                "VALUES (%s, %s, %s, NOW()) "
+                "ON CONFLICT (user_id) DO UPDATE SET last_seen = NOW(), "
+                "role = EXCLUDED.role, username = EXCLUDED.username",
                 (user_id, user_data["username"], user_data["role"])
             )
-            conn.commit()
-            conn.close()
         except Exception:
             pass
         return user_data
@@ -266,21 +185,17 @@ import uuid
 
 @router.post("/register")
 def register(user: UserCreate):
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT id FROM users WHERE username = ?", (user.username,))
-    if c.fetchone():
-        conn.close()
+    if pg_service.query_one("SELECT id FROM users WHERE username = %s", (user.username,)):
         raise HTTPException(status_code=400, detail="Username already registered")
-    
+
     user_id = str(uuid.uuid4())
     hashed_password = get_password_hash(user.password)
-    
-    c.execute("INSERT INTO users (id, username, password_hash, email, role) VALUES (?, ?, ?, ?, ?)", 
-              (user_id, user.username, hashed_password, user.email, "pengguna"))
-    conn.commit()
-    conn.close()
-    
+
+    pg_service.execute(
+        "INSERT INTO users (id, username, password_hash, email, role) VALUES (%s, %s, %s, %s, %s)",
+        (user_id, user.username, hashed_password, user.email, "pengguna")
+    )
+
     access_token = create_access_token(
         data={"sub": user_id, "username": user.username, "email": user.email, "role": "pengguna"}, 
         expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
@@ -289,23 +204,18 @@ def register(user: UserCreate):
 
 @router.post("/login")
 def login(user: UserLogin):
-    conn = get_db_connection()
-    c = conn.cursor()
-    
-    # Also fetch role, but fallback safely if column missing due to incomplete migration
-    try:
-        c.execute("SELECT id, username, password_hash, email, role FROM users WHERE username = ?", (user.username,))
-    except sqlite3.OperationalError:
-        c.execute("SELECT id, username, password_hash, email, 'pengguna' as role FROM users WHERE username = ?", (user.username,))
-        
-    row = c.fetchone()
-    conn.close()
-    
+    # Migration M3: the legacy "role column may be missing" OperationalError
+    # fallbacks are gone -- the PG schema (migrations/001) always has role.
+    row = pg_service.query_one(
+        "SELECT id, username, password_hash, email, role FROM users WHERE username = %s",
+        (user.username,)
+    )
+
     if not row or not verify_password(user.password, row["password_hash"]):
         raise HTTPException(status_code=401, detail="Incorrect username or password")
-    
-    role = row["role"] if "role" in row.keys() else "pengguna"
-    
+
+    role = row["role"] or "pengguna"
+
     access_token = create_access_token(
         data={"sub": row["id"], "username": row["username"], "email": row["email"], "role": role}, 
         expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
@@ -314,20 +224,17 @@ def login(user: UserLogin):
 
 @router.post("/change-password")
 def change_password(data: PasswordChange, current_user: dict = Depends(get_current_user)):
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT password_hash FROM users WHERE id = ?", (current_user["id"],))
-    row = c.fetchone()
+    row = pg_service.query_one(
+        "SELECT password_hash FROM users WHERE id = %s", (current_user["id"],)
+    )
     if not row or not verify_password(data.old_password, row["password_hash"]):
-        conn.close()
         raise HTTPException(status_code=401, detail="Current password is incorrect")
     if verify_password(data.new_password, row["password_hash"]):
-        conn.close()
         raise HTTPException(status_code=400, detail="New password must be different from the current password")
-    c.execute("UPDATE users SET password_hash = ? WHERE id = ?",
-              (get_password_hash(data.new_password), current_user["id"]))
-    conn.commit()
-    conn.close()
+    pg_service.execute(
+        "UPDATE users SET password_hash = %s WHERE id = %s",
+        (get_password_hash(data.new_password), current_user["id"])
+    )
     return {"message": "Password updated successfully"}
 
 @router.get("/me")
@@ -339,17 +246,12 @@ def get_users(current_user: dict = Depends(get_current_user)):
     user_level = get_role_level(current_user.get("role", "pengguna"))
     if user_level < 2:  # Only managers and above can list users for ACL
         raise HTTPException(status_code=403, detail="Not authorized")
-        
-    conn = get_db_connection()
-    c = conn.cursor()
-    try:
-        c.execute("SELECT id, username, email, role FROM users")
-    except sqlite3.OperationalError:
-        c.execute("SELECT id, username, email, 'pengguna' as role FROM users")
-        
+
+    rows = pg_service.query("SELECT id, username, email, role FROM users")
+
     users = []
-    for row in c.fetchall():
-        row_level = get_role_level(row["role"])
+    for row in rows:
+        row_level = get_role_level(row["role"] or "pengguna")
         # Can only see users of equal or lower rank to grant access to (FR-21/FR-22)
         if row_level <= user_level and row["id"] != current_user["id"]:
             users.append({
@@ -358,5 +260,4 @@ def get_users(current_user: dict = Depends(get_current_user)):
                 "email": row["email"],
                 "role": row["role"]
             })
-    conn.close()
     return {"users": users}

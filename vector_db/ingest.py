@@ -1,80 +1,116 @@
+"""Bulk regulation ingestion (Migration M4: was SQLite -> ChromaDB).
+
+Reads every distinct local file registered in public.regulations, parses it
+(hybrid PyMuPDF+VLM extraction for PDFs, direct read for .txt), chunks it with the shared
+LegalChunker, embeds it with the vendored all-MiniLM-L6-v2 weights
+(services.embed_service) and upserts the rows into the unified PG chunks
+table.
+
+Legacy parity notes:
+  * chunk ids stay md5(f"{reg_id}_chunk_{i}") -- the M2 migration preserved
+    them, so re-ingesting a document overwrites its old rows instead of
+    duplicating (ON CONFLICT DO UPDATE == collection.upsert semantics).
+  * sparse_legacy stays FALSE: the bulk corpus lived only in Chroma (never in
+    the SQLite FTS5 index), so -- exactly like the migrated rows -- it takes
+    part in dense retrieval only, not the `WHERE sparse_legacy` BM25 side.
+  * the other chunk columns mirror the legacy Chroma metadata 1:1
+    (doc_category/user_id stay NULL for this tool, as before). visibility
+    defaults to 'public' since the 2026-09-29 corpus fix: NULL left chunks
+    invisible to retrieval for EVERY user (the filter is visibility='public'
+    OR user_id=<caller>; NULL matches neither), and the ON CONFLICT clause
+    below rewrites visibility on every re-ingest, so without the default a
+    re-ingest would reset backfilled rows to NULL. Access control is
+    unchanged -- retrieve_contexts still gates every candidate through
+    regulations.klasifikasi + access_grants (is_allowed). See
+    la-legpro-doc/bug_reports.md.
+
+Run in the container (supported default; needs parser + embedder deps):
+    docker exec legpro-backend python /app/vector_db/ingest.py [search QUERY | force]
+"""
+import hashlib
 import os
 import sys
-import sqlite3
-import hashlib
-import chromadb
-from chromadb.utils import embedding_functions
+import time
 
-# Add parser directory to path so we can import our Parser and Chunker
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(os.path.join(BASE_DIR, "parser"))
+sys.path.insert(0, BASE_DIR)
 
-from pdf_parser import LegalDocumentParser, LegalChunker
+import script_env
 
-# Configuration
-DB_PATH = os.path.join(BASE_DIR, "data", "legal_metadata.db")
-CHROMA_DB_DIR = os.path.join(BASE_DIR, "data", "chroma_db")
+script_env.bootstrap(needs_parser=True)
 
-def init_chroma():
-    print(f"Initializing ChromaDB at {CHROMA_DB_DIR}...")
-    client = chromadb.PersistentClient(path=CHROMA_DB_DIR)
-    collection = client.get_or_create_collection(
-        name="ojk_regulations",
-        metadata={"hnsw:space": "cosine"}
-    )
-    return client, collection
+from pdf_parser import LegalChunker
+from services.rag_service import extract_text_hybrid
+from services import pg_service
+from services.embed_service import embed_documents, embed_query
 
-def get_indexed_reg_ids(collection) -> set:
-    """Return the set of reg_ids already stored in ChromaDB."""
+# Full-row upsert: ON CONFLICT mirrors the legacy collection.upsert (which
+# replaced documents AND metadatas wholesale), so a re-ingest refreshes every
+# column of the chunk.
+UPSERT_CHUNK = (
+    "INSERT INTO chunks (id, doc_id, text, window_context, domain, jenis, "
+    "judul, nomor, sektor, status, filename, doc_category, visibility, "
+    "user_id, embedding, sparse_legacy) "
+    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
+    "%s::vector, FALSE) "
+    "ON CONFLICT (id) DO UPDATE SET text = EXCLUDED.text, "
+    "window_context = EXCLUDED.window_context, domain = EXCLUDED.domain, "
+    "jenis = EXCLUDED.jenis, judul = EXCLUDED.judul, nomor = EXCLUDED.nomor, "
+    "sektor = EXCLUDED.sektor, status = EXCLUDED.status, "
+    "filename = EXCLUDED.filename, doc_category = EXCLUDED.doc_category, "
+    "visibility = EXCLUDED.visibility, user_id = EXCLUDED.user_id, "
+    "embedding = EXCLUDED.embedding"
+)
+
+
+def get_indexed_reg_ids() -> set:
+    """Return the set of doc_ids already stored in the chunks table."""
     try:
-        result = collection.get(include=["metadatas"])
-        return {m.get("reg_id", "") for m in result["metadatas"] if m.get("reg_id")}
+        rows = pg_service.query(
+            "SELECT DISTINCT doc_id FROM chunks WHERE doc_id IS NOT NULL")
+        return {r["doc_id"] for r in rows}
     except Exception:
         return set()
 
+
 def ingest_documents(force_reindex=False):
-    if not os.path.exists(DB_PATH):
-        print(f"SQLite DB not found: {DB_PATH}")
-        return
-
-    client, collection = init_chroma()
-    parser = None  # Lazy-init: only created when a PDF is actually encountered
-    chunker = LegalChunker()
-
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-
-    # Fetch DISTINCT (reg_id, local_path) rows — skip rows without a local file
-    c.execute("""
-        SELECT id, domain, judul, nomor, jenis, sektor, status, local_path
-        FROM regulations
-        WHERE local_path IS NOT NULL AND local_path != ''
-        GROUP BY local_path        -- de-duplicate identical paths
-    """)
-    records = c.fetchall()
-    conn.close()
-
+    # DISTINCT ON (local_path) is the PG idiom for the legacy SQLite
+    # `GROUP BY local_path` de-duplication (deterministic: lowest id wins).
+    records = pg_service.query(
+        "SELECT DISTINCT ON (local_path) id, domain, judul, nomor, jenis, "
+        "sektor, status, local_path FROM regulations "
+        "WHERE local_path IS NOT NULL AND local_path != '' "
+        "ORDER BY local_path, id"
+    )
     print(f"Found {len(records)} unique regulation files in DB.")
 
+    chunker = LegalChunker()
+
     # Get already-indexed reg_ids so we can skip them
-    already_indexed = set() if force_reindex else get_indexed_reg_ids(collection)
-    print(f"Already indexed: {len(already_indexed)} reg_ids  |  Skip mode: {not force_reindex}")
+    already_indexed = set() if force_reindex else get_indexed_reg_ids()
+    print(f"Already indexed: {len(already_indexed)} doc_ids  |  Skip mode: {not force_reindex}")
 
     processed = 0
     skipped_exists = 0
     skipped_missing = 0
     failed = 0
-    to_process = [r for r in records if str(r[0]) not in already_indexed and r[7] and os.path.exists(r[7])]
+    # resolve_data_path maps legacy Windows host paths (migrated rows) onto
+    # this environment's mount point before the existence check.
+    to_process = [r for r in records
+                  if str(r["id"]) not in already_indexed
+                  and r["local_path"]
+                  and os.path.exists(script_env.resolve_data_path(r["local_path"]))]
     total_new = len(to_process)
     print(f"New files to index: {total_new}  |  Will skip: {len(records) - total_new}\n")
 
-    import time
     t_start = time.time()
 
     for row in records:
-        reg_id, domain, judul, nomor, jenis, sektor, status, local_path = row
-        reg_id_str = str(reg_id)
-        filename = os.path.basename(local_path) if local_path else ""
+        reg_id_str = str(row["id"])
+        domain, judul, nomor = row["domain"], row["judul"], row["nomor"]
+        jenis, sektor, status = row["jenis"], row["sektor"], row["status"]
+        local_path = script_env.resolve_data_path(row["local_path"])
+        filename = os.path.basename(local_path.replace("\\", "/")) if local_path else ""
 
         # Skip already indexed
         if reg_id_str in already_indexed:
@@ -110,11 +146,10 @@ def ingest_documents(force_reindex=False):
                 with open(local_path, "r", encoding="utf-8") as f:
                     full_text = f.read()
             else:
-                # Lazy-init PaddleOCR only when we actually hit a PDF
-                if parser is None:
-                    print("  [INFO] Initializing PaddleOCR for PDF processing...")
-                    parser = LegalDocumentParser()
-                full_text = parser.parse_pdf(local_path)
+                # (R1 bugfix: hybrid extraction -- PyMuPDF for digital pages,
+                # VLM for scanned/garbled ones. The legacy PaddleOCR chain was
+                # dead in every shipped image; see bug_reports.md.)
+                full_text = extract_text_hybrid(local_path)
 
             if not full_text.strip():
                 print(f"  [WARN] No text extracted from {filename}. Skipping.")
@@ -139,7 +174,7 @@ def ingest_documents(force_reindex=False):
                 failed += 1
                 continue
 
-            # 3. Build ChromaDB payload — use reg_id (not nomor) to avoid collisions
+            # 3. Build the payload — use reg_id (not nomor) to avoid collisions
             documents, metadatas, ids = [], [], []
             for i, chunk_data in enumerate(chunks):
                 clean_meta = {k: v for k, v in chunk_data["metadata"].items() if v is not None}
@@ -149,8 +184,17 @@ def ingest_documents(force_reindex=False):
                 documents.append(chunk_data["text"])
                 metadatas.append(clean_meta)
 
-            # 4. Insert into ChromaDB (upsert-style: add will error on duplicate → use upsert)
-            collection.upsert(documents=documents, metadatas=metadatas, ids=ids)
+            # 4. Embed + upsert into the unified PG chunks table
+            embeddings = embed_documents(documents)
+            with pg_service.get_conn() as conn:
+                for chunk_id, text, meta, emb in zip(ids, documents, metadatas, embeddings):
+                    conn.execute(
+                        UPSERT_CHUNK,
+                        (chunk_id, meta.get("reg_id"), text, meta.get("window_context"),
+                         meta.get("domain"), meta.get("jenis"), meta.get("judul"),
+                         meta.get("nomor"), meta.get("sektor"), meta.get("status"),
+                         meta.get("filename"), meta.get("doc_category"),
+                         meta.get("visibility") or "public", meta.get("user_id"), emb))
             processed += 1
 
         except Exception as e:
@@ -159,27 +203,32 @@ def ingest_documents(force_reindex=False):
 
     elapsed_total = time.time() - t_start
     m_total, s_total = divmod(int(elapsed_total), 60)
-    print(f"\n\n" + "="*50)
+    total_chunks = pg_service.query_one("SELECT COUNT(*) AS n FROM chunks")["n"]
+    print("\n\n" + "="*50)
     print(f"INGESTION COMPLETE  (took {m_total:02d}m {s_total:02d}s)")
     print(f"  Newly indexed : {processed}")
     print(f"  Already existed: {skipped_exists}")
     print(f"  File missing  : {skipped_missing}")
     print(f"  Failed / empty: {failed}")
-    print(f"  Total chunks in ChromaDB: {collection.count()}")
+    print(f"  Total chunks in PG store: {total_chunks}")
     print("="*50)
 
 
 def search_collection(query, n_results=3):
-    client, collection = init_chroma()
+    """Dense top-N over the chunks table (was a Chroma collection.query)."""
     print(f"\nSearching for: '{query}'")
-    results = collection.query(query_texts=[query], n_results=n_results)
-    for i in range(len(results['documents'][0])):
-        doc = results['documents'][0][i]
-        meta = results['metadatas'][0][i]
-        dist = results['distances'][0][i]
-        print(f"\n[{i+1}] Distance: {dist:.4f}")
-        print(f"Regulation: {meta.get('jenis')} Nomor {meta.get('nomor')} ({meta.get('sektor')})")
-        print(f"Preview: {doc[:300]}...")
+    q_vec = embed_query(query)
+    with pg_service.get_conn() as conn:
+        conn.execute("SET LOCAL hnsw.ef_search = 100")
+        rows = conn.execute(
+            "SELECT text, jenis, nomor, sektor, embedding <=> %s::vector AS dist "
+            "FROM chunks WHERE embedding IS NOT NULL "
+            "ORDER BY embedding <=> %s::vector LIMIT %s",
+            (q_vec, q_vec, n_results)).fetchall()
+    for i, row in enumerate(rows):
+        print(f"\n[{i+1}] Distance: {row['dist']:.4f}")
+        print(f"Regulation: {row['jenis']} Nomor {row['nomor']} ({row['sektor']})")
+        print(f"Preview: {row['text'][:300]}...")
 
 
 if __name__ == "__main__":

@@ -1,7 +1,13 @@
-import os
-import sys
+"""Kemenkeu JDIH scraper — unimplemented stub, not registered in runner.
 
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+scrape() is a template placeholder that only prints; nothing is fetched.
+The class is importable and convention-compliant (README §6.1) but is
+intentionally absent from run_all_scrapers.py SCRAPERS. The Kemenkeu PDFs
+in data/pdfs/kemenkeu were ingested by earlier tooling, not by this stub.
+To activate: implement the TODO steps in scrape() against
+https://jdih.kemenkeu.go.id, then add
+("Kemenkeu", "kemenkeu", "KemenkeuScraper") to SCRAPERS.
+"""
 from base_scraper import BaseJDIHScraper
 
 class KemenkeuScraper(BaseJDIHScraper):

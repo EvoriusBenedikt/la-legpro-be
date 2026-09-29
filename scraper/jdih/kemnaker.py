@@ -1,14 +1,20 @@
-import os
-import sys
+"""Kemnaker JDIH scraper — Selenium-based, host-only, not registered in runner.
+
+Requires selenium + a local Chrome/chromedriver. selenium is deliberately
+absent from requirements.txt (the Docker runtime image ships no Chrome),
+so this scraper is intentionally absent from run_all_scrapers.py SCRAPERS.
+Run manually on a host with Chrome installed:
+    python scraper/jdih/kemnaker.py
+To activate in the runner: add selenium to requirements.txt, install
+Chrome + chromedriver in the runtime image (DevOps coordination), then add
+("Kemnaker", "kemnaker", "KemnakerScraper") to SCRAPERS. See README §6.1.
+"""
 import time
-import re
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-# Add parent directory to path to import base_scraper
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from base_scraper import BaseJDIHScraper
 
 class KemnakerScraper(BaseJDIHScraper):
@@ -38,7 +44,7 @@ class KemnakerScraper(BaseJDIHScraper):
                 WebDriverWait(driver, 15).until(
                     EC.presence_of_element_located((By.CSS_SELECTOR, "a[href*='/peraturan/detail/']"))
                 )
-            except Exception as e:
+            except Exception:
                 print("Timeout waiting for links to load. The site might be blocking headless browsers or using a different layout.")
             
             time.sleep(2) # Extra buffer for JS rendering

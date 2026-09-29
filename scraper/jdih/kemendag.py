@@ -1,6 +1,4 @@
 """Kemendag Scraper — Perdagangan, e-commerce, perlindungan konsumen"""
-import os, sys
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from base_scraper import BaseJDIHScraper
 
 class KemendagScraper(BaseJDIHScraper):

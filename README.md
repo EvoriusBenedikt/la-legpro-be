@@ -291,6 +291,22 @@ The knowledge base is a two-layer system:
 
 All scrapers inherit from `BaseJDIHScraper` (`scraper/jdih/base_scraper.py`).
 
+**Naming convention (single standard — Phase 3 audit, 2026-09):**
+- File: `scraper/jdih/<agency>.py` — snake_case common abbreviation, **no `_scraper` suffix**.
+- Class: PascalCase of the same abbreviation + `Scraper` (`kominfo.py` → `KominfoScraper`).
+  Letter-spelled acronyms stay ALL-CAPS: `bi.py` → `BIScraper`, `dpr.py` → `DPRScraper`,
+  `ppatk.py` → `PPATKScraper`, `bpjs_kesehatan.py` → `BPJSKesehatanScraper`.
+- Import: bare `from base_scraper import BaseJDIHScraper` — **no `sys.path` hacks**
+  (`run_all_scrapers.py` inserts the folder; direct runs get it via `sys.path[0]`).
+- Entry point: `scrape(self, limit: int = 100)` plus an `if __name__ == "__main__":` block.
+- `super().__init__("<Domain_Name>")` strings are the SQLite `domain` data contract —
+  never rename them (existing rows would diverge from new ones).
+- `scraper/jdih/` holds **agency scrapers only**; curated direct-to-Chroma injectors
+  live in `vector_db/` (e.g. `vector_db/ingest_nda_corpus.py`, moved here from
+  `scraper/jdih/nda_scraper.py` in Phase 3).
+- Not registered in `run_all_scrapers.py` (intentional): `kemenkeu.py` (TODO stub),
+  `kemnaker.py` (requires selenium + Chrome — host-only, run manually).
+
 **Base class provides:**
 - `save_to_db()` — writes metadata to SQLite
 - `download_pdf()` — downloads and saves PDF to `data/pdfs/`

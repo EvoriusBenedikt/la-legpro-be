@@ -1,0 +1,32 @@
+# One-shot migration-tools image (Migration M5).
+#
+# migrate_data.py / verify_migration.py must read the LEGACY Chroma store, but
+# the backend image deliberately no longer ships chromadb (removed in M4). This
+# small image provides the exact M2-proven toolchain instead:
+#   * chromadb==1.5.9  -- pinned to the legacy on-disk data format (M2 finding)
+#   * psycopg[binary]==3.3.6 + python-dotenv==1.2.2 -- same pins as
+#     api/requirements.txt, so migration and app see PG identically.
+#
+# Build (context = migrations/, nothing is copied into the image):
+#   docker build -f migrations/Dockerfile.migrate-tools \
+#     -t la-legpro-migrate-tools:m5 migrations/
+#
+# Run (repo mounted as-is; REPO_ROOT resolves to /work, so the default
+# --data-dir /work/data is the instance's legacy store directory):
+#   docker run --rm --network la-legpro-be_default \
+#     -v <repo>/la-legpro-be:/work \
+#     -e DATABASE_URL=postgresql://legpro:<POSTGRES_PASSWORD>@postgres:5432/legpro \
+#     la-legpro-migrate-tools:m5 python migrations/migrate_data.py
+#
+# Ship to instance-3 offline via:
+#   docker save la-legpro-migrate-tools:m5 -o la-legpro-migrate-tools_m5.tar
+FROM python:3.12-slim
+
+RUN pip install --no-cache-dir \
+    chromadb==1.5.9 \
+    "psycopg[binary]==3.3.6" \
+    python-dotenv==1.2.2
+
+WORKDIR /work
+
+CMD ["python", "migrations/migrate_data.py", "--help"]

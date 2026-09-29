@@ -1,6 +1,4 @@
 """Kominfo / Komdigi JDIH Scraper — UU ITE, PDP, Sistem Elektronik"""
-import os, sys, time
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from base_scraper import BaseJDIHScraper
 
 class KominfoScraper(BaseJDIHScraper):

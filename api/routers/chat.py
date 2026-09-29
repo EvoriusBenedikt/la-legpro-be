@@ -1,9 +1,9 @@
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
-import sqlite3, os, json, time, re
-from typing import List, Optional, Any
+from fastapi import APIRouter, Depends, HTTPException
+import os, re
+from typing import List
 from pydantic import BaseModel
 import auth
-import chromadb
+from services import pg_service
 from services.llm_client import call_glm
 
 router = APIRouter(prefix="/api", tags=["chat"])
@@ -24,12 +24,9 @@ class ChatResponse(BaseModel):
 class SessionRequest(BaseModel):
     title: str
 
-try:
-    chroma_client = chromadb.PersistentClient(path=os.path.join(BASE_DIR, "data", "chromadb"))
-    collection = chroma_client.get_or_create_collection(name="regulations")
-except Exception as e:
-    print("ChromaDB Error in chat router:", e)
-    collection = None
+# Migration M3: the module-level ChromaDB client for data/chromadb was
+# vestigial -- that store held only an empty "regulations" collection which
+# was never queried (retrieval goes through services.rag_service). Removed.
 
 @router.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(req: ChatRequest, current_user: dict = Depends(auth.get_current_user)):
@@ -44,7 +41,9 @@ async def chat_endpoint(req: ChatRequest, current_user: dict = Depends(auth.get_
         raise HTTPException(status_code=400, detail="Missing user message")
 
     # 1. Retrieve Semantic Context
-    from main import retrieve_contexts, retrieve_graph_contexts, log_audit
+    from services.rag_service import retrieve_contexts
+    from services.kg_service import retrieve_graph_contexts
+    from services.db_service import log_audit
     contexts = retrieve_contexts(last_user_message, current_user=current_user)
     
     # FR-16: 1.5 Retrieve Graph Context
@@ -71,12 +70,10 @@ async def chat_endpoint(req: ChatRequest, current_user: dict = Depends(auth.get_
     # Fetch user's contract monitor stats
     user_stats_str = ""
     try:
-        conn = auth.get_db_connection()
-        c = conn.cursor()
-        c.execute("SELECT id FROM compliance_history WHERE user_id = ?", (current_user["id"],))
-        rows = c.fetchall()
-        total_docs = len(rows)
-        conn.close()
+        stats_row = pg_service.query_one(
+            "SELECT COUNT(*) AS n FROM compliance_history WHERE user_id = %s",
+            (current_user["id"],))
+        total_docs = stats_row["n"] if stats_row else 0
         user_stats_str = f"INFO SISTEM (DASHBOARD PENGGUNA): Pengguna saat ini memiliki total {total_docs} dokumen yang tersimpan dan dipantau di dalam Contract Monitor.\n\n"
     except Exception as e:
         print(f"Failed to fetch user stats for chatbot: {e}")

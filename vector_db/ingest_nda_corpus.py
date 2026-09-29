@@ -1,8 +1,24 @@
+"""
+ingest_nda_corpus.py
+====================
+Inject curated NDA-related clauses (UU 30/2000 Rahasia Dagang, UU 27/2022 PDP,
+UU 11/2008 ITE, KUHPerdata 1320/1338/1339/1243) directly into ChromaDB under
+`mock_*` ids. Moved from scraper/jdih/nda_scraper.py in the Phase 3 naming
+audit: it scrapes nothing — it is a curated-corpus ingest tool, sibling of
+ingest.py / fast_ingest_txt.py.
+
+RETIRED (Migration M4, 2026-09-26): the curated `mock_*` chunks this seeded
+were carried into the PG `chunks` table verbatim by the M2 data migration
+(fresh deployments get them through migrations/migrate_data.py), ChromaDB is
+gone and the chromadb dependency was removed from requirements.txt -- so this
+script fails with ImportError by design. Kept unported as the canonical text
+of the curated clauses; do not run.
+"""
+
 import os
 import chromadb
-import uuid
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # project root
 CHROMA_DIR = os.path.join(BASE_DIR, "data", "chroma_db")
 
 # Crucial NDA regulations

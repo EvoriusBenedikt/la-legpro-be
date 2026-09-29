@@ -11,11 +11,8 @@ Strategy:
 """
 
 import os
-import sys
 import time
-import requests
 
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from base_scraper import BaseJDIHScraper
 
 class SetkabScraper(BaseJDIHScraper):
@@ -135,7 +132,6 @@ class SetkabScraper(BaseJDIHScraper):
                         items = data.get("data", []) or data.get("results", [])
                     except Exception:
                         # HTML fallback — basic parsing
-                        from html.parser import HTMLParser
                         items = []
 
                     for item in items:

@@ -5,7 +5,8 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from auth import get_current_user, get_db_connection
+from auth import get_current_user
+from services import pg_service
 
 router = APIRouter()
 
@@ -41,15 +42,14 @@ class TemplateGenerateRequest(BaseModel):
 
 @router.get("/templates")
 def get_templates(current_user: dict = Depends(get_current_user)):
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute(
-        "SELECT id, title, description, content_template, category, created_at "
+    # Migration M3: created_at is formatted in SQL to keep the exact
+    # 'YYYY-MM-DD HH:MM:SS' (UTC) string shape the FE has always received.
+    rows = pg_service.query(
+        "SELECT id, title, description, content_template, category, "
+        "to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at "
         "FROM document_templates ORDER BY created_at DESC"
     )
-    templates = [dict(row) for row in c.fetchall()]
-    conn.close()
-    return {"templates": templates}
+    return {"templates": rows}
 
 
 @router.post("/templates/generate")
@@ -57,12 +57,10 @@ def generate_document_from_template(
     req: TemplateGenerateRequest,
     current_user: dict = Depends(get_current_user)
 ):
-    # 1. Fetch the template from SQLite
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT * FROM document_templates WHERE id = ?", (req.template_id,))
-    template_row = c.fetchone()
-    conn.close()
+    # 1. Fetch the template from PostgreSQL
+    template_row = pg_service.query_one(
+        "SELECT * FROM document_templates WHERE id = %s", (req.template_id,)
+    )
 
     if not template_row:
         raise HTTPException(status_code=404, detail="Template not found")

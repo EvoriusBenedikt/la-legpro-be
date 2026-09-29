@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   backend:
     build:
@@ -9,11 +7,60 @@ services:
     ports:
       - "8080:8000"
     volumes:
-      # Persist SQLite and ChromaDB data
+      # App data: uploaded PDFs, vendored model weights (data/models/), PG
+      # backup tars. Also holds the legacy SQLite files until the migration is
+      # signed off; the legacy ChromaDB dirs were deleted in M4.
       - ./data:/app/data
       # Mount .env so host changes reflect inside container
       - ./.env:/app/.env
       # Mount api code for hot reloading
       - ./api:/app/api
+      # Migration M4: the peripheral ops scripts (scrapers, bulk ingest,
+      # audits, accuracy eval) now talk to PG and run inside this container
+      # (psycopg + embedder + vendored weights live here). Mounted like ./api
+      # so host edits go live without a rebuild.
+      - ./vector_db:/app/vector_db
+      - ./scraper:/app/scraper
+      - ./script_env.py:/app/script_env.py
+      - ./run_all_scrapers.py:/app/run_all_scrapers.py
+      - ./check_db.py:/app/check_db.py
+      - ./evaluate_accuracy.py:/app/evaluate_accuracy.py
     environment:
       - PYTHONUNBUFFERED=1
+      # Migration M1: PostgreSQL + pgvector (compose interpolation reads la-legpro-be/.env)
+      - DATABASE_URL=postgresql://legpro:${POSTGRES_PASSWORD:-legpro}@postgres:5432/legpro
+      # Migration M3: huggingface.co is unreachable from this network (corporate
+      # SNI/DNS block), so the embedder + reranker weights are vendored in the
+      # mounted ./data/models dir (fetched once from ModelScope mirrors of the
+      # official repos; see la-legpro-doc/updates.md). Both services treat these
+      # vars as local model directories -- no hub access at runtime.
+      - EMBEDDER_MODEL_NAME=/app/data/models/all-MiniLM-L6-v2
+      - RERANKER_MODEL_NAME=/app/data/models/ms-marco-MiniLM-L-6-v2
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: legpro-postgres
+    environment:
+      - POSTGRES_DB=legpro
+      - POSTGRES_USER=legpro
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-legpro}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      # Schema is applied automatically on first init (empty volume);
+      # later changes go through new numbered migration files.
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    ports:
+      # Loopback-only: host tools and out-of-container uvicorn can reach PG,
+      # but it is not exposed on the LAN.
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U legpro -d legpro"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  pg_data:

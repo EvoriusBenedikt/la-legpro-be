@@ -1,24 +1,39 @@
+"""Golden-question accuracy evaluation (Migration M4: was ChromaDB + GLM_* env).
+
+Retrieves public chunks for 20 golden questions from the PG chunks table
+(embedding via services.embed_service -- the vendored all-MiniLM-L6-v2 that
+replaced ChromaDB's default ONNX embedder), answers them through the shared
+services.llm_client.call_glm (MODEL_BASE_URL/MODEL_API_KEY/LLAMA_MODEL from
+.env, with the production retry + llm_metrics logging) and keyword-grades the
+answers.
+
+The legacy script read GLM_BASE_URL/GLM_API_KEY/GLM_MODEL -- env names that
+no longer exist in .env -- and imported termcolor, which was never in
+requirements.txt; both are fixed by this cutover.
+
+Run in the container (supported default; needs the embedder + LLM reachability):
+    docker exec legpro-backend python /app/evaluate_accuracy.py
+"""
 import os
+import sys
+import textwrap
 import time
-import chromadb
-import requests
-import json
-from termcolor import colored
 
-from dotenv import load_dotenv
-
-# --- Configuration ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-load_dotenv(os.path.join(BASE_DIR, ".env"))
+sys.path.insert(0, BASE_DIR)
 
-CHROMA_DB_DIR = os.path.join(BASE_DIR, "data", "chroma_db")
+import script_env
 
-# Using the GLM API from .env
-GLM_BASE_URL = os.getenv("GLM_BASE_URL")
-GLM_API_KEY = os.getenv("GLM_API_KEY")
-MODEL_NAME = os.getenv("GLM_MODEL")
+script_env.bootstrap()
 
-OLLAMA_URL = f"{GLM_BASE_URL}/chat/completions"
+from services import pg_service
+from services.embed_service import embed_query
+from services.llm_client import call_glm
+
+# --- Minimal ANSI coloring (replaces the termcolor dependency) ---
+def colored(text: str, color: str) -> str:
+    codes = {"cyan": "36", "magenta": "35", "green": "32", "red": "31", "yellow": "33"}
+    return f"\033[{codes.get(color, '0')}m{text}\033[0m"
 
 # --- Test Data (Golden Questions) ---
 # Format: {"question": "...", "expected_keywords": ["..."]}
@@ -119,33 +134,26 @@ TEST_SUITE = [
 ]
 
 
-def get_chroma_collection():
-    client = chromadb.PersistentClient(path=CHROMA_DB_DIR)
-    return client.get_or_create_collection(
-        name="ojk_regulations",
-        metadata={"hnsw:space": "cosine"}
-    )
-
 def retrieve_public_context(query: str, n_results=5) -> str:
-    collection = get_chroma_collection()
-    results = collection.query(
-        query_texts=[query],
-        n_results=n_results,
-        where={"visibility": "public"}
-    )
-    
-    contexts = []
-    if results and results['documents']:
-        for i in range(len(results['documents'][0])):
-            doc = results['documents'][0][i]
-            meta = results['metadatas'][0][i]
-            contexts.append(f"SUMBER: {meta.get('jenis')} {meta.get('nomor')}\n{doc}")
-            
+    """Dense top-N over public chunks (was a Chroma collection.query with a
+    where={"visibility": "public"} metadata filter -- exact-match semantics,
+    so rows without visibility never matched there and NULLs don't match here)."""
+    q_vec = embed_query(query)
+    with pg_service.get_conn() as conn:
+        conn.execute("SET LOCAL hnsw.ef_search = 100")
+        rows = conn.execute(
+            "SELECT text, jenis, nomor FROM chunks "
+            "WHERE visibility = 'public' AND embedding IS NOT NULL "
+            "ORDER BY embedding <=> %s::vector LIMIT %s",
+            (q_vec, n_results)).fetchall()
+
+    contexts = [f"SUMBER: {r['jenis']} {r['nomor']}\n{r['text']}" for r in rows]
     context = "\n\n".join(contexts)
     # Truncate context to prevent API payload size issues
     if len(context) > 4000:
         context = context[:4000] + "\n...[TRUNCATED]"
     return context
+
 
 def query_llm(question: str, context: str) -> str:
     system_prompt = (
@@ -153,87 +161,67 @@ def query_llm(question: str, context: str) -> str:
         "Jika jawabannya tidak ada di dalam konteks, katakan 'Berdasarkan dokumen yang diberikan, tidak ada informasi'.\n\n"
         f"KONTEKS:\n{context}"
     )
-    
-    payload = {
-        "model": MODEL_NAME,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": question}
-        ],
-        "stream": False,
-        "temperature": 0.1
-    }
-    
-    headers = {
-        "Authorization": f"Bearer {GLM_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    
-    print(f"         [DEBUG] Sending payload of size ~{len(str(payload))} chars...")
-    
+
+    print(f"         [DEBUG] Sending payload of size ~{len(system_prompt) + len(question)} chars...")
+
     try:
-        response = requests.post(OLLAMA_URL, json=payload, headers=headers, timeout=60)
-        if response.status_code == 200:
-            return response.json()['choices'][0]['message']['content']
-        else:
-            print(f"         [API ERROR] Status: {response.status_code}, Msg: {response.text}")
-            return "Error: HTTP " + str(response.status_code)
-    except requests.exceptions.ConnectionError:
-        print("         [API ERROR] Connection aborted (Remote end closed connection). Payload might be too large.")
-        return "Error: Connection aborted"
+        return call_glm(
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": question},
+            ],
+            temperature=0.1,
+            timeout=60,
+        )
     except Exception as e:
+        # call_glm raises HTTPException with the user-facing Indonesian message;
+        # grading below treats any "Error:" answer as a miss, like the legacy.
         print(f"         [API ERROR] {e}")
         return "Error: " + str(e)
 
+
 def run_evaluation():
-    print(colored("Starting Automated AI Evaluation...", "cyan", attrs=["bold"]))
+    print(colored("Starting Automated AI Evaluation...", "cyan"))
     print(f"Total test cases: {len(TEST_SUITE)}\n")
-    
+
     passed = 0
-    
+
     for i, test in enumerate(TEST_SUITE, 1):
         question = test["question"]
         expected = test["expected_keywords"]
-        
+
         print(f"[{i}/{len(TEST_SUITE)}] Testing: {question}")
-        
+
         # 1. Retrieve Context
         start_time = time.time()
         context = retrieve_public_context(question)
-        
+
         # 2. Query LLM
         answer = query_llm(question, context)
         latency = time.time() - start_time
-        
+
         # 3. Grade Answer
         answer_lower = answer.lower()
         matched = [kw for kw in expected if kw.lower() in answer_lower]
         score = len(matched) / len(expected) * 100
-        
+
         is_pass = score > 0 # Require at least 1 keyword for a pass in this simple script
-        
+
         print("\n         " + colored("=== AI Answer ===", "magenta"))
-        import textwrap
         print(textwrap.indent(answer, "         "))
         print("         " + colored("=================", "magenta") + "\n")
-        
+
         if is_pass:
             passed += 1
             print(colored(f"  [PASS] Score: {score:.0f}% ({latency:.2f}s)", "green"))
         else:
             print(colored(f"  [FAIL] Score: {score:.0f}% ({latency:.2f}s)", "red"))
             print(f"         Expected keywords missing: {set(expected) - set(matched)}\n")
-            
+
     # Summary
     print("\n" + "="*40)
-    print(colored(f"EVALUATION COMPLETE: {passed}/{len(TEST_SUITE)} Passed", "yellow", attrs=["bold"]))
+    print(colored(f"EVALUATION COMPLETE: {passed}/{len(TEST_SUITE)} Passed", "yellow"))
     print("="*40)
 
 if __name__ == "__main__":
-    try:
-        from termcolor import colored
-    except ImportError:
-        # Fallback if termcolor is not installed
-        def colored(text, *args, **kwargs): return text
-        
     run_evaluation()
