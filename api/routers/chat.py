@@ -44,7 +44,19 @@ async def chat_endpoint(req: ChatRequest, current_user: dict = Depends(auth.get_
     from services.rag_service import retrieve_contexts
     from services.kg_service import retrieve_graph_contexts
     from services.db_service import log_audit
-    contexts = retrieve_contexts(last_user_message, current_user=current_user)
+    # 2026-10-03: retrieval is best-effort. A missing embedder/reranker (a
+    # deploy host shipped without data/models made every chat 500 -- see
+    # bug_reports.md 2026-10-03) or a vector-store fault must not take down
+    # the whole conversation. Degrade to an ungrounded answer instead: the
+    # system prompt below forbids fabricated citations and a visible notice
+    # is appended to the answer, so the degradation is loud, never silent.
+    retrieval_degraded = False
+    try:
+        contexts = retrieve_contexts(last_user_message, current_user=current_user)
+    except Exception as e:
+        print(f"Chat retrieval failed, degrading to ungrounded answer: {e}")
+        contexts = []
+        retrieval_degraded = True
     
     # FR-16: 1.5 Retrieve Graph Context
     graph_context = retrieve_graph_contexts(last_user_message, current_user=current_user)
@@ -113,6 +125,12 @@ async def chat_endpoint(req: ChatRequest, current_user: dict = Depends(auth.get_
         "   - Prison threats for debts: You MUST cite 'Article 19 paragraph (2) of Law No. 39 of 1999 concerning Human Rights (UU HAM)' which strictly prohibits criminal punishment/prison for civil debt issues. Clearly distinguish between civil default (wanprestasi) and malicious intent (fraud, Article 378 of the Criminal Code).\n\n"
         "Always provide actionable solutions and naturally cite relevant legal bases/articles."
     )
+    if retrieval_degraded:
+        system_prompt += (
+            "\nRETRIEVAL UNAVAILABLE: the regulation database could not be searched for this question. "
+            "Do NOT cite specific regulation numbers, articles, or documents from memory. "
+            "Answer with general legal principles only and say the regulation lookup is temporarily unavailable."
+        )
 
     enriched_user_prompt = (
         f"{lang_rule}\n\n"
@@ -135,6 +153,15 @@ async def chat_endpoint(req: ChatRequest, current_user: dict = Depends(auth.get_
         )
     # FR-25: Audit log the search query
     log_audit(current_user.get("id", ""), "SEARCH", "", f"Query: {last_user_message[:200]}")
+    if retrieval_degraded:
+        notice = (
+            "\n\n---\n_Catatan: penelusuran basis data regulasi sedang tidak tersedia, "
+            "sehingga jawaban ini tidak merujuk regulasi spesifik._"
+            if user_lang == "indonesian" else
+            "\n\n---\n_Note: regulation-database retrieval is currently unavailable, "
+            "so this answer does not cite specific regulations._"
+        )
+        answer += notice
     return ChatResponse(answer=answer, sources=sources_to_return)
 
 @router.post("/chat-session")
