@@ -5,13 +5,23 @@ and exist ONLY there, so a deployed stack answers 401 for them (auth.py login).
 
 Creates the roster below with the GIVEN password (no default on purpose) and
 skips usernames that already exist - safe to re-run, never touches real rows.
+Databases that predate this script (hand-created demo rows, restored
+snapshots) therefore keep their old unknown passwords on a plain run; pass
+--force to reset the password_hash of existing usernames instead (password
+only - role and every other column stay untouched).
 
-Usage on the deploy host (inside the backend container, code is bind-mounted):
+Usage on the deploy host (inside the backend container; scripts/ ships in the
+image and is NOT bind-mounted, so after editing it on the host copy it in
+with `docker compose cp` or rebuild the image):
     docker compose exec -e SEED_PASSWORD='ChooseSomething!' backend \
         python scripts/seed_demo_users.py
 or with an explicit roster subset:
     docker compose exec -e SEED_PASSWORD='...' backend \
         python scripts/seed_demo_users.py --users demoacc
+or to reset the password of an existing account (e.g. a hand-created row
+whose password nobody remembers):
+    docker compose exec -e SEED_PASSWORD='...' backend \
+        python scripts/seed_demo_users.py --users demoaccc --force
 
 The script reads DATABASE_URL from the container environment exactly like the
 app does (services.pg_service), so it targets the deployment's own database.
@@ -48,6 +58,10 @@ def main() -> int:
     parser.add_argument("--role", default="pengguna",
                         help="role for usernames outside the roster (default pengguna)")
     parser.add_argument("--email-domain", default="example.com")
+    parser.add_argument("--force", action="store_true",
+                        help="reset password_hash of usernames that already exist "
+                             "(password only; role and other columns untouched). "
+                             "Without it existing rows are skipped unchanged.")
     args = parser.parse_args()
 
     if not args.password:
@@ -57,12 +71,21 @@ def main() -> int:
     roles = dict(ROSTER)
     wanted = [u.strip() for u in args.users.split(",") if u.strip()] or list(roles)
 
-    created = skipped = 0
+    created = reset = skipped = 0
     for username in wanted:
         role = roles.get(username, args.role)
         if pg_service.query_one("SELECT id FROM users WHERE username = %s", (username,)):
-            print(f"skip    {username} (already exists)")
-            skipped += 1
+            if not args.force:
+                print(f"skip    {username} (already exists; keeps its old password, so "
+                      f"login with this run's password would fail - use --force to reset it)")
+                skipped += 1
+                continue
+            pg_service.execute(
+                "UPDATE users SET password_hash = %s WHERE username = %s",
+                (hash_pw(args.password), username),
+            )
+            print(f"reset   {username} (password updated; role and other columns untouched)")
+            reset += 1
             continue
         pg_service.execute(
             "INSERT INTO users (id, username, password_hash, email, role) "
@@ -73,7 +96,7 @@ def main() -> int:
         print(f"created {username} (role: {role})")
         created += 1
 
-    print(f"done: {created} created, {skipped} skipped")
+    print(f"done: {created} created, {reset} reset, {skipped} skipped")
     return 0
 
 
