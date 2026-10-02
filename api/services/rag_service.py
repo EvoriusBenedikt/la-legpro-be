@@ -278,6 +278,89 @@ def understand_document(text: str) -> dict:
         }
 
 
+def classify_document_vlm(pdf_path: str, full_text: str) -> dict:
+    """Confidence-gated document classification (2026-09-30).
+
+    One VLM pass over the rendered first page (image) plus the hybrid-
+    extracted text, asking for strict JSON:
+      {"klasifikasi": "Umum|Rahasia|Terbatas",
+       "jenis": <active document_taxonomy name>,
+       "confidence": 0-100,
+       "reasoning": "<short Indonesian justification>"}
+
+    Returns a dict with those keys plus 'kind' ('ok' | 'error'). Any failure
+    (VLM unreachable, unparseable JSON, off-vocabulary labels) yields
+    confidence 0 so the caller routes the doc to human pending review —
+    an errored classifier can never auto-approve.
+    """
+    result = {"klasifikasi": "Umum", "jenis": None, "confidence": 0,
+              "reasoning": "", "kind": "ok"}
+    # Active taxonomy vocabulary — the same list the pending approver sees.
+    try:
+        tax_rows = pg_service.query(
+            "SELECT name FROM document_taxonomy WHERE is_active = TRUE ORDER BY name ASC")
+    except Exception as tax_err:
+        tax_rows = []
+        print(f"[classify] taxonomy query failed: {tax_err}")
+    allowed_jenis = [r["name"] for r in tax_rows]
+    if not allowed_jenis:
+        result.update(reasoning="Taksonomi dokumen tidak tersedia; klasifikasi otomatis dilewati.",
+                      kind="error")
+        return result
+    try:
+        import fitz
+        doc = fitz.open(pdf_path)
+        try:
+            image_b64 = vlm_extract_page_image(doc[0])
+        finally:
+            doc.close()
+        prompt = (
+            "Anda adalah analis regulasi korporat. Klasifikasikan dokumen hukum Indonesia "
+            "pada gambar halaman pertama ini (teks hasil ekstraksi disertakan di bawah).\n"
+            "Balas HANYA dengan objek JSON valid tanpa teks lain, berbentuk:\n"
+            '{"klasifikasi": "Umum" | "Rahasia" | "Terbatas", '
+            '"jenis": "<salah satu nama taksonomi di bawah>", '
+            '"confidence": <integer 0-100>, '
+            '"reasoning": "<1-2 kalimat bahasa Indonesia>"}\n\n'
+            f"Nama taksonomi yang diperbolehkan untuk 'jenis': {', '.join(allowed_jenis)}.\n"
+            "Definisi klasifikasi kerahasiaan: 'Umum' = dokumen publik/terbuka untuk semua "
+            "pegawai; 'Rahasia' = berisi informasi sensitif organisasi (mis. perjanjian, "
+            "data internal); 'Terbatas' = peredaran terbatas pada pihak/jabatan tertentu.\n"
+            "confidence = seberapa yakin Anda pada KEDUA label sekaligus (0-100); berikan "
+            "nilai rendah bila halaman pertama tidak cukup menentukan.\n\n"
+            f"TEKS HASIL EKSTRAKSI (awal dokumen):\n{(full_text or '')[:2500]}"
+        )
+        raw = call_glm_vision(image_b64, prompt, timeout=90)
+        data = extract_json(raw)
+        if not isinstance(data, dict):
+            raise ValueError("classifier JSON bukan objek")
+        klas = str(data.get("klasifikasi", "")).strip().title()
+        jenis = str(data.get("jenis", "")).strip()
+        conf = int(float(data.get("confidence", 0)))
+        reasoning = str(data.get("reasoning", "")).strip()[:500]
+        jenis_match = next((n for n in allowed_jenis if n.lower() == jenis.lower()), None)
+        if klas not in ("Umum", "Rahasia", "Terbatas"):
+            result.update(reasoning=reasoning or "Label klasifikasi dari AI tidak valid.",
+                          kind="error")
+            return result
+        if jenis_match is None:
+            # Keep the secrecy recommendation for the approver, but force the
+            # pending path: an off-taxonomy jenis is a failed classification.
+            result.update(klasifikasi=klas, confidence=0,
+                          reasoning=(f"{reasoning} Label jenis tidak ada dalam taksonomi.").strip()[:500],
+                          kind="error")
+            return result
+        result.update(klasifikasi=klas, jenis=jenis_match,
+                      confidence=max(0, min(100, conf)), reasoning=reasoning)
+        print(f"[classify] {os.path.basename(pdf_path)}: {klas}/{jenis_match} conf={result['confidence']}")
+        return result
+    except Exception as e:
+        print(f"[classify] VLM classification failed for {pdf_path}: {e}")
+        result.update(reasoning=f"Klasifikasi otomatis gagal ({type(e).__name__}); diperlukan persetujuan manual.",
+                      kind="error")
+        return result
+
+
 def extract_signing_date(text: str) -> str | None:
     """
     Pass 0B — Dedicated signing date extraction.

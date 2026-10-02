@@ -55,10 +55,17 @@ async def get_repository(current_user: dict = Depends(auth.get_current_user)):
     # (Migration M3: ANY(%s) replaces the inline IN-list; access_grants.doc_id
     # is TEXT while regulations.id is int -> id::text comparison.)
     records = pg_service.query(
-        "SELECT id, judul, nomor, jenis, sektor, status, local_path, klasifikasi "
+        "SELECT id, judul, nomor, jenis, sektor, status, local_path, klasifikasi, "
+        "ai_confidence, approval_mode "
         "FROM regulations "
         "WHERE local_path IS NOT NULL AND local_path != '' "
         "AND status != 'Menunggu Konfirmasi' "
+        # Pending-first flow (2026-09-30): in-flight docs (scan/classify/ingest)
+        # stay out of the designated tabs until resolved — uploads are tracked
+        # in the pending queue + Riwayat Unggahan instead. Transient scraper
+        # 'Memproses' rows are hidden too (decision A); System Monitoring still
+        # shows their ACTIVE_TASKS progress.
+        "AND status != 'Memproses' "
         "AND ( "
         "    klasifikasi = ANY(%s) "
         "    OR id::text IN ( "
@@ -88,18 +95,32 @@ async def get_repository(current_user: dict = Depends(auth.get_current_user)):
             "sektor": str(sektor) if sektor else "",
             "status": str(status) if status else "",
             "klasifikasi": str(klasifikasi) if klasifikasi else "Umum",
-            "filename": filename
+            "filename": filename,
+            # Provenance of the classification (migration 005): 'auto' =
+            # confidence-gated auto-approval, 'manual' = pending confirmed,
+            # None = pre-feature row.
+            "ai_confidence": row["ai_confidence"],
+            "approval_mode": row["approval_mode"]
         })
     return {"documents": docs}
 
 
 @router.get("/repository/pending")
 async def get_pending_repository(current_user: dict = Depends(auth.require_role("sekretaris perusahaan"))):
+    # Pending-first flow (2026-09-30): the queue now covers the whole upload
+    # lifecycle — 'Memproses' (scanning/classifying, read-only cards) plus
+    # 'Menunggu Konfirmasi' (approval cards). Restricted to upload-originated
+    # rows (nomor LIKE 'CUSTOM-%'); scraper transients are not queue items.
     records = pg_service.query(
-        "SELECT id, judul, nomor, jenis, sektor, status, local_path, klasifikasi "
-        "FROM regulations "
-        "WHERE status = 'Menunggu Konfirmasi'")
-    
+        "SELECT r.id, r.judul, r.nomor, r.jenis, r.sektor, r.status, r.local_path, "
+        "r.klasifikasi, r.ai_confidence, r.ai_jenis, r.ai_reasoning, h.uploaded_at "
+        "FROM regulations r "
+        "LEFT JOIN upload_history h ON h.doc_id = r.id::text "
+        "WHERE r.status IN ('Memproses', 'Menunggu Konfirmasi') "
+        "AND r.nomor LIKE 'CUSTOM-%' "
+        "ORDER BY h.uploaded_at DESC NULLS LAST, r.id DESC")
+
+    from services.app_state import ACTIVE_TASKS
     docs = []
     for row in records:
         reg_id = row["id"]
@@ -111,17 +132,90 @@ async def get_pending_repository(current_user: dict = Depends(auth.require_role(
         local_path = row["local_path"]
         klasifikasi = row["klasifikasi"]
         filename = os.path.basename(local_path) if local_path else None
+        doc_id_str = str(reg_id) if reg_id is not None else None
+        scanning = status == "Memproses"
+        # Decision D: a 'Memproses' row with no RUNNING task is stale (backend
+        # restarted mid-scan) — flag it so the FE can offer a hint + reject.
+        task = ACTIVE_TASKS.get(f"task_{doc_id_str}") if doc_id_str else None
+        stale = scanning and not (task and task.get("status") == "RUNNING")
+        uploaded_at = row["uploaded_at"]
         docs.append({
-            "id": str(reg_id) if reg_id is not None else None,
+            "id": doc_id_str,
             "judul": str(judul) if judul else "",
             "nomor": str(nomor) if nomor is not None else "",
             "jenis": str(jenis) if jenis else "",
             "sektor": str(sektor) if sektor else "",
             "status": str(status) if status else "",
             "klasifikasi": str(klasifikasi) if klasifikasi else "Umum",
-            "filename": filename
+            "filename": filename,
+            # VLM classification verdict (migration 005) — null on rows that
+            # predate the confidence-gated classifier.
+            "ai_confidence": row["ai_confidence"],
+            "ai_jenis": row["ai_jenis"] or "",
+            "ai_reasoning": row["ai_reasoning"] or "",
+            # Queue-stage fields (2026-09-30): 'scanning' = AI pass running,
+            # 'awaiting_approval' = needs the sekretaris decision.
+            "stage": "scanning" if scanning else "awaiting_approval",
+            "stale": stale,
+            "uploaded_at": uploaded_at.isoformat() if uploaded_at else None
         })
     return {"documents": docs}
+
+
+@router.get("/repository/uploads/history")
+async def get_upload_history(
+    limit: int = 50,
+    offset: int = 0,
+    outcome: Optional[str] = None,
+    current_user: dict = Depends(auth.require_role("manajer"))
+):
+    """Riwayat Unggahan (2026-09-30, migration 006): durable upload trail.
+
+    Visibility (decision B): sekretaris perusahaan sees every upload; manajer
+    and direktur see only their own. Admin is blocked, mirroring the FR-24
+    repository exclusion."""
+    role = (current_user.get("role") or "").lower()
+    if role == "admin":
+        raise HTTPException(status_code=403, detail="Admin sistem tidak memiliki kewenangan untuk mengakses repositori dokumen.")
+
+    limit = max(1, min(200, limit))
+    offset = max(0, offset)
+    where, params = [], []
+    if role != "sekretaris perusahaan":
+        where.append("uploaded_by = %s")
+        params.append(str(current_user.get("id", "")))
+    if outcome:
+        where.append("outcome = %s")
+        params.append(outcome)
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
+    total = pg_service.query_one(
+        f"SELECT count(*) AS n FROM upload_history {where_sql}", tuple(params))["n"]
+    rows = pg_service.query(
+        f"SELECT id, doc_id, filename, judul, uploaded_by_name, uploaded_at, "
+        f"outcome, ai_klasifikasi, ai_jenis, ai_confidence, final_klasifikasi, "
+        f"final_jenis, resolved_at, resolved_by_name, detail "
+        f"FROM upload_history {where_sql} "
+        f"ORDER BY uploaded_at DESC, id DESC LIMIT %s OFFSET %s",
+        tuple(params + [limit, offset]))
+    entries = [{
+        "id": r["id"],
+        "doc_id": r["doc_id"],
+        "filename": r["filename"],
+        "judul": r["judul"] or "",
+        "uploaded_by_name": r["uploaded_by_name"] or "",
+        "uploaded_at": r["uploaded_at"].isoformat() if r["uploaded_at"] else None,
+        "outcome": r["outcome"],
+        "ai_klasifikasi": r["ai_klasifikasi"] or "",
+        "ai_jenis": r["ai_jenis"] or "",
+        "ai_confidence": r["ai_confidence"],
+        "final_klasifikasi": r["final_klasifikasi"] or "",
+        "final_jenis": r["final_jenis"] or "",
+        "resolved_at": r["resolved_at"].isoformat() if r["resolved_at"] else None,
+        "resolved_by_name": r["resolved_by_name"] or "",
+        "detail": r["detail"] or ""
+    } for r in rows]
+    return {"total": total, "entries": entries}
 
 @router.post("/documents/{doc_id}/grant-access")
 async def grant_document_access(
@@ -215,6 +309,17 @@ async def revoke_grant(grant_id: str, current_user: dict = Depends(auth.get_curr
     log_audit(current_user.get("id", ""), "REVOKE_ACCESS", row["doc_id"], f"Akses dicabut dari: {row['granted_to']}")
     return {"message": "Akses berhasil dicabut."}
 
+def _classify_threshold() -> int:
+    """Confidence gate for VLM auto-classification (2026-09-30): a doc
+    scoring >= CLASSIFY_CONFIDENCE_THRESHOLD skips human pending review and
+    is ingested immediately with the AI labels; below it (or on a failed
+    classifier run) it goes to 'Menunggu Konfirmasi' as before. The env var
+    is read per run, so a threshold change only needs a backend restart."""
+    try:
+        return max(0, min(100, int(os.getenv("CLASSIFY_CONFIDENCE_THRESHOLD", "80"))))
+    except ValueError:
+        return 80
+
 def process_document_background(file_path: str, doc_id: str, filename: str, nomor: str, jenis: str, sektor: str, status: str, klasifikasi: str):
     from services.app_state import ACTIVE_TASKS
     from datetime import datetime
@@ -223,35 +328,49 @@ def process_document_background(file_path: str, doc_id: str, filename: str, nomo
     try:
         # (R1 bugfix: hybrid PyMuPDF+VLM extraction replaces the dead
         # PaddleOCR chain; see la-legpro-doc/bug_reports.md.)
-        from services.rag_service import extract_text_hybrid
+        from services.rag_service import extract_text_hybrid, classify_document_vlm
         full_text = extract_text_hybrid(file_path)
-        
-        # ── AI Recommendation (FR-4) ──────────────────────────────────────
-        messages = [
-            {"role": "system", "content": "Anda adalah analis regulasi korporat. Tugas Anda adalah memberikan rekomendasi tingkat kerahasiaan dokumen berdasarkan isinya. Balas hanya dengan satu kata: 'Umum', 'Rahasia', atau 'Terbatas'."},
-            {"role": "user", "content": f"Teks dokumen:\n{full_text[:3000]}\n\nBerdasarkan teks ini, rekomendasikan klasifikasi: Umum, Rahasia, atau Terbatas."}
-        ]
-        
-        recommended_klasifikasi = "Umum"
-        try:
-            from services.llm_client import call_glm
-            raw_content = call_glm(messages, temperature=0.1, timeout=30)
-            raw_content = raw_content.lower()
-            if "terbatas" in raw_content:
-                recommended_klasifikasi = "Terbatas"
-            elif "rahasia" in raw_content:
-                recommended_klasifikasi = "Rahasia"
-        except Exception as llm_err:
-            print(f"LLM classification error: {llm_err}")
-            
+
+        # ── AI scan + classification (FR-4; confidence-gated 2026-09-30) ────
+        # Replaces the old one-word secrecy recommendation: one VLM pass over
+        # page 1 + extracted text returns {klasifikasi, jenis, confidence,
+        # reasoning}; classifier failures come back with confidence 0.
+        ai = classify_document_vlm(file_path, full_text)
+        threshold = _classify_threshold()
         pg_service.execute(
-            "UPDATE regulations SET status = 'Menunggu Konfirmasi', klasifikasi = %s "
-            "WHERE id::text = %s",
-            (recommended_klasifikasi, doc_id))
-        print(f"Document {doc_id} set to Pending Confirmation with AI Recommendation: {recommended_klasifikasi}")
+            "UPDATE regulations SET klasifikasi = %s, ai_jenis = %s, "
+            "ai_confidence = %s, ai_reasoning = %s WHERE id::text = %s",
+            (ai["klasifikasi"], ai["jenis"], ai["confidence"], ai["reasoning"], doc_id))
+
+        from services.db_service import record_upload_event
+        if ai["jenis"] and ai["confidence"] >= threshold:
+            # High-confidence path: fully automatic — adopt both AI labels,
+            # mark the row auditable as auto-approved, and ingest right away.
+            pg_service.execute(
+                "UPDATE regulations SET jenis = %s, approval_mode = 'auto' WHERE id::text = %s",
+                (ai["jenis"], doc_id))
+            record_upload_event(doc_id, "auto_approved", ai=ai,
+                                final_klasifikasi=ai["klasifikasi"], final_jenis=ai["jenis"])
+            print(f"Document {doc_id} auto-approved (confidence {ai['confidence']} >= {threshold}): "
+                  f"{ai['klasifikasi']}/{ai['jenis']}")
+            ACTIVE_TASKS[task_id]["status"] = "COMPLETED"
+            ACTIVE_TASKS[task_id]["end_time"] = datetime.now()
+            # Same worker thread: ingest re-registers task_id with its own
+            # RUNNING→COMPLETED lifecycle, so the progress UI stays truthful.
+            ingest_document_background(file_path, doc_id, filename, nomor,
+                                       ai["jenis"], sektor, "Berlaku", ai["klasifikasi"])
+            return
+
+        # Low confidence (or classifier error): human approval required.
+        pg_service.execute(
+            "UPDATE regulations SET status = 'Menunggu Konfirmasi' WHERE id::text = %s",
+            (doc_id,))
+        record_upload_event(doc_id, "awaiting_approval", ai=ai)
+        print(f"Document {doc_id} set to Pending Confirmation (confidence {ai['confidence']} < {threshold}, "
+              f"AI recommendation: {ai['klasifikasi']}/{ai['jenis']})")
         ACTIVE_TASKS[task_id]["status"] = "COMPLETED"
         ACTIVE_TASKS[task_id]["end_time"] = datetime.now()
-        
+
     except Exception as e:
         ACTIVE_TASKS[task_id]["status"] = "FAILED"
         ACTIVE_TASKS[task_id]["end_time"] = datetime.now()
@@ -259,6 +378,11 @@ def process_document_background(file_path: str, doc_id: str, filename: str, nomo
         try:
             pg_service.execute(
                 "UPDATE regulations SET status = 'Gagal - Error' WHERE id::text = %s", (doc_id,))
+        except:
+            pass
+        try:
+            from services.db_service import record_upload_event
+            record_upload_event(doc_id, "failed_error", detail=f"Parsing/klasifikasi gagal: {e}")
         except:
             pass
 
@@ -303,6 +427,11 @@ def ingest_document_background(file_path: str, doc_id: str, filename: str, nomor
                 pg_service.execute(
                     "UPDATE regulations SET status = 'Gagal - Duplikat' WHERE id::text = %s",
                     (doc_id,))
+                # History (2026-09-30): overwrites auto_approved/confirmed when
+                # the ingest itself fails on a near-duplicate — truthful outcome.
+                from services.db_service import record_upload_event
+                record_upload_event(doc_id, "failed_duplicate",
+                                    detail=f"Jarak kemiripan {dist:.3f} < 0.15 terhadap korpus yang ada.")
                 ACTIVE_TASKS[task_id]["status"] = "FAILED"
                 ACTIVE_TASKS[task_id]["end_time"] = datetime.now()
                 return
@@ -402,6 +531,11 @@ def ingest_document_background(file_path: str, doc_id: str, filename: str, nomor
                 "UPDATE regulations SET status = 'Gagal - Error' WHERE id::text = %s", (doc_id,))
         except:
             pass
+        try:
+            from services.db_service import record_upload_event
+            record_upload_event(doc_id, "failed_error", detail=f"Ingest gagal: {e}")
+        except:
+            pass
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Knowledge Graph Endpoints
@@ -412,9 +546,10 @@ def ingest_document_background(file_path: str, doc_id: str, filename: str, nomor
 async def delete_document(doc_id: str, current_user: dict = Depends(auth.require_role("sekretaris perusahaan"))):
     """Deletes a document from the repository."""
     
-    # Check if doc exists
+    # Check if doc exists (status decides the history outcome below: deleting
+    # a still-pending upload is a REJECTION, anything else is a plain delete)
     row = pg_service.query_one(
-        "SELECT local_path, judul FROM regulations WHERE id::text = %s", (doc_id,))
+        "SELECT local_path, judul, status FROM regulations WHERE id::text = %s", (doc_id,))
     if not row:
         raise HTTPException(status_code=404, detail="Not Found")
 
@@ -466,8 +601,15 @@ async def delete_document(doc_id: str, current_user: dict = Depends(auth.require
     # (step 5 likewise -- the regulation row is deleted in the transaction above)
     
     # 6. Audit Log
-    from services.db_service import log_audit
+    from services.db_service import log_audit, record_upload_event
     log_audit(current_user.get("id", ""), "DELETE_DOCUMENT", doc_id, f"Menghapus dokumen: {judul}")
+
+    # 7. Upload history (no-op UPDATE for non-upload docs — they have no row):
+    # pending-queue deletes are rejections; everything else is a plain delete.
+    # 'Memproses' rows can only be deleted when stale (the M4 guard above
+    # rejects while the task is RUNNING), so deleting one is also a rejection.
+    outcome = "rejected" if row["status"] in ("Menunggu Konfirmasi", "Memproses") else "deleted"
+    record_upload_event(doc_id, outcome, resolver=current_user)
  
     return {"message": "Dokumen berhasil dihapus."}
 
@@ -479,6 +621,10 @@ async def delete_document(doc_id: str, current_user: dict = Depends(auth.require
 
 class ConfirmPendingRequest(BaseModel):
     klasifikasi: str
+    # Approved taxonomy label (2026-09-30): the pending UI now offers the AI's
+    # ai_jenis pre-selected in a taxonomy dropdown; omit to keep the current
+    # jenis on the row.
+    jenis: Optional[str] = None
 
 @router.post("/repository/pending/{doc_id}/confirm")
 async def confirm_pending_document(
@@ -496,15 +642,34 @@ async def confirm_pending_document(
 
     local_path, nomor, judul, jenis, sektor = (doc["local_path"], doc["nomor"],
                                                doc["judul"], doc["jenis"], doc["sektor"])
-    
-    # Update DB
+
+    # The approved jenis must come from the active taxonomy (the FE select is
+    # fed from /api/taxonomy; this keeps the endpoint honest for other clients).
+    jenis_final = (req.jenis or "").strip() or jenis
+    if req.jenis:
+        tax = pg_service.query_one(
+            "SELECT name FROM document_taxonomy WHERE name = %s AND is_active = TRUE",
+            (jenis_final,))
+        if not tax:
+            raise HTTPException(status_code=400, detail="Jenis dokumen tidak ada dalam taksonomi aktif.")
+
+    # Update DB — approval_mode='manual' records that a human confirmed this
+    # doc through the pending queue (vs 'auto' for confidence-gated approvals).
     pg_service.execute(
-        "UPDATE regulations SET status = 'Berlaku', klasifikasi = %s WHERE id::text = %s",
-        (req.klasifikasi, doc_id))
-    
+        "UPDATE regulations SET status = 'Berlaku', klasifikasi = %s, jenis = %s, "
+        "approval_mode = 'manual' WHERE id::text = %s",
+        (req.klasifikasi, jenis_final, doc_id))
+
+    from services.db_service import log_audit, record_upload_event
+    log_audit(current_user.get("id", ""), "CONFIRM_DOCUMENT", doc_id,
+              f"Mengonfirmasi dokumen pending: {judul} (klasifikasi={req.klasifikasi}, jenis={jenis_final})")
+    record_upload_event(doc_id, "confirmed",
+                        final_klasifikasi=req.klasifikasi, final_jenis=jenis_final,
+                        resolver=current_user)
+
     # Trigger vector DB injection and KG asynchronously
     filename = os.path.basename(local_path)
-    background_tasks.add_task(ingest_document_background, local_path, doc_id, filename, nomor, jenis, sektor, 'Berlaku', req.klasifikasi)
+    background_tasks.add_task(ingest_document_background, local_path, doc_id, filename, nomor, jenis_final, sektor, 'Berlaku', req.klasifikasi)
     
     return {"message": "Dokumen berhasil dikonfirmasi dan dimasukkan ke repositori."}
 

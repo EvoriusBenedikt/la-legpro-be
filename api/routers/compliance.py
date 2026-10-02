@@ -92,6 +92,12 @@ async def upload_document(
         # Get the actual generated ID
         doc_id = str(rows[0]["id"])
         
+        # Upload-history intake (2026-09-30, migration 006): durable trail row
+        # for the Riwayat Unggahan tab; pipeline transitions in repository.py
+        # update it (awaiting_approval / auto_approved / failed_* / ...).
+        from services.db_service import log_upload_intake
+        log_upload_intake(doc_id, file.filename, judul, current_user)
+        
         # Launch async background task for actual text extraction and chunking
         from routers.repository import process_document_background
         background_tasks.add_task(process_document_background, file_path, doc_id, file.filename, nomor, jenis, sektor, status, klasifikasi)

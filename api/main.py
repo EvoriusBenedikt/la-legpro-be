@@ -63,6 +63,17 @@ async def track_api_stats(request, call_next):
         API_STATS[route]["errors"] += 1
     return response
 
+
+# ── Liveness probe for container healthchecks ───────────────────────────────
+# Unauthenticated BY DESIGN: docker-compose healthchecks carry no credentials,
+# and /api/engineer/health (the FR-31 metrics endpoint) is role-guarded. This
+# returns a constant and touches nothing; readiness is covered by the postgres
+# healthcheck + depends_on, so no DB work belongs here.
+@app.get("/api/healthz", include_in_schema=False)
+async def healthz():
+    return {"status": "ok"}
+
+
 # ── Startup: contract-expiration email alerts (APScheduler cron) ────────────
 @app.on_event("startup")
 def startup_event():

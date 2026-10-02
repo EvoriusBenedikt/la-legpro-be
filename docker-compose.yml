@@ -40,6 +40,16 @@ services:
       # vars as local model directories -- no hub access at runtime.
       - EMBEDDER_MODEL_NAME=/app/data/models/all-MiniLM-L6-v2
       - RERANKER_MODEL_NAME=/app/data/models/ms-marco-MiniLM-L-6-v2
+    # Liveness probe against the unauthenticated /api/healthz route (main.py).
+    # python:3.12-slim ships no curl/wget, so the probe uses stdlib urllib;
+    # urlopen raises on non-2xx, which fails the check. start_period covers the
+    # embedder/reranker import time before uvicorn accepts connections.
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import urllib.request as u; u.urlopen(\"http://localhost:8000/api/healthz\", timeout=3).read()'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
     depends_on:
       postgres:
         condition: service_healthy

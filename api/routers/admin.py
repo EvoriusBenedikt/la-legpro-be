@@ -12,11 +12,18 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fil
 class KGExclusion(BaseModel):
     entity_name: str
 
+# Per-status cap for the dashboard's doc_details payload: doc_status keeps
+# the true totals while each detail list ships at most this many rows. The
+# uncapped version serialized the whole corpus (952+ docs, ~1 MB JSON) for
+# four 200px scrollable card lists.
+DOC_DETAILS_LIMIT = 100
+
 @router.get("/dashboard")
 async def admin_dashboard(current_user: dict = Depends(auth.require_role("admin"))):
     """FR-26: Admin-only dashboard with system stats and audit logs."""
-    # 1. Document Processing Status & Details
-    all_docs = pg_service.query("SELECT id, judul, status, nomor FROM regulations")
+    # 1. Document Processing Status & Details (ORDER BY id keeps the
+    #    DOC_DETAILS_LIMIT slice deterministic)
+    all_docs = pg_service.query("SELECT id, judul, status, nomor FROM regulations ORDER BY id")
     
     doc_details = {
         "Berlaku": [],
@@ -45,6 +52,10 @@ async def admin_dashboard(current_user: dict = Depends(auth.require_role("admin"
         "Gagal": len(doc_details["Gagal"])
     }
 
+    # Counts above are computed first, then the payload is bounded; the FE
+    # shows "Menampilkan N pertama dari M dokumen" when value > len(list).
+    doc_details = {k: v[:DOC_DETAILS_LIMIT] for k, v in doc_details.items()}
+
     # 2. Document Volume by Klasifikasi
     klas_rows = pg_service.query(
         "SELECT klasifikasi, COUNT(*) as count FROM regulations "
@@ -69,7 +80,16 @@ async def admin_dashboard(current_user: dict = Depends(auth.require_role("admin"
         "FROM audit_logs ORDER BY id DESC LIMIT 100")
 
     # 6. System Health (Migration M3: the vector store is the PG chunks
-    # table now; the "chromadb" key is kept because the frozen FE reads it)
+    # table now; the "sqlite"/"chromadb" key names are kept because the
+    # frozen FE reads them — both probe PostgreSQL. "sqlite" was hardcoded
+    # True until 2026-09-30, which made the DB tile a placebo.)
+    db_ok = False
+    try:
+        pg_service.query_one("SELECT 1")
+        db_ok = True
+    except Exception as e:
+        print(f"Database health check failed: {e}")
+
     chroma_ok = False
     try:
         pg_service.query_one("SELECT 1 FROM chunks LIMIT 1")
@@ -85,7 +105,7 @@ async def admin_dashboard(current_user: dict = Depends(auth.require_role("admin"
         "active_grants": active_grants,
         "audit_logs": audit_logs,
         "system_health": {
-            "sqlite": True,
+            "sqlite": db_ok,
             "chromadb": chroma_ok
         }
     }

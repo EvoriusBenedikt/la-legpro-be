@@ -65,3 +65,59 @@ def log_audit(user_id: str, action_type: str, resource_id: str = "", details: st
         )
     except Exception as e:
         print(f"Failed to write audit log: {e}")
+
+
+# ── Upload history (2026-09-30, migration 006) ─────────────────────────────
+# Durable trail for the "Riwayat Unggahan" tab: one row per /api/upload,
+# updated in place as the doc moves through scan → gate → ingest/confirm/
+# reject. Both helpers swallow errors — history is an audit convenience and
+# must never break the upload pipeline.
+
+def log_upload_intake(doc_id: str, filename: str, judul: str, user: dict):
+    try:
+        pg_service.execute(
+            "INSERT INTO upload_history "
+            "(doc_id, filename, judul, uploaded_by, uploaded_by_name) "
+            "VALUES (%s, %s, %s, %s, %s)",
+            (doc_id, filename, judul,
+             str(user.get("id", "")), user.get("username", "")),
+        )
+    except Exception as e:
+        print(f"Failed to write upload history intake: {e}")
+
+
+def record_upload_event(doc_id: str, outcome: str, ai: dict = None,
+                        final_klasifikasi: str = None, final_jenis: str = None,
+                        resolver: dict = None, detail: str = None):
+    """Update the doc's upload_history row with a pipeline transition.
+
+    outcome: awaiting_approval | auto_approved | confirmed | rejected |
+    failed_duplicate | failed_error | deleted. resolved_at stamps every
+    transition; resolved_by only records human actions (confirm/reject/delete).
+    """
+    try:
+        sets = ["outcome = %s", "resolved_at = NOW()"]
+        params = [outcome]
+        if ai:
+            sets += ["ai_klasifikasi = %s", "ai_jenis = %s",
+                     "ai_confidence = %s", "ai_reasoning = %s"]
+            params += [ai.get("klasifikasi"), ai.get("jenis"),
+                       ai.get("confidence"), ai.get("reasoning")]
+        if final_klasifikasi is not None:
+            sets.append("final_klasifikasi = %s")
+            params.append(final_klasifikasi)
+        if final_jenis is not None:
+            sets.append("final_jenis = %s")
+            params.append(final_jenis)
+        if resolver:
+            sets += ["resolved_by = %s", "resolved_by_name = %s"]
+            params += [str(resolver.get("id", "")), resolver.get("username", "")]
+        if detail is not None:
+            sets.append("detail = %s")
+            params.append(detail[:500])
+        params.append(doc_id)
+        pg_service.execute(
+            f"UPDATE upload_history SET {', '.join(sets)} WHERE doc_id = %s",
+            tuple(params))
+    except Exception as e:
+        print(f"Failed to record upload event ({outcome}) for {doc_id}: {e}")
