@@ -190,8 +190,12 @@ def register(user: UserCreate):
     # SERVER_FIELD_ERRORS). Keep both sides in sync when rewording.
     if pg_service.query_one("SELECT id FROM users WHERE username = %s", (user.username,)):
         raise HTTPException(status_code=400, detail="Username already registered")
-    # Case-sensitive match, same convention as the username check above.
-    if pg_service.query_one("SELECT id FROM users WHERE email = %s", (user.email,)):
+    # Emails are case-insensitive by convention (providers like Gmail treat
+    # Joe@X and joe@x as the same mailbox): normalize to lowercase for the
+    # duplicate check and for storage. LOWER(email) so legacy mixed-case rows
+    # still match. The FE register input also lowercases as the user types.
+    email = user.email.lower()
+    if pg_service.query_one("SELECT id FROM users WHERE LOWER(email) = %s", (email,)):
         raise HTTPException(status_code=400, detail="Email already registered")
 
     user_id = str(uuid.uuid4())
@@ -199,14 +203,14 @@ def register(user: UserCreate):
 
     pg_service.execute(
         "INSERT INTO users (id, username, password_hash, email, role) VALUES (%s, %s, %s, %s, %s)",
-        (user_id, user.username, hashed_password, user.email, "pengguna")
+        (user_id, user.username, hashed_password, email, "pengguna")
     )
 
     access_token = create_access_token(
-        data={"sub": user_id, "username": user.username, "email": user.email, "role": "pengguna"}, 
+        data={"sub": user_id, "username": user.username, "email": email, "role": "pengguna"}, 
         expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     )
-    return {"access_token": access_token, "token_type": "bearer", "user": {"id": user_id, "username": user.username, "email": user.email, "role": "pengguna"}}
+    return {"access_token": access_token, "token_type": "bearer", "user": {"id": user_id, "username": user.username, "email": email, "role": "pengguna"}}
 
 @router.post("/login")
 def login(user: UserLogin):
