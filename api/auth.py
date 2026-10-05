@@ -148,11 +148,15 @@ def require_exact_role(exact_role: str):
 from pydantic import Field, field_validator
 
 def validate_password_strength(v: str) -> str:
-    """Shared rule: at least one number and one symbol (no length floor)."""
+    """Shared rule (register + change-password): at least one uppercase
+    letter, one number, and one symbol; whitespace does not count as a
+    symbol (user decision 2026-10-05). No length floor."""
     import re
+    if not re.search(r"[A-Z]", v):
+        raise ValueError("Password must contain at least one uppercase letter")
     if not re.search(r"\d", v):
         raise ValueError("Password must contain at least one number")
-    if not re.search(r"[^A-Za-z0-9]", v):
+    if not re.search(r"[^A-Za-z0-9\s]", v):
         raise ValueError("Password must contain at least one symbol")
     return v
 
