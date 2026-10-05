@@ -185,8 +185,14 @@ import uuid
 
 @router.post("/register")
 def register(user: UserCreate):
+    # NOTE: the FE maps these exact detail strings to form fields for
+    # red-border attribution (la-legpro-fe/src/components/Auth.tsx,
+    # SERVER_FIELD_ERRORS). Keep both sides in sync when rewording.
     if pg_service.query_one("SELECT id FROM users WHERE username = %s", (user.username,)):
         raise HTTPException(status_code=400, detail="Username already registered")
+    # Case-sensitive match, same convention as the username check above.
+    if pg_service.query_one("SELECT id FROM users WHERE email = %s", (user.email,)):
+        raise HTTPException(status_code=400, detail="Email already registered")
 
     user_id = str(uuid.uuid4())
     hashed_password = get_password_hash(user.password)
