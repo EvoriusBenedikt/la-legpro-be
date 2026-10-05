@@ -190,6 +190,11 @@ def register(user: UserCreate):
     # SERVER_FIELD_ERRORS). Keep both sides in sync when rewording.
     if pg_service.query_one("SELECT id FROM users WHERE username = %s", (user.username,)):
         raise HTTPException(status_code=400, detail="Username already registered")
+    # Whitespace makes an email invalid — rejected, not auto-stripped (user
+    # decision). The FE validates this before submit and maps the detail
+    # string below to the email field; this guard covers direct API clients.
+    if any(c.isspace() for c in user.email):
+        raise HTTPException(status_code=400, detail="Email must not contain whitespace")
     # Emails are case-insensitive by convention (providers like Gmail treat
     # Joe@X and joe@x as the same mailbox): normalize to lowercase for the
     # duplicate check and for storage. LOWER(email) so legacy mixed-case rows
