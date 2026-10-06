@@ -25,8 +25,25 @@ def check_permission(user: dict):
 
 @router.get("/taxonomy")
 def get_taxonomy(current_user: dict = Depends(get_current_user)):
-    rows = pg_service.query("SELECT id, name, is_active FROM document_taxonomy ORDER BY name ASC")
-    return {"taxonomy": [{"id": r["id"], "name": r["name"], "is_active": bool(r["is_active"])} for r in rows]}
+    # usage_count (2026-10-06): repository documents classified under each
+    # jenis, so the FE delete/deactivate dialog can state consequences.
+    # Additive field; existing consumers only read id/name/is_active.
+    rows = pg_service.query(
+        "SELECT t.id, t.name, t.is_active, COUNT(r.id) AS usage_count "
+        "FROM document_taxonomy t "
+        "LEFT JOIN regulations r ON r.jenis = t.name "
+        "GROUP BY t.id, t.name, t.is_active "
+        "ORDER BY t.name ASC"
+    )
+    return {"taxonomy": [
+        {
+            "id": r["id"],
+            "name": r["name"],
+            "is_active": bool(r["is_active"]),
+            "usage_count": int(r["usage_count"]),
+        }
+        for r in rows
+    ]}
 
 @router.post("/taxonomy")
 def create_taxonomy(req: TaxonomyCreate, current_user: dict = Depends(get_current_user)):
