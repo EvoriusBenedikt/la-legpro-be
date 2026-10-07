@@ -6,6 +6,7 @@ import concurrent.futures
 from typing import Optional, Any
 from pydantic import BaseModel, field_validator
 import auth
+from fastapi.concurrency import run_in_threadpool
 from services import pg_service
 from services.llm_client import call_glm, extract_json
 
@@ -193,7 +194,11 @@ async def analyze_document(req: AnalyzeRequest):
     diubah_dengan = []
     
     try:
-        raw_content = call_glm(messages_llm, temperature=0.1, timeout=60)
+        # call_glm is blocking `requests` code; awaited in a worker thread so
+        # the single-threaded event loop keeps serving everyone else while the
+        # LLM call runs (previously froze the whole backend for the call's
+        # duration — healthz included; bug_reports.md 2026-10-07).
+        raw_content = await run_in_threadpool(call_glm, messages_llm, temperature=0.1, timeout=60)
         parsed = extract_json(raw_content)
         overview = parsed.get("overview", overview)
         dicabut = parsed.get("dicabut", [])
@@ -269,10 +274,18 @@ async def analyze_pasals(req: AnalyzeRequest):
     )
 
     try:
-        raw = call_glm([
-            {"role": "system", "content": system_prompt},
-            {"role": "user",   "content": user_prompt},
-        ], temperature=0.1, timeout=180)
+        # Same event-loop protection as /analyze: the deep per-pasal call is
+        # the longest LLM round trip in the drawer (timeout=180, plus the
+        # retry chain) and must not freeze other users' requests.
+        raw = await run_in_threadpool(
+            call_glm,
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": user_prompt},
+            ],
+            temperature=0.1,
+            timeout=180,
+        )
 
         # The LLM might return an object {"pasals":[...]} OR a bare array [...]
         # (M4: extract_json also survives prose around the JSON body)

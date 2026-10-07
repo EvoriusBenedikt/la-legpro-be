@@ -10,6 +10,36 @@ router = APIRouter(prefix="/api", tags=["repository"])
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 PDFS_DIR = os.path.join(BASE_DIR, "data", "pdfs")
 
+
+def _basename_any(path: str) -> str:
+    """os.path.basename that also strips Windows separators.
+
+    The corpus DB stores local_path values scraped on a Windows machine
+    (``C:\\...\\data\\pdfs\\kemenkeu\\x.pdf``). On the Linux backend
+    os.path.basename does not treat ``\\`` as a separator and returns the
+    whole path unchanged, which used to leak into the API's ``filename``
+    field (bug_reports.md 2026-10-07). Normalize first, then basename.
+    """
+    return os.path.basename(path.replace("\\", "/"))
+
+
+def _find_pdf_file(safe_filename: str) -> str | None:
+    """Resolve a bare PDF filename against PDFS_DIR, including subfolders.
+
+    The corpus keeps agency PDFs in subfolders (kemenkeu/, kemnaker/) while
+    the API contract only carries the bare filename, so a top-level miss
+    falls back to a deterministic walk (sorted) of PDFS_DIR. safe_filename
+    must already be a basename (no separators) — guaranteed by callers.
+    """
+    top = os.path.join(PDFS_DIR, safe_filename)
+    if os.path.isfile(top):
+        return top
+    for root, dirs, files in os.walk(PDFS_DIR):
+        dirs.sort()
+        if safe_filename in sorted(files):
+            return os.path.join(root, safe_filename)
+    return None
+
 class AccessGrantRequest(BaseModel):
     granted_to: str
     reason: str
@@ -23,9 +53,9 @@ async def serve_pdf(filename: str):
     The frontend decodes the base64 and creates a blob:// URL to render in an iframe.
     """
     import base64
-    safe_filename = os.path.basename(filename.replace("\\", "/"))  # prevent path traversal
-    file_path = os.path.join(PDFS_DIR, safe_filename)
-    if not os.path.isfile(file_path):
+    safe_filename = _basename_any(filename)  # prevent path traversal
+    file_path = _find_pdf_file(safe_filename)
+    if file_path is None:
         raise HTTPException(status_code=404, detail=f"PDF '{safe_filename}' not found")
     with open(file_path, "rb") as f:
         pdf_bytes = f.read()
@@ -86,7 +116,7 @@ async def get_repository(current_user: dict = Depends(auth.get_current_user)):
         status = row["status"]
         local_path = row["local_path"]
         klasifikasi = row["klasifikasi"]
-        filename = os.path.basename(local_path) if local_path else None
+        filename = _basename_any(local_path) if local_path else None
         docs.append({
             "id": str(reg_id) if reg_id is not None else None,
             "judul": str(judul) if judul else "",
@@ -131,7 +161,7 @@ async def get_pending_repository(current_user: dict = Depends(auth.require_role(
         status = row["status"]
         local_path = row["local_path"]
         klasifikasi = row["klasifikasi"]
-        filename = os.path.basename(local_path) if local_path else None
+        filename = _basename_any(local_path) if local_path else None
         doc_id_str = str(reg_id) if reg_id is not None else None
         scanning = status == "Memproses"
         # Decision D: a 'Memproses' row with no RUNNING task is stale (backend
@@ -248,6 +278,13 @@ async def grant_document_access(
         
     if not req.reason or len(req.reason.strip()) < 5:
         raise HTTPException(status_code=400, detail="Alasan wajib diisi (minimal 5 karakter).")
+        
+    # Defense-in-depth: every visibility check joins access_grants.granted_to
+    # against users.id (TEXT UUID), so a grant to a non-existent user is a
+    # silent dead grant — reject it at the source instead of storing it.
+    grantee = pg_service.query_one("SELECT id FROM users WHERE id = %s", (req.granted_to,))
+    if not grantee:
+        raise HTTPException(status_code=400, detail="Pengguna penerima akses tidak ditemukan.")
         
     grant_id = str(uuid.uuid4())
     # expires_at: '' (legacy empty string) becomes NULL -- TIMESTAMPTZ cannot
