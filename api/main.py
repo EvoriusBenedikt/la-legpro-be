@@ -153,4 +153,8 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    # The audit-export download (admin.py) names its file via
+    # Content-Disposition; without exposure the browser hides the header
+    # from cross-origin JS and the FE falls back to a local filename.
+    expose_headers=["Content-Disposition"],
 )

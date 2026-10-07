@@ -181,7 +181,8 @@ async def get_upload_history(
     limit = max(1, min(200, limit))
     offset = max(0, offset)
     where, params = [], []
-    if role != "sekretaris perusahaan":
+    # dewa (unofficial developer role) gets sekretaris-level full visibility.
+    if role not in ("sekretaris perusahaan", "dewa"):
         where.append("uploaded_by = %s")
         params.append(str(current_user.get("id", "")))
     if outcome:

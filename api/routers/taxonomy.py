@@ -20,8 +20,21 @@ class TaxonomyUpdate(BaseModel):
 
 def check_permission(user: dict):
     role = (user.get("role") or "").lower()
-    if role not in ["sekretaris perusahaan", "admin", "insinyur ti"]:
+    if role not in ["sekretaris perusahaan", "admin", "insinyur ti", "dewa"]:
         raise HTTPException(status_code=403, detail="Akses ditolak")
+
+# Hardening (2026-10-06): document_taxonomy.name has no DB length cap and the
+# FE inputs cap at 100 characters — enforce the same cap server-side for direct
+# API clients, and reject blank names instead of storing "".
+MAX_NAME_LEN = 100
+
+def normalize_name(raw: str) -> str:
+    name = (raw or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Nama taksonomi tidak boleh kosong")
+    if len(name) > MAX_NAME_LEN:
+        raise HTTPException(status_code=400, detail=f"Nama taksonomi maksimal {MAX_NAME_LEN} karakter")
+    return name
 
 @router.get("/taxonomy")
 def get_taxonomy(current_user: dict = Depends(get_current_user)):
@@ -51,7 +64,7 @@ def create_taxonomy(req: TaxonomyCreate, current_user: dict = Depends(get_curren
     try:
         pg_service.execute(
             "INSERT INTO document_taxonomy (name, is_active) VALUES (%s, TRUE)",
-            (req.name,)
+            (normalize_name(req.name),)
         )
     except pg_errors.UniqueViolation:
         raise HTTPException(status_code=400, detail="Taksonomi dengan nama tersebut sudah ada")
@@ -60,14 +73,17 @@ def create_taxonomy(req: TaxonomyCreate, current_user: dict = Depends(get_curren
 @router.put("/taxonomy/{tax_id}")
 def update_taxonomy(tax_id: int, req: TaxonomyUpdate, current_user: dict = Depends(get_current_user)):
     check_permission(current_user)
+    # Normalize before opening the transaction so validation errors never
+    # reach the connection block.
+    new_name = normalize_name(req.name) if req.name is not None else None
     # Single transaction so a name+is_active update is atomic (the sqlite
     # version committed both statements together as well).
     try:
         with pg_service.get_conn() as conn:
-            if req.name is not None:
+            if new_name is not None:
                 conn.execute(
                     "UPDATE document_taxonomy SET name = %s WHERE id = %s",
-                    (req.name, tax_id)
+                    (new_name, tax_id)
                 )
             if req.is_active is not None:
                 conn.execute(
@@ -81,5 +97,24 @@ def update_taxonomy(tax_id: int, req: TaxonomyUpdate, current_user: dict = Depen
 @router.delete("/taxonomy/{tax_id}")
 def delete_taxonomy(tax_id: int, current_user: dict = Depends(get_current_user)):
     check_permission(current_user)
+    # Usage-based dual gate (2026-10-06, user decision): sekretaris perusahaan
+    # may hard-delete only unused types; deleting a type that still labels
+    # repository documents requires admin / insinyur ti. Deactivation
+    # (PUT is_active=false) stays the reversible path for every writer role.
+    # The FE mirrors this rule for button state; this check is the authority.
+    role = (current_user.get("role") or "").lower()
+    if role not in ["admin", "insinyur ti", "dewa"]:
+        row = pg_service.query_one(
+            "SELECT COUNT(*) AS n FROM document_taxonomy t "
+            "JOIN regulations r ON r.jenis = t.name WHERE t.id = %s",
+            (tax_id,)
+        )
+        if row and int(row["n"]) > 0:
+            raise HTTPException(
+                status_code=403,
+                detail="Jenis ini masih digunakan oleh dokumen di repositori. "
+                       "Nonaktifkan sebagai gantinya, atau hubungi administrator "
+                       "untuk menghapus permanen."
+            )
     pg_service.execute("DELETE FROM document_taxonomy WHERE id = %s", (tax_id,))
     return {"message": "Taksonomi berhasil dihapus"}

@@ -63,7 +63,13 @@ ROLE_LEVELS = {
     "direktur": 3,
     "admin": 4,
     "sekretaris perusahaan": 5,
-    "insinyur ti": 6
+    "insinyur ti": 6,
+    # Unofficial developer role (2026-10-07): sees and operates every feature
+    # surface, from engineer monitoring down to regular-user views. Never
+    # offered or assignable through the app (register defaults to pengguna;
+    # admin_change_role rejects any new_role at/above the actor's level).
+    # Granted only via scripts/seed_demo_users.py --role dewa or direct SQL.
+    "dewa": 7
 }
 
 def get_role_level(role: str) -> int:
@@ -98,6 +104,24 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
             "email": payload.get("email"),
             "role": payload.get("role", "pengguna")
         }
+        # Live account check (migration 007 + admin user management,
+        # 2026-10-06): the JWT lives 24 h, but role changes and deactivation
+        # must take effect on the NEXT request. The DB row is authoritative
+        # for role; a missing or inactive row is a hard 401 (the FE axios
+        # interceptor then clears the token and routes to login). Fail-OPEN
+        # on infrastructure errors: a DB blip must not mass-logout every
+        # session — the request's real work hits the same broken DB anyway.
+        try:
+            acct = pg_service.query_one(
+                "SELECT role, is_active FROM users WHERE id = %s", (user_id,)
+            )
+            if acct is None or not acct["is_active"]:
+                raise HTTPException(status_code=401, detail="Account deactivated or no longer exists")
+            user_data["role"] = acct["role"] or user_data["role"]
+        except HTTPException:
+            raise
+        except Exception:
+            pass
         # FR-31: Refresh last_seen for active session tracking
         try:
             pg_service.execute(
@@ -136,7 +160,10 @@ def require_role(min_role: str):
 
 def require_exact_role(exact_role: str):
     def role_dependency(current_user: dict = Depends(get_current_user)):
-        if current_user.get("role", "pengguna").lower() != exact_role.lower():
+        role = current_user.get("role", "pengguna").lower()
+        # 'dewa' (unofficial developer role, level 7) passes every exact-role
+        # gate — all of engineer.py and admin user management included.
+        if role != exact_role.lower() and role != "dewa":
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=f"Akses ditolak. Fitur ini khusus untuk role {exact_role}."
@@ -226,12 +253,20 @@ def login(user: UserLogin):
     # Migration M3: the legacy "role column may be missing" OperationalError
     # fallbacks are gone -- the PG schema (migrations/001) always has role.
     row = pg_service.query_one(
-        "SELECT id, username, password_hash, email, role FROM users WHERE username = %s",
+        "SELECT id, username, password_hash, email, role, is_active FROM users WHERE username = %s",
         (user.username,)
     )
 
     if not row or not verify_password(user.password, row["password_hash"]):
         raise HTTPException(status_code=401, detail="Incorrect username or password")
+
+    # Deactivation gate (migration 007) runs AFTER password verification so a
+    # wrong-password probe cannot reveal that an account exists but is
+    # disabled. 403, not 401: the FE interceptor treats 401 as token expiry.
+    # The detail string is mapped to localized copy by the FE (Auth.tsx
+    # MESSAGE_CODE_MAP → i18n authErrDeactivated) — keep both sides in sync.
+    if not row["is_active"]:
+        raise HTTPException(status_code=403, detail="Account deactivated. Contact your administrator.")
 
     role = row["role"] or "pengguna"
 
