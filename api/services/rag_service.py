@@ -720,6 +720,26 @@ def extract_text_hybrid(pdf_path: str, digital_threshold: int = 80,
     return "\n\n".join(full_text_parts)
 
 
+def _attach_filenames(contexts: List[dict]) -> None:
+    """Best-effort regulations.filename lookup per context, so chat sources
+       can deep-link the drawer's PDF tab (critique remediation P2-5,
+       2026-10-08). Contexts whose doc_id has no regulations row (internal
+       docs, legacy orphans) simply carry filename=None."""
+    doc_ids = sorted({str(c["doc_id"]) for c in contexts if c.get("doc_id")})
+    if not doc_ids:
+        return
+    try:
+        rows = pg_service.query(
+            "SELECT id::text AS doc_id, filename FROM regulations "
+            "WHERE id::text = ANY(%s::text[])",
+            (doc_ids,))
+        fmap = {r["doc_id"]: r["filename"] for r in rows}
+        for c in contexts:
+            c["filename"] = fmap.get(str(c.get("doc_id") or "")) or None
+    except Exception as e:
+        print(f"Filename lookup for chat sources failed: {e}")
+
+
 def retrieve_contexts(query: str, current_user: dict, n_results=5, doc_category=None, hybrid_cag=True) -> List[dict]:
     """Searches Vector DB and returns structured raw dictionaries.
        If hybrid_cag=True, uses RAG to find the best document, then CAG to inject the full text.
@@ -836,12 +856,14 @@ def retrieve_contexts(query: str, current_user: dict, n_results=5, doc_category=
                     if len(full_text) <= 25000:
                         contexts.append({
                             "id": best_reg_id,
+                            "doc_id": best_reg_id,
                             "text": full_text,
                             "jenis": best_top_meta["jenis"] or '',
                             "nomor": best_top_meta["nomor"] or '',
                             "sektor": best_top_meta["sektor"] or '',
                             "judul": best_top_meta["judul"] or ''
                         })
+                        _attach_filenames(contexts)
                         return contexts
                     # If it exceeds 25,000 chars, we DO NOT return contexts here. 
                     # We let it fall through to the standard chunk-based RAG below so the LLM gets the most relevant snippets instead of just the first 25k chars.
@@ -881,6 +903,7 @@ def retrieve_contexts(query: str, current_user: dict, n_results=5, doc_category=
             dense_ranks[chunk_id] = dense_rank
             chunk_data[chunk_id] = {
                 "id": chunk_id,
+                "doc_id": meta["doc_id"],
                 "text": window_doc,
                 "jenis": meta["jenis"] or '',
                 "nomor": meta["nomor"] or '',
@@ -932,6 +955,7 @@ def retrieve_contexts(query: str, current_user: dict, n_results=5, doc_category=
             if chunk_id not in chunk_data:
                 chunk_data[chunk_id] = {
                     "id": chunk_id,
+                    "doc_id": doc_id,
                     "text": _cap_context_text(row["window_context"] or row["text"]),
                     "jenis": row["jenis"] or '',
                     "nomor": row["nomor"] or '',
@@ -987,5 +1011,6 @@ def retrieve_contexts(query: str, current_user: dict, n_results=5, doc_category=
     # Build final context list
     for cand in candidates[:n_results]:
         contexts.append(cand)
-        
+
+    _attach_filenames(contexts)
     return contexts

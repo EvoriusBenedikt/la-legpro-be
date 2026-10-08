@@ -110,6 +110,24 @@ def main():
                 docs.append(ch["text"])
                 metas.append(clean)
 
+            # Id-collision guard (2026-10-07 pilot incident, bug_reports.md):
+            # legacy chunks are keyed md5('{legacy_sqlite_id}_chunk_i') while
+            # this tool keys md5('{PG_id}_chunk_i'). A row's PG id can equal
+            # ANY other row's legacy id (reg 2 and reg 462 are different
+            # regulations, not duplicates), and the ON CONFLICT upsert would
+            # silently overwrite that other document's chunks (6 of doc 462's
+            # were; restored from backup). Refuse instead of corrupting.
+            clashes = pg_service.query(
+                "SELECT doc_id FROM chunks "
+                "WHERE id = ANY(%s) AND doc_id IS DISTINCT FROM %s",
+                (ids, reg_id_str))
+            if clashes:
+                owners = sorted({str(c["doc_id"]) for c in clashes})
+                print(f"  [FAIL] id collision: {len(clashes)} chunk id(s) owned "
+                      f"by doc_id(s) {','.join(owners)} -- refusing to overwrite")
+                fail += 1
+                continue
+
             embeddings = embed_documents(docs)
             with pg_service.get_conn() as conn:
                 for chunk_id, doc, m, emb in zip(ids, docs, metas, embeddings):

@@ -73,6 +73,25 @@ def get_indexed_reg_ids() -> set:
         return set()
 
 
+def find_id_collisions(ids, reg_id_str):
+    """Return the doc_ids that already own any of `ids` under a DIFFERENT
+    doc_id ([] == safe to upsert).
+
+    Chunk ids live in two coexisting spaces -- legacy md5('{sqlite_id}_chunk_i')
+    rows migrated from Chroma vs new md5('{PG_id}_chunk_i') ids -- so a PG row
+    whose id equals another row's legacy sqlite id (reg 2 vs doc 462 is the
+    live pair) would have that row's chunks silently overwritten through the
+    UPSERT_CHUNK ON CONFLICT path. Same guard as reingest_missing.py
+    (2026-10-08); see la-legpro-doc/bug_reports.md.
+    """
+    with pg_service.get_conn() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT doc_id FROM chunks WHERE id = ANY(%s) "
+            "AND doc_id IS DISTINCT FROM %s",
+            (ids, reg_id_str)).fetchall()
+    return ["NULL" if r["doc_id"] is None else str(r["doc_id"]) for r in rows]
+
+
 def ingest_documents(force_reindex=False):
     # DISTINCT ON (local_path) is the PG idiom for the legacy SQLite
     # `GROUP BY local_path` de-duplication (deterministic: lowest id wins).
@@ -93,6 +112,7 @@ def ingest_documents(force_reindex=False):
     processed = 0
     skipped_exists = 0
     skipped_missing = 0
+    skipped_collision = 0
     failed = 0
     # resolve_data_path maps legacy Windows host paths (migrated rows) onto
     # this environment's mount point before the existence check.
@@ -184,6 +204,20 @@ def ingest_documents(force_reindex=False):
                 documents.append(chunk_data["text"])
                 metadatas.append(clean_meta)
 
+            # 3b. Id-collision guard -- refuse BEFORE the expensive embed
+            # step when the computed ids already belong to another document
+            # (see find_id_collisions). Without this, a skip-mode bulk run
+            # would e.g. let chunkless reg 2 overwrite doc 462's restored
+            # legacy-space chunks through ON CONFLICT DO UPDATE.
+            owners = find_id_collisions(ids, reg_id_str)
+            if owners:
+                sys.stdout.write(
+                    f"\n  [FAIL] id collision for {filename} (reg {reg_id_str}): "
+                    f"chunk ids owned by doc(s) {', '.join(owners)} "
+                    "-- refusing to overwrite\n")
+                skipped_collision += 1
+                continue
+
             # 4. Embed + upsert into the unified PG chunks table
             embeddings = embed_documents(documents)
             with pg_service.get_conn() as conn:
@@ -209,6 +243,7 @@ def ingest_documents(force_reindex=False):
     print(f"  Newly indexed : {processed}")
     print(f"  Already existed: {skipped_exists}")
     print(f"  File missing  : {skipped_missing}")
+    print(f"  Id collisions : {skipped_collision}")
     print(f"  Failed / empty: {failed}")
     print(f"  Total chunks in PG store: {total_chunks}")
     print("="*50)

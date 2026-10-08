@@ -17,13 +17,23 @@ async def get_knowledge_graph(
     current_user: dict = Depends(auth.require_role("manajer"))
 ):
     """Returns all KG nodes and edges for the graph visualizer."""
-    node_query = "SELECT id, label, type, doc_id FROM kg_nodes WHERE 1=1"
+    # doc_status: the legal-effect status of the node's own regulation. Only
+    # 'regulasi' nodes carry a doc_id — kg_service upserts each document's
+    # self-node with doc_id = regulations.id while entitas/topik stay NULL —
+    # so this LEFT JOIN can never misattribute another document's status
+    # (v5 status rings; same id::text cast as the rebuild query below).
+    node_query = (
+        "SELECT n.id, n.label, n.type, n.doc_id, r.status AS doc_status "
+        "FROM kg_nodes n "
+        "LEFT JOIN regulations r ON r.id::text = n.doc_id "
+        "WHERE 1=1"
+    )
     params = []
     if search:
-        node_query += " AND label LIKE %s"
+        node_query += " AND n.label LIKE %s"
         params.append(f"%{search}%")
     if node_type:
-        node_query += " AND type = %s"
+        node_query += " AND n.type = %s"
         params.append(node_type)
     node_query += " LIMIT 500"
 

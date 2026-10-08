@@ -72,7 +72,8 @@ async def chat_endpoint(req: ChatRequest, current_user: dict = Depends(auth.get_
             "sektor": c['sektor'],
             "judul": c['judul'],
             "snippet": c['text'],
-            "rerank_score": c.get('rerank_score')
+            "rerank_score": c.get('rerank_score'),
+            "filename": c.get('filename')
         })
         context_str += f"SUMBER [{i+1}]: {c['jenis']} Nomor {c['nomor']}\nTEKS:\n{c['text']}\n\n"
 
@@ -122,7 +123,11 @@ async def chat_endpoint(req: ChatRequest, current_user: dict = Depends(auth.get_
         "   - Bold (`**...**`) only around actual key terms, always with opening AND closing markers on the same line.\n"
         "4. CRITICAL LEGAL ARGUMENTS:\n"
         "   - Electronic vs Stamped paper contracts: Emphasize that a stamp duty (meterai) is just a document tax, NOT a requirement for a valid contract. Contract validity is based purely on Article 1320 of the Civil Code and Article 5 of the ITE Law.\n"
-        "   - Prison threats for debts: You MUST cite 'Article 19 paragraph (2) of Law No. 39 of 1999 concerning Human Rights (UU HAM)' which strictly prohibits criminal punishment/prison for civil debt issues. Clearly distinguish between civil default (wanprestasi) and malicious intent (fraud, Article 378 of the Criminal Code).\n\n"
+        "   - Prison threats for debts: You MUST cite 'Article 19 paragraph (2) of Law No. 39 of 1999 concerning Human Rights (UU HAM)' which strictly prohibits criminal punishment/prison for civil debt issues. Clearly distinguish between civil default (wanprestasi) and malicious intent (fraud, Article 378 of the Criminal Code).\n"
+        "5. CITATION MARKERS (verifiability is the product promise):\n"
+        "   - LEGAL CONTEXT supplies numbered sources (SUMBER [1], SUMBER [2], ...). When a claim rests on one of them, end that claim with its marker in square brackets, immediately before the closing punctuation, e.g. '... wajib dimuat dalam laporan tahunan [2].'\n"
+        "   - Use ONLY markers of sources actually supplied; never invent or renumber a marker.\n"
+        "   - When quoting a regulation's number, year, or article that appears in a source, reproduce it EXACTLY as written there — never alter digits, years, or abbreviations.\n\n"
         "Always provide actionable solutions and naturally cite relevant legal bases/articles."
     )
     if retrieval_degraded:
@@ -143,16 +148,22 @@ async def chat_endpoint(req: ChatRequest, current_user: dict = Depends(auth.get_
         {"role": "system", "content": system_prompt},
         {"role": "user",   "content": enriched_user_prompt}
     ]
+    # FR-25: Audit log the search query -- moved BEFORE the LLM call so a
+    # failed generation is still auditable (critique remediation, 2026-10-08).
+    log_audit(current_user.get("id", ""), "SEARCH", "", f"Query: {last_user_message[:200]}")
     try:
         answer = call_glm(messages, temperature=0.1, timeout=60)
     except HTTPException as e:
-        print(f"Chat fallback triggered due to GLM error: {e.detail}")
-        answer = (
-            "Maaf, layanan AI sedang mengalami gangguan koneksi sementara. "
-            "Silakan coba kirim pertanyaan yang sama beberapa detik lagi."
+        # Critique remediation P1-3 (2026-10-08): an LLM failure must never
+        # return a canned apology shaped like an ordinary answer -- it got
+        # saved to chat history and replayed into later LLM context as if
+        # the assistant had really answered. Surface failures as 502; the FE
+        # renders non-2xx as a first-class error state with a retry action.
+        print(f"Chat LLM call failed: {e.detail}")
+        raise HTTPException(
+            status_code=502,
+            detail="Layanan AI tidak dapat dihubungi. Silakan coba lagi beberapa saat."
         )
-    # FR-25: Audit log the search query
-    log_audit(current_user.get("id", ""), "SEARCH", "", f"Query: {last_user_message[:200]}")
     if retrieval_degraded:
         notice = (
             "\n\n---\n_Catatan: penelusuran basis data regulasi sedang tidak tersedia, "

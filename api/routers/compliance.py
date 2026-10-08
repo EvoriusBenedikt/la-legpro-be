@@ -109,6 +109,73 @@ async def upload_document(
         print(f"Upload error: {e}")
         raise HTTPException(status_code=500, detail="Terjadi kesalahan saat memproses dokumen.")
 
+def _sibling_chunk_doc_id(reg_id):
+    """doc_id of a duplicate sibling holding chunks, or None.
+
+    Primary match key = chunks.filename (the local_path basename serve_pdf
+    also resolves on) + domain: duplicate registrations of one regulation
+    share the same source file (reg 2 resolves to its chunk-holding sibling
+    reg 1 -- both POJK_Perbankan_9.pdf). Nomor/judul columns alone are not
+    reliable across duplicate registrations, and some legacy chunks carry
+    NULL filename, so a nomor + judul-prefix pass runs as second fallback.
+    """
+    row = pg_service.query_one(
+        "SELECT domain, local_path, nomor, judul FROM regulations "
+        "WHERE id::text = %s",
+        (reg_id,))
+    if not row:
+        return None
+    basename = os.path.basename(
+        str(row["local_path"] or "").replace("\\", "/"))
+    if basename:
+        sib = pg_service.query_one(
+            "SELECT c.doc_id FROM chunks c "
+            "JOIN regulations s ON s.id::text = c.doc_id "
+            "WHERE c.filename = %s AND s.domain = %s AND c.doc_id <> %s "
+            "GROUP BY c.doc_id ORDER BY c.doc_id LIMIT 1",
+            (basename, row["domain"], reg_id))
+        if sib:
+            return sib["doc_id"]
+    # Second pass: nomor + judul-prefix match, for siblings whose chunks
+    # carry NULL/mismatched filename metadata (163 of doc 462's chunks have
+    # no filename at all).
+    sib = pg_service.query_one(
+        "SELECT s.id::text AS doc_id FROM regulations r "
+        "JOIN regulations s ON s.domain = r.domain AND s.nomor = r.nomor "
+        "  AND LEFT(s.judul, 60) = LEFT(r.judul, 60) AND s.id <> r.id "
+        "WHERE r.id::text = %s "
+        "  AND EXISTS (SELECT 1 FROM chunks c WHERE c.doc_id = s.id::text) "
+        "ORDER BY s.id LIMIT 1",
+        (reg_id,))
+    return sib["doc_id"] if sib else None
+
+
+def _fetch_doc_chunks(reg_id, nomor):
+    """Chunks for a regulation by reg_id, with duplicate-sibling fallback.
+
+    The corpus carries duplicate registrations of the same regulation (e.g.
+    PG ids 1 and 2 for POJK 9/2024 -- reg 1 holds the chunks) where only one
+    row carries the legacy chunk ingest; the chunk-less duplicate used to
+    render an empty drawer
+    ("belum memiliki data di knowledge base"). Per user decision 2026-10-07
+    (non-destructive sibling fallback; corpus dedup deferred), a reg_id
+    lookup that finds nothing resolves via _sibling_chunk_doc_id. The nomor
+    path already matches across rows via chunks.nomor and needs no fallback.
+    """
+    if not reg_id:
+        return pg_service.query(
+            "SELECT text FROM chunks WHERE nomor = %s ORDER BY seq", (nomor,))
+    rows = pg_service.query(
+        "SELECT text FROM chunks WHERE doc_id = %s ORDER BY seq", (reg_id,))
+    if rows:
+        return rows
+    sib = _sibling_chunk_doc_id(reg_id)
+    if not sib:
+        return []
+    return pg_service.query(
+        "SELECT text FROM chunks WHERE doc_id = %s ORDER BY seq", (sib,))
+
+
 @router.post("/analyze")
 async def analyze_document(req: AnalyzeRequest):
     """Analyzes a document from regulation chunks + LLM for overview and status."""
@@ -116,14 +183,7 @@ async def analyze_document(req: AnalyzeRequest):
     # Step 1: Fetch all chunks for this specific document
     # Prefer reg_id (unique) but fall back to nomor if not available
     try:
-        if req.reg_id:
-            rows = pg_service.query(
-                "SELECT text FROM chunks WHERE doc_id = %s ORDER BY seq",
-                (req.reg_id,))
-        else:
-            rows = pg_service.query(
-                "SELECT text FROM chunks WHERE nomor = %s ORDER BY seq",
-                (req.nomor,))
+        rows = _fetch_doc_chunks(req.reg_id, req.nomor)
         chunks = [r["text"] for r in rows]
     except Exception as e:
         print(f"Chunks fetch error: {e}")
@@ -222,12 +282,7 @@ async def analyze_pasals(req: AnalyzeRequest):
     producing status, perbandingan (comparison), and hubungan (hierarchy).
     """
     try:
-        if req.reg_id:
-            rows = pg_service.query(
-                "SELECT text FROM chunks WHERE doc_id = %s ORDER BY seq", (req.reg_id,))
-        else:
-            rows = pg_service.query(
-                "SELECT text FROM chunks WHERE nomor = %s ORDER BY seq", (req.nomor,))
+        rows = _fetch_doc_chunks(req.reg_id, req.nomor)
         chunks = [r["text"] for r in rows]
     except Exception as e:
         print(f"Chunks fetch error: {e}")
