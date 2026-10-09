@@ -5,6 +5,7 @@ from psycopg import errors as pg_errors
 
 from auth import get_current_user
 from services import pg_service
+from services.db_service import log_audit
 
 # Migration M3 (cutover): document_taxonomy lives in PostgreSQL; the local
 # sqlite3 connection helper is replaced by services.pg_service.
@@ -29,20 +30,28 @@ def check_permission(user: dict):
 MAX_NAME_LEN = 100
 
 def normalize_name(raw: str) -> str:
+    # Terminology (2026-10-08, critique minor 3): these details surface in FE
+    # error lanes, where the documented object noun is "jenis dokumen" —
+    # "Taksonomi" stays the screen/collection identity only (ui_ux_design.md).
     name = (raw or "").strip()
     if not name:
-        raise HTTPException(status_code=400, detail="Nama taksonomi tidak boleh kosong")
+        raise HTTPException(status_code=400, detail="Nama jenis dokumen tidak boleh kosong")
     if len(name) > MAX_NAME_LEN:
-        raise HTTPException(status_code=400, detail=f"Nama taksonomi maksimal {MAX_NAME_LEN} karakter")
+        raise HTTPException(status_code=400, detail=f"Nama jenis dokumen maksimal {MAX_NAME_LEN} karakter")
     return name
 
 @router.get("/taxonomy")
 def get_taxonomy(current_user: dict = Depends(get_current_user)):
     # usage_count (2026-10-06): repository documents classified under each
     # jenis, so the FE delete/deactivate dialog can state consequences.
-    # Additive field; existing consumers only read id/name/is_active.
+    # internal_count (2026-10-08): the subset the Legal Repository shows on
+    # its "Dokumen Internal" tab — mirrors LegalRepository.tsx's sektor split
+    # so the FE usage link can target the right ?tab= deep-link param.
+    # Additive fields; existing consumers only read id/name/is_active.
     rows = pg_service.query(
-        "SELECT t.id, t.name, t.is_active, COUNT(r.id) AS usage_count "
+        "SELECT t.id, t.name, t.is_active, COUNT(r.id) AS usage_count, "
+        "COUNT(r.id) FILTER (WHERE r.sektor IN ('Upload Manual', 'Dokumen Internal')) "
+        "AS internal_count "
         "FROM document_taxonomy t "
         "LEFT JOIN regulations r ON r.jenis = t.name "
         "GROUP BY t.id, t.name, t.is_active "
@@ -54,6 +63,7 @@ def get_taxonomy(current_user: dict = Depends(get_current_user)):
             "name": r["name"],
             "is_active": bool(r["is_active"]),
             "usage_count": int(r["usage_count"]),
+            "internal_count": int(r["internal_count"]),
         }
         for r in rows
     ]}
@@ -61,14 +71,19 @@ def get_taxonomy(current_user: dict = Depends(get_current_user)):
 @router.post("/taxonomy")
 def create_taxonomy(req: TaxonomyCreate, current_user: dict = Depends(get_current_user)):
     check_permission(current_user)
+    name = normalize_name(req.name)
     try:
-        pg_service.execute(
-            "INSERT INTO document_taxonomy (name, is_active) VALUES (%s, TRUE)",
-            (normalize_name(req.name),)
+        rows = pg_service.execute_returning(
+            "INSERT INTO document_taxonomy (name, is_active) VALUES (%s, TRUE) RETURNING id",
+            (name,)
         )
     except pg_errors.UniqueViolation:
-        raise HTTPException(status_code=400, detail="Taksonomi dengan nama tersebut sudah ada")
-    return {"message": "Taksonomi berhasil ditambahkan"}
+        raise HTTPException(status_code=400, detail="Jenis dokumen dengan nama tersebut sudah ada")
+    # Audit trail (2026-10-08, critique Issue 2): every taxonomy mutation is
+    # attributable — log_audit never raises and runs on its own connection.
+    log_audit(current_user["id"], "CREATE_TAXONOMY",
+              str(rows[0]["id"]) if rows else "", f'"{name}"')
+    return {"message": "Jenis dokumen berhasil ditambahkan"}
 
 @router.put("/taxonomy/{tax_id}")
 def update_taxonomy(tax_id: int, req: TaxonomyUpdate, current_user: dict = Depends(get_current_user)):
@@ -76,23 +91,55 @@ def update_taxonomy(tax_id: int, req: TaxonomyUpdate, current_user: dict = Depen
     # Normalize before opening the transaction so validation errors never
     # reach the connection block.
     new_name = normalize_name(req.name) if req.name is not None else None
-    # Single transaction so a name+is_active update is atomic (the sqlite
-    # version committed both statements together as well).
+    # Cascade rename (2026-10-08 harden, critique Issue 1, user decision — the
+    # id-based FK alternative was rejected): regulations.jenis name-joins
+    # document_taxonomy.name, so a rename must carry its documents along or it
+    # silently detaches them (usage_count → 0, classifications orphaned). Both
+    # UPDATEs share one transaction — a UniqueViolation rolls back name and
+    # cascade together, never a half-renamed state. FOR UPDATE serializes
+    # concurrent renames: the loser cascades from the winner's fresh name and
+    # its stale-name WHERE matches 0 rows, leaving a consistent end state.
+    # Post-cascade, DELETE remains the only detaching operation.
+    updated_documents = 0
+    old_name = None
+    renamed = False
     try:
         with pg_service.get_conn() as conn:
-            if new_name is not None:
+            row = conn.execute(
+                "SELECT name FROM document_taxonomy WHERE id = %s FOR UPDATE",
+                (tax_id,)
+            ).fetchone()
+            old_name = row["name"] if row else None
+            if new_name is not None and old_name is not None and old_name != new_name:
                 conn.execute(
                     "UPDATE document_taxonomy SET name = %s WHERE id = %s",
                     (new_name, tax_id)
                 )
-            if req.is_active is not None:
+                casc = conn.execute(
+                    "UPDATE regulations SET jenis = %s WHERE jenis = %s",
+                    (new_name, old_name)
+                )
+                updated_documents = casc.rowcount
+                renamed = True
+            if req.is_active is not None and old_name is not None:
                 conn.execute(
                     "UPDATE document_taxonomy SET is_active = %s WHERE id = %s",
                     (req.is_active, tax_id)
                 )
     except pg_errors.UniqueViolation:
-        raise HTTPException(status_code=400, detail="Taksonomi dengan nama tersebut sudah ada")
-    return {"message": "Taksonomi berhasil diperbarui"}
+        raise HTTPException(status_code=400, detail="Jenis dokumen dengan nama tersebut sudah ada")
+    # Audit after commit; a PUT on a missing id changed nothing, so it logs
+    # nothing (old_name is None only when the row does not exist).
+    if old_name is not None:
+        if renamed:
+            log_audit(current_user["id"], "RENAME_TAXONOMY", str(tax_id),
+                      f'"{old_name}" -> "{new_name}" ({updated_documents} dokumen mengikuti)')
+        if req.is_active is not None:
+            log_audit(current_user["id"],
+                      "ACTIVATE_TAXONOMY" if req.is_active else "DEACTIVATE_TAXONOMY",
+                      str(tax_id), f'"{new_name if renamed else old_name}"')
+    return {"message": "Jenis dokumen berhasil diperbarui",
+            "updated_documents": updated_documents}
 
 @router.delete("/taxonomy/{tax_id}")
 def delete_taxonomy(tax_id: int, current_user: dict = Depends(get_current_user)):
@@ -102,13 +149,19 @@ def delete_taxonomy(tax_id: int, current_user: dict = Depends(get_current_user))
     # repository documents requires admin / insinyur ti. Deactivation
     # (PUT is_active=false) stays the reversible path for every writer role.
     # The FE mirrors this rule for button state; this check is the authority.
+    # Name + count are fetched for EVERY role (2026-10-08): the gate consumes
+    # the count and the audit row records the blast radius — post-cascade,
+    # delete is the only detaching operation (orphaned classifications
+    # re-attach if the same name is recreated).
+    row = pg_service.query_one(
+        "SELECT t.name, COUNT(r.id) AS n "
+        "FROM document_taxonomy t "
+        "LEFT JOIN regulations r ON r.jenis = t.name "
+        "WHERE t.id = %s GROUP BY t.id, t.name",
+        (tax_id,)
+    )
     role = (current_user.get("role") or "").lower()
     if role not in ["admin", "insinyur ti", "dewa"]:
-        row = pg_service.query_one(
-            "SELECT COUNT(*) AS n FROM document_taxonomy t "
-            "JOIN regulations r ON r.jenis = t.name WHERE t.id = %s",
-            (tax_id,)
-        )
         if row and int(row["n"]) > 0:
             raise HTTPException(
                 status_code=403,
@@ -117,4 +170,7 @@ def delete_taxonomy(tax_id: int, current_user: dict = Depends(get_current_user))
                        "untuk menghapus permanen."
             )
     pg_service.execute("DELETE FROM document_taxonomy WHERE id = %s", (tax_id,))
-    return {"message": "Taksonomi berhasil dihapus"}
+    if row:
+        log_audit(current_user["id"], "DELETE_TAXONOMY", str(tax_id),
+                  f'"{row["name"]}" ({int(row["n"])} dokumen kehilangan klasifikasi jenis)')
+    return {"message": "Jenis dokumen berhasil dihapus"}

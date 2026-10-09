@@ -721,19 +721,28 @@ def extract_text_hybrid(pdf_path: str, digital_threshold: int = 80,
 
 
 def _attach_filenames(contexts: List[dict]) -> None:
-    """Best-effort regulations.filename lookup per context, so chat sources
-       can deep-link the drawer's PDF tab (critique remediation P2-5,
-       2026-10-08). Contexts whose doc_id has no regulations row (internal
-       docs, legacy orphans) simply carry filename=None."""
+    """Best-effort PDF filename lookup per context, so chat sources can
+       deep-link the drawer's PDF tab (critique remediation P2-5,
+       2026-10-08). regulations has no filename column; the canonical
+       derivation (ingest.py, reingest_missing.py, fast_ingest_txt.py) is
+       os.path.basename(local_path), and /api/pdf/{filename} resolves
+       exactly that basename against PDFS_DIR incl. subfolders
+       (compliance.py: chunks.filename is "the local_path basename
+       serve_pdf" uses). Contexts whose doc_id has no regulations row
+       (internal docs, legacy orphans) simply carry filename=None."""
     doc_ids = sorted({str(c["doc_id"]) for c in contexts if c.get("doc_id")})
     if not doc_ids:
         return
     try:
         rows = pg_service.query(
-            "SELECT id::text AS doc_id, filename FROM regulations "
+            "SELECT id::text AS doc_id, local_path FROM regulations "
             "WHERE id::text = ANY(%s::text[])",
             (doc_ids,))
-        fmap = {r["doc_id"]: r["filename"] for r in rows}
+        fmap = {}
+        for r in rows:
+            lp = r.get("local_path") or ""
+            fname = os.path.basename(lp.replace("\\", "/")) if lp else ""
+            fmap[r["doc_id"]] = fname or None
         for c in contexts:
             c["filename"] = fmap.get(str(c.get("doc_id") or "")) or None
     except Exception as e:

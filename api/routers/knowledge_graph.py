@@ -22,20 +22,28 @@ async def get_knowledge_graph(
     # self-node with doc_id = regulations.id while entitas/topik stay NULL —
     # so this LEFT JOIN can never misattribute another document's status
     # (v5 status rings; same id::text cast as the rebuild query below).
+    # The LIMIT lives INSIDE the subquery on purpose: with the join written
+    # at the top level, Postgres flipped the plan and the 500-row cap came
+    # back regulasi-only (psql differential: plain LIMIT 500 = 145 regulasi
+    # / 122 entitas / 233 topik; joined-at-top LIMIT 500 = 500/0/0), which
+    # stripped every cluster hub from the default graph view. Postgres never
+    # pulls a LIMIT subquery up into the join, so the row selection stays
+    # identical to the pre-status query and the join only decorates it.
     node_query = (
         "SELECT n.id, n.label, n.type, n.doc_id, r.status AS doc_status "
-        "FROM kg_nodes n "
-        "LEFT JOIN regulations r ON r.id::text = n.doc_id "
-        "WHERE 1=1"
+        "FROM (SELECT * FROM kg_nodes WHERE 1=1"
     )
     params = []
     if search:
-        node_query += " AND n.label LIKE %s"
+        node_query += " AND label LIKE %s"
         params.append(f"%{search}%")
     if node_type:
-        node_query += " AND n.type = %s"
+        node_query += " AND type = %s"
         params.append(node_type)
-    node_query += " LIMIT 500"
+    node_query += (
+        " LIMIT 500) n "
+        "LEFT JOIN regulations r ON r.id::text = n.doc_id"
+    )
 
     nodes = pg_service.query(node_query, tuple(params))
 
