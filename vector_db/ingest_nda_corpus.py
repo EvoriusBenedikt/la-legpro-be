@@ -9,7 +9,8 @@ ingest.py / fast_ingest_txt.py.
 
 RETIRED (Migration M4, 2026-09-26): the curated `mock_*` chunks this seeded
 were carried into the PG `chunks` table verbatim by the M2 data migration
-(fresh deployments get them through migrations/migrate_data.py), ChromaDB is
+(fresh deployments got them through the M2 migration tooling, deleted from
+the repo 2026-10-09 -- recoverable via git history), ChromaDB is
 gone and the chromadb dependency was removed from requirements.txt -- so this
 script fails with ImportError by design. Kept unported as the canonical text
 of the curated clauses; do not run.
