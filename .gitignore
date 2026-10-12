@@ -35,3 +35,4 @@ server.log
 # VSCode / IDE
 .vscode/
 .idea/
+.superpowers/

@@ -36,7 +36,7 @@ import history
 import internal_docs
 import templates
 from routers import admin, engineer
-from routers import chat, repository, knowledge_graph
+from routers import chat, chat_attachments, repository, knowledge_graph
 from routers import compliance, taxonomy
 from services.app_state import API_STATS
 from services.db_service import init_main_db
@@ -124,6 +124,7 @@ app.include_router(templates.router, prefix="/api", tags=["templates"])
 app.include_router(admin.router)
 app.include_router(engineer.router)
 app.include_router(chat.router)
+app.include_router(chat_attachments.router)
 app.include_router(repository.router)
 app.include_router(knowledge_graph.router)
 app.include_router(compliance.router)
