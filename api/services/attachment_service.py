@@ -248,6 +248,49 @@ def get_whole_text(attachment_id: str, owner: str):
     return row["extracted_text"], row["filename"]
 
 
+def get_meta(attachment_id: str, owner: str):
+    """Metadata row for an owned attachment, else None (chat-endpoint
+    validation: exists / owner / status)."""
+    return pg_service.query_one(
+        f"SELECT {_META_COLS} FROM chat_attachments WHERE id = %s AND owner = %s",
+        (attachment_id, owner))
+
+
+def build_vision_parts(attachment_ids: list, owner: str):
+    """OpenAI-style image_url data-URL parts for owned READY image
+    attachments, in the priority order given (chat.py orders current-turn
+    first), capped at IMAGES_PER_REQUEST.
+
+    Returns (parts, dropped_ids); dropped covers over-cap, non-image,
+    not-ready, foreign, and file-missing ids — chat.py turns drops into a
+    loud notice line, never a silent skip. call_glm passes `messages`
+    verbatim to the API, so list content needs no llm_client change.
+    """
+    import base64
+    parts, dropped = [], []
+    for aid in attachment_ids:
+        if len(parts) >= IMAGES_PER_REQUEST:
+            dropped.append(aid)
+            continue
+        row = pg_service.query_one(
+            "SELECT id, mime, filename FROM chat_attachments "
+            "WHERE id = %s AND owner = %s AND kind = 'image' AND status = 'ready'",
+            (aid, owner))
+        if not row:
+            dropped.append(aid)
+            continue
+        path = os.path.join(ATTACH_ROOT, row["id"], row["filename"])
+        try:
+            with open(path, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode("ascii")
+        except OSError:
+            dropped.append(aid)
+            continue
+        parts.append({"type": "image_url",
+                      "image_url": {"url": f"data:{row['mime']};base64,{b64}"}})
+    return parts, dropped
+
+
 def retrieve_attachment_contexts(attachment_ids: list, query: str, top_k: int = RETRIEVAL_TOP_K) -> list:
     """Scoped top-k recall over chat_attachment_chunks for the given attachment
     ids only (never the corpus). Dense cosine pulls a wider candidate pool,

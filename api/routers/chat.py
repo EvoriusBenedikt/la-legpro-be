@@ -13,6 +13,10 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fil
 class ChatMessage(BaseModel):
     role: str
     content: str
+    # Chat attachments (2026-10-12): honored on user messages only; ids ride
+    # on the message they were sent with — the full window the FE replays IS
+    # the multi-turn attachment memory.
+    attachment_ids: List[str] = []
 
 class ChatRequest(BaseModel):
     messages: List[ChatMessage] = []
@@ -80,6 +84,73 @@ async def chat_endpoint(req: ChatRequest, current_user: dict = Depends(auth.get_
     if graph_context:
         context_str += f"\n{graph_context}\n\n"
 
+    # ── Chat attachments (2026-10-12) ───────────────────────────────────────
+    # Images ride as OpenAI-style vision parts on the synthesized user
+    # message; PDFs become LAMPIRAN text context: current-turn whole docs
+    # verbatim (cap CURRENT_TURN_WHOLE_CAP, newest first), every other
+    # in-window pdf via scoped top-k retrieval over chat_attachment_chunks.
+    # Unusable ids (missing/foreign/processing/failed/over-cap) produce loud
+    # notice lines appended to the answer — never a silent drop (house
+    # grammar: retrieval_degraded).
+    from services import attachment_service
+    owner_id = str(current_user["id"])
+    user_msgs = [m for m in req.messages if m.role == "user"]
+    current_ids = list(user_msgs[-1].attachment_ids) if user_msgs else []
+    older_ids = [i for m in user_msgs[:-1] for i in m.attachment_ids]
+    # dedupe preserving order, current turn first (vision + whole caps keep
+    # the newest); whole-cap overflow falls to retrieval — its chunks exist
+    # in both storage modes, so nothing is silently lost.
+    window_ids = list(dict.fromkeys(current_ids + older_ids))
+
+    ready_images, current_pdfs, other_pdfs, invalid_ids = [], [], [], []
+    for aid in window_ids:
+        meta = attachment_service.get_meta(aid, owner_id)
+        if not meta or meta["status"] != "ready":
+            invalid_ids.append(aid)
+            continue
+        if meta["kind"] == "image":
+            ready_images.append(meta)
+        elif aid in current_ids:
+            current_pdfs.append(meta)
+        else:
+            other_pdfs.append(meta)
+
+    vision_parts, dropped_images = attachment_service.build_vision_parts(
+        [m["id"] for m in ready_images], owner_id)
+
+    lampiran_blocks = []
+    current_pdfs.reverse()  # newest first (FE appends chronologically)
+    whole_now = [m for m in current_pdfs
+                 if m["storage_mode"] == "whole"][:attachment_service.CURRENT_TURN_WHOLE_CAP]
+    overflow = [m for m in current_pdfs if m not in whole_now]
+    for meta in whole_now:
+        got = attachment_service.get_whole_text(meta["id"], owner_id)
+        if got:
+            text, filename = got
+            lampiran_blocks.append(
+                f"LAMPIRAN [A{len(lampiran_blocks) + 1}]: {filename} (pdf)\nTEKS:\n{text}\n")
+    retrieval_pool = other_pdfs + overflow
+    attachment_retrieval_failed = False
+    if retrieval_pool:
+        try:
+            hits = attachment_service.retrieve_attachment_contexts(
+                [m["id"] for m in retrieval_pool], last_user_message)
+        except Exception as e:
+            print(f"Chat attachment retrieval failed, dropping attachment context: {e}")
+            hits = []
+            attachment_retrieval_failed = True
+        fname_by_id = {m["id"]: m["filename"] for m in retrieval_pool}
+        for h in hits:
+            lampiran_blocks.append(
+                f"LAMPIRAN [A{len(lampiran_blocks) + 1}]: "
+                f"{fname_by_id.get(h['attachment_id'], h['filename'])} "
+                f"(pdf, bagian ke-{h['seq'] + 1})\nTEKS:\n{h['text']}\n")
+    if lampiran_blocks:
+        context_str += (
+            "\nDOKUMEN LAMPIRAN PENGGUNA (diunggah ke percakapan ini; "
+            "BUKAN bagian basis data regulasi):\n"
+            + "\n".join(lampiran_blocks) + "\n")
+
     # Fetch user's contract monitor stats
     user_stats_str = ""
     try:
@@ -136,6 +207,14 @@ async def chat_endpoint(req: ChatRequest, current_user: dict = Depends(auth.get_
             "Do NOT cite specific regulation numbers, articles, or documents from memory. "
             "Answer with general legal principles only and say the regulation lookup is temporarily unavailable."
         )
+    if lampiran_blocks:
+        system_prompt += (
+            "\nLAMPIRAN PENGGUNA: Blok bertanda 'LAMPIRAN [A<n>]' adalah dokumen yang diunggah pengguna "
+            "ke percakapan ini — BUKAN regulasi dari basis data terindeks. Saat sebuah klaim bersandar "
+            "pada isi lampiran, akhiri klaim itu dengan penandanya, mis. '... sebagaimana diatur dalam [A1].', "
+            "dan sebut sumbernya sebagai 'Lampiran A<n> (nama berkas)'. Gunakan hanya penanda lampiran yang "
+            "benar-benar disediakan; jangan pernah menyajikan isi lampiran sebagai regulasi terindeks."
+        )
 
     enriched_user_prompt = (
         f"{lang_rule}\n\n"
@@ -144,9 +223,14 @@ async def chat_endpoint(req: ChatRequest, current_user: dict = Depends(auth.get_
         f"REMINDER: {lang_rule}"
     )
 
+    # call_glm passes `messages` verbatim to the OpenAI-compatible API, so a
+    # list content (vision parts + text part) needs no llm_client change.
+    user_content = enriched_user_prompt
+    if vision_parts:
+        user_content = vision_parts + [{"type": "text", "text": enriched_user_prompt}]
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user",   "content": enriched_user_prompt}
+        {"role": "user",   "content": user_content}
     ]
     # FR-25: Audit log the search query -- moved BEFORE the LLM call so a
     # failed generation is still auditable (critique remediation, 2026-10-08).
@@ -173,6 +257,25 @@ async def chat_endpoint(req: ChatRequest, current_user: dict = Depends(auth.get_
             "so this answer does not cite specific regulations._"
         )
         answer += notice
+    # Attachment notices: same loud-degradation grammar as retrieval_degraded.
+    attachment_notes = []
+    if invalid_ids:
+        attachment_notes.append(
+            f"_Catatan: {len(invalid_ids)} lampiran dilewati (masih diproses, gagal, atau tidak ditemukan)._"
+            if user_lang == "indonesian" else
+            f"_Note: {len(invalid_ids)} attachment(s) skipped (still processing, failed, or not found)._")
+    if dropped_images:
+        attachment_notes.append(
+            f"_Catatan: hanya {attachment_service.IMAGES_PER_REQUEST} gambar terbaru yang dikirim ke model; {len(dropped_images)} gambar lebih lama dilewati._"
+            if user_lang == "indonesian" else
+            f"_Note: only the {attachment_service.IMAGES_PER_REQUEST} most recent images were sent to the model; {len(dropped_images)} older one(s) skipped._")
+    if attachment_retrieval_failed:
+        attachment_notes.append(
+            "_Catatan: penelusuran konteks lampiran PDF sedang tidak tersedia, sebagian isi lampiran mungkin tidak terujuk._"
+            if user_lang == "indonesian" else
+            "_Note: PDF attachment retrieval was unavailable; some attachment content may not be reflected._")
+    if attachment_notes:
+        answer += "\n\n---\n" + "\n".join(attachment_notes)
     return ChatResponse(answer=answer, sources=sources_to_return)
 
 @router.post("/chat-session")
