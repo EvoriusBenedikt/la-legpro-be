@@ -6,7 +6,7 @@ All routes are JWT-authed, owner-scoped, and refuse admins with the same
 413 (oversize) / 415 (magic-byte mismatch) / 422 (conversation limit); the
 FE translates the detail codes into chip errors.
 """
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, BackgroundTasks
 from fastapi.responses import FileResponse
 
 import auth
@@ -28,6 +28,7 @@ def _guard_admin(current_user: dict):
 
 @router.post("/chat-attachments")
 async def upload_attachment(
+    background_tasks: BackgroundTasks,
     conversation_id: str = Form(...),
     file: UploadFile = File(...),
     current_user: dict = Depends(auth.get_current_user),
@@ -35,11 +36,16 @@ async def upload_attachment(
     _guard_admin(current_user)
     data = await file.read()
     try:
-        return attachment_service.save_upload(
+        meta = attachment_service.save_upload(
             conversation_id, str(current_user["id"]),
             file.filename or "", file.content_type or "", data)
     except ValueError as e:
         raise HTTPException(status_code=_STATUS_MAP.get(str(e), 400), detail=str(e))
+    if meta["kind"] == "pdf":
+        # Images are ready at insert; PDFs extract once, in the background —
+        # the row's status is the progress channel the FE polls.
+        background_tasks.add_task(attachment_service.process_pdf, meta["id"])
+    return meta
 
 
 @router.get("/chat-attachments")

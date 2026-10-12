@@ -113,6 +113,19 @@ def shutdown_event():
     from services.pg_service import close_pool
     close_pool()
 
+# Chat attachments (2026-10-12): a restart kills in-flight PDF extraction
+# jobs, so 'processing' rows past the staleness threshold would spin forever.
+# One UPDATE at startup flips them to failed with a re-upload instruction.
+@app.on_event("startup")
+def sweep_stale_chat_attachments():
+    try:
+        from services.attachment_service import sweep_stale_processing
+        n = sweep_stale_processing()
+        if n:
+            print(f"[Startup] Chat-attachment sweep: {n} stale 'processing' row(s) marked failed.")
+    except Exception as e:
+        print(f"[Startup] Chat-attachment sweep failed: {e}")
+
 # ── Init DB for metadata ────────────────────────────────────────────────────
 init_main_db()
 
