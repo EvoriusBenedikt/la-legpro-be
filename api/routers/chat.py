@@ -215,6 +215,21 @@ async def chat_endpoint(req: ChatRequest, current_user: dict = Depends(auth.get_
             "dan sebut sumbernya sebagai 'Lampiran A<n> (nama berkas)'. Gunakan hanya penanda lampiran yang "
             "benar-benar disediakan; jangan pernah menyajikan isi lampiran sebagai regulasi terindeks."
         )
+    if vision_parts:
+        # Bugfix 2026-10-12 (found by the Task-5 UI probe): with a short
+        # question the VLM notices an attached image on its own, but once the
+        # corpus retrieval is big and noisy (snippets saturated with the word
+        # "Lampiran"), the UNANNOUNCED image part gets ignored — the model
+        # answers "tidak ada informasi tentang gambar". Deterministic per
+        # question wording, reproduced via curl. Announce the images the same
+        # way the LAMPIRAN rule announces PDF text blocks.
+        system_prompt += (
+            "\nGAMBAR TERLAMPIR: Pesan pengguna menyertakan "
+            f"{len(vision_parts)} GAMBAR sebagai bagian multimodal (image_url). "
+            "Gambar itu BENAR-BENAR ADA dan terlihat oleh Anda — lihat langsung "
+            "dan gunakan isinya (warna, teks, objek) saat menjawab. Jangan pernah "
+            "menyatakan gambar tidak tersedia atau tidak ada informasi tentang gambar."
+        )
 
     enriched_user_prompt = (
         f"{lang_rule}\n\n"
