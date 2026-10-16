@@ -270,6 +270,15 @@ def login(user: UserLogin):
 
     role = row["role"] or "pengguna"
 
+    # Migration 010: stamp last_login on every successful sign-in. Fail-open
+    # so a missing column (pre-migration install) never blocks login.
+    try:
+        pg_service.execute(
+            "UPDATE users SET last_login = NOW() WHERE id = %s", (row["id"],)
+        )
+    except Exception:
+        pass
+
     access_token = create_access_token(
         data={"sub": row["id"], "username": row["username"], "email": row["email"], "role": role}, 
         expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)

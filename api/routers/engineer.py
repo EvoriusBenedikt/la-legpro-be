@@ -1,11 +1,11 @@
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 import os
 import psutil
 import time
 from datetime import datetime, timedelta
 from typing import Optional
 import auth
-from services import backup_service, pg_service
+from services import backup_service, hardware_info, host_metrics, pg_service, task_queue
 
 router = APIRouter(prefix="/api/engineer", tags=["engineer"])
 
@@ -17,7 +17,10 @@ async def get_system_health(current_user: dict = Depends(auth.require_exact_role
     """FR-31: Fetch real-time system health metrics"""
     cpu_percent = psutil.cpu_percent(interval=0.5)
     mem = psutil.virtual_memory()
-    disk = psutil.disk_usage('/')
+    # The data volume, not '/': inside a container '/' is the image overlay or
+    # the desktop VM's virtual disk — a phantom volume that on the dev stack
+    # hid the real, nearly full host drive behind a calm 7% (bug 2026-10-12).
+    disk, disk_path = host_metrics.data_disk_usage()
 
     # Migration M3: sizes are PostgreSQL relation totals for the two legacy
     # table groups (same response keys the FE monitoring has always consumed).
@@ -26,42 +29,61 @@ async def get_system_health(current_user: dict = Depends(auth.require_exact_role
     return {
         "cpu": cpu_percent,
         "memory": {"total": mem.total, "used": mem.used, "percent": mem.percent},
-        "disk": {"total": disk.total, "used": disk.used, "percent": disk.percent},
+        "disk": {"total": disk.total, "used": disk.used, "percent": disk.percent, "path": disk_path},
         "database": {
             "metadata_db_mb": metadata_mb,
             "users_db_mb": users_mb
         },
-        "uptime_seconds": int(time.time() - psutil.boot_time())
+        "uptime_seconds": int(time.time() - psutil.boot_time()),
+        "runtime_scope": host_metrics.RUNTIME_SCOPE
     }
+
+
+@router.get("/hardware")
+async def get_hardware(current_user: dict = Depends(auth.require_exact_role("insinyur ti"))):
+    """FR-31: full server hardware inspection — CPU model/cores/arch, GPU probe
+    chain, kernel, runtime OS, hostname, plus the live memory split (total /
+    used / available). The inventory is cached process-side (it cannot change
+    mid-boot); the monitoring page fetches this once per session and on manual
+    reload, never on the poll cadence."""
+    return hardware_info.snapshot()
 
 
 @router.get("/queue")
 async def get_processing_queue(current_user: dict = Depends(auth.require_exact_role("insinyur ti"))):
-    """FR-31: Processing queue from ACTIVE_TASKS"""
+    """FR-31: Processing queue — every task (QUEUED/RUNNING/COMPLETED/FAILED/
+    CANCELLED) with stage status, uploader, attempts and failure reason, plus
+    per-status counters. The FE filters/paginates client-side (<= 200 tasks)."""
+    return task_queue.snapshot()
+
+
+@router.post("/queue/{task_id}/cancel")
+async def cancel_queue_task(task_id: str, current_user: dict = Depends(auth.require_exact_role("insinyur ti"))):
+    """Cancel a queued task at once, or flag a running one to stop at its next
+    stage boundary (a model call already in flight cannot be interrupted)."""
+    result = task_queue.request_cancel(task_id)
+    if result == "invalid":
+        raise HTTPException(status_code=409, detail="Tugas tidak dapat dibatalkan pada status ini.")
+    from services.db_service import log_audit
+    log_audit(current_user.get("id", ""), "CANCEL_TASK", task_id, f"Membatalkan tugas pemrosesan ({result})")
+    return {"result": result}
+
+
+@router.post("/queue/{task_id}/retry")
+async def retry_queue_task(task_id: str, background_tasks: BackgroundTasks,
+                           current_user: dict = Depends(auth.require_exact_role("insinyur ti"))):
+    """Re-run a FAILED or CANCELLED task from its first stage."""
     try:
-        from services.app_state import ACTIVE_TASKS
-    except ImportError:
-        ACTIVE_TASKS = {}
-        
-    active_tasks_list = []
-    recent_history_list = []
-    
-    for t_id, data in ACTIVE_TASKS.items():
-        task_obj = {
-            "id": t_id,
-            "name": data["name"],
-            "status": data["status"],
-            "start_time": data["start_time"].isoformat() if data["start_time"] else None,
-            "end_time": data["end_time"].isoformat() if data["end_time"] else None,
-        }
-        if data["status"] == "RUNNING":
-            active_tasks_list.append(task_obj)
-        else:
-            recent_history_list.append(task_obj)
-            
-    recent_history_list.sort(key=lambda x: x["start_time"] or "", reverse=True)
-    
-    return {"active_tasks": active_tasks_list, "recent_history": recent_history_list[:20]}
+        kind, args = task_queue.prepare_manual_retry(task_id)
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    from routers import repository
+    fn = repository.process_document_background if kind == "parse" \
+        else repository.ingest_document_background
+    background_tasks.add_task(fn, *args)
+    from services.db_service import log_audit
+    log_audit(current_user.get("id", ""), "RETRY_TASK", task_id, "Mengulang tugas pemrosesan secara manual")
+    return {"result": "queued"}
 
 
 @router.get("/backups")

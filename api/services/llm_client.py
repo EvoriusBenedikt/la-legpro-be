@@ -27,8 +27,8 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fil
 API_BASE_URL = os.getenv("MODEL_BASE_URL", "https://console.labahasa.ai/v1").rstrip("/")
 API_KEY      = os.getenv("MODEL_API_KEY", "")
 # Reverted to use Maverick for both text and vision because GLM is unstable
-GLM_MODEL    = os.getenv("LLAMA_MODEL", "llama-4-maverick-instruct")
-VLM_MODEL    = os.getenv("LLAMA_MODEL", "llama-4-maverick-instruct")
+GLM_MODEL    = os.getenv("LLM_MODEL", "llama-4-maverick-instruct")
+VLM_MODEL    = os.getenv("LLM_MODEL", "llama-4-maverick-instruct")
 GLM_MAX_ATTEMPTS = int(os.getenv("GLM_MAX_ATTEMPTS", "5"))
 GLM_RETRY_BACKOFF_BASE = float(os.getenv("GLM_RETRY_BACKOFF_BASE", "0.8"))
 
@@ -138,6 +138,7 @@ def call_glm(messages: list, temperature: float = 0.1, timeout: int = 90) -> str
     # DEBUG: See what the server is actually using
     print(f"DEBUG: Calling LLM at URL: {url}")
     print(f"DEBUG: Model: {GLM_MODEL}")
+    print(f"DEBUG: API Key configured: {'Yes' if API_KEY else 'No (EMPTY)'}")
 
     headers = {
         "Authorization": f"Bearer {API_KEY}",

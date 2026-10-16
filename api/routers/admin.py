@@ -29,7 +29,8 @@ async def admin_dashboard(current_user: dict = Depends(auth.require_role("admin"
     """FR-26: Admin-only dashboard with system stats and audit logs."""
     # 1. Document Processing Status & Details (ORDER BY id keeps the
     #    DOC_DETAILS_LIMIT slice deterministic)
-    all_docs = pg_service.query("SELECT id, judul, status, nomor FROM regulations ORDER BY id")
+    all_docs = pg_service.query(
+        "SELECT id, judul, status, nomor, jenis FROM regulations ORDER BY id")
     
     doc_details = {
         "Berlaku": [],
@@ -40,7 +41,11 @@ async def admin_dashboard(current_user: dict = Depends(auth.require_role("admin"
     
     for d in all_docs:
         s = (d["status"] or "").strip()
-        doc_obj = {"id": d["id"], "judul": d["judul"], "nomor": d["nomor"], "status": s}
+        # jenis rides the detail rows (2026-10-12): the dashboard cards show
+        # the classification badge (POJK/SEOJK/...) under each title instead
+        # of the bare nomor, which carried no information on its own.
+        doc_obj = {"id": d["id"], "judul": d["judul"], "nomor": d["nomor"],
+                   "jenis": d["jenis"], "status": s}
         
         if s == "Memproses":
             doc_details["Memproses"].append(doc_obj)
@@ -219,9 +224,10 @@ def _user_payload(row: dict, actor: dict) -> dict:
         "role": row["role"],
         "is_active": row["is_active"],
         "created_at": row["created_at"],
-        # The FE renders row controls from these flags; every mutation
-        # re-checks server-side (_managed_target) — flags are UX, not
-        # authorization.
+        # Migration 010: last_login / email_verified — absent on pre-migration
+        # installs; .get() returns None so the FE handles null gracefully.
+        "last_login": row.get("last_login"),
+        "email_verified": bool(row.get("email_verified", False)),
         "manageable": row_level < actor_level and row["id"] != actor["id"],
         "is_self": row["id"] == actor["id"],
     }
@@ -232,10 +238,117 @@ async def admin_list_users(current_user: dict = Depends(auth.require_exact_role(
     filtering is FE-side: a small corporate directory in one fetch keeps the
     panel instant instead of round-tripping per keystroke."""
     rows = pg_service.query(
-        "SELECT id, username, email, role, is_active, "
-        "to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at "
+        "SELECT id, username, email, role, is_active, email_verified, "
+        "to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at, "
+        "to_char(last_login,  'YYYY-MM-DD HH24:MI:SS') AS last_login "
         "FROM users ORDER BY LOWER(username)")
     return {"users": [_user_payload(r, current_user) for r in rows]}
+
+@router.get("/users/export")
+async def admin_export_users(
+    current_user: dict = Depends(auth.require_exact_role("admin")),
+):
+    """Download the full user directory as CSV (all fields visible to this
+    actor). Fails gracefully on pre-migration columns via coalesce."""
+    rows = pg_service.query(
+        "SELECT id, username, email, role, is_active, email_verified, "
+        "to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at, "
+        "to_char(last_login,  'YYYY-MM-DD HH24:MI:SS') AS last_login "
+        "FROM users ORDER BY LOWER(username)")
+    COLS = ["id", "username", "email", "role", "is_active",
+            "email_verified", "created_at", "last_login"]
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(COLS)
+    for r in rows:
+        writer.writerow(["" if r.get(c) is None else r.get(c) for c in COLS])
+    stamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="users-{stamp}.csv"'},
+    )
+
+@router.get("/users/{user_id}")
+async def admin_get_user(user_id: str,
+                         current_user: dict = Depends(auth.require_exact_role("admin"))):
+    """Single-user detail for the drawer: includes audit-log activity count
+    and last five action types."""
+    row = pg_service.query_one(
+        "SELECT id, username, email, role, is_active, email_verified, "
+        "to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at, "
+        "to_char(last_login,  'YYYY-MM-DD HH24:MI:SS') AS last_login "
+        "FROM users WHERE id = %s", (user_id,))
+    if not row:
+        raise HTTPException(status_code=404, detail="User not found")
+    payload = _user_payload(row, current_user)
+    # Recent audit activity (last 5 actions, newest first).
+    recent = pg_service.query(
+        "SELECT to_char(timestamp, 'YYYY-MM-DD HH24:MI:SS') AS timestamp, "
+        "action_type, resource_id, details "
+        "FROM audit_logs WHERE user_id = %s ORDER BY id DESC LIMIT 5",
+        (user_id,))
+    total_row = pg_service.query_one(
+        "SELECT COUNT(*) AS n FROM audit_logs WHERE user_id = %s", (user_id,))
+    payload["recent_activity"] = list(recent)
+    payload["activity_total"] = total_row["n"] if total_row else 0
+    return payload
+
+@router.post("/users/{user_id}/force-logout")
+async def admin_force_logout(user_id: str,
+                             current_user: dict = Depends(auth.require_exact_role("admin"))):
+    """Invalidate the target's active session immediately — their next
+    authenticated request returns 401 (get_current_user re-reads is_active
+    but active_sessions deletion is the faster signal when they're still
+    active). Does NOT deactivate the account; the user can log back in."""
+    _managed_target(user_id, current_user)
+    pg_service.execute("DELETE FROM active_sessions WHERE user_id = %s", (user_id,))
+    log_audit(current_user["id"], "FORCE_LOGOUT", user_id, "admin force-logout")
+    return {"message": "Session invalidated"}
+
+@router.post("/users/{user_id}/reset-password")
+async def admin_reset_password(user_id: str,
+                               current_user: dict = Depends(auth.require_exact_role("admin"))):
+    """Generate a temporary password and return it once (plain-text, for
+    the admin to relay to the user out-of-band). The hash is stored; the
+    plain value is never persisted. Uses the same strength rules as
+    registration so the user can change it immediately via /change-password."""
+    import secrets, string
+    target = _managed_target(user_id, current_user)
+    # Build a password that satisfies validate_password_strength:
+    # ≥1 uppercase, ≥1 digit, ≥1 symbol, total 16 chars.
+    alphabet = string.ascii_letters + string.digits + "!@#$%^&*()"
+    while True:
+        pwd = ''.join(secrets.choice(alphabet) for _ in range(16))
+        if (any(c.isupper() for c in pwd)
+                and any(c.isdigit() for c in pwd)
+                and any(c in "!@#$%^&*()" for c in pwd)):
+            break
+    pg_service.execute(
+        "UPDATE users SET password_hash = %s WHERE id = %s",
+        (auth.get_password_hash(pwd), user_id),
+    )
+    # Also invalidate any live session so the new password takes effect now.
+    pg_service.execute("DELETE FROM active_sessions WHERE user_id = %s", (user_id,))
+    log_audit(current_user["id"], "RESET_PASSWORD", user_id, target["username"])
+    return {"message": "Password reset", "temp_password": pwd}
+
+class EmailVerifiedUpdate(BaseModel):
+    email_verified: bool
+
+@router.patch("/users/{user_id}/email-verified")
+async def admin_set_email_verified(user_id: str, req: EmailVerifiedUpdate,
+                                   current_user: dict = Depends(auth.require_exact_role("admin"))):
+    """Manually mark/unmark email as verified (migration 010). Useful for
+    on-premises installs with no SMTP flow."""
+    _managed_target(user_id, current_user)
+    pg_service.execute(
+        "UPDATE users SET email_verified = %s WHERE id = %s",
+        (req.email_verified, user_id),
+    )
+    log_audit(current_user["id"], "SET_EMAIL_VERIFIED", user_id,
+              f"email_verified={req.email_verified}")
+    return {"message": "Updated", "email_verified": req.email_verified}
 
 def _managed_target(user_id: str, current_user: dict) -> dict:
     """Shared guard chain for the role/status mutations: target exists, is

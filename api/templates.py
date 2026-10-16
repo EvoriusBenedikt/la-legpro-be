@@ -16,7 +16,7 @@ load_dotenv(os.path.join(_BASE_DIR, ".env"))
 
 API_BASE_URL = os.getenv("MODEL_BASE_URL", "https://console.labahasa.ai/v1").rstrip("/")
 API_KEY      = os.getenv("MODEL_API_KEY", "")
-LLM_MODEL    = os.getenv("LLAMA_MODEL", "llama-4-maverick-instruct")
+LLM_MODEL    = os.getenv("LLM_MODEL", "llama-4-maverick-instruct")
 
 
 def _make_llm_session() -> requests.Session:

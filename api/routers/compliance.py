@@ -101,6 +101,10 @@ async def upload_document(
         
         # Launch async background task for actual text extraction and chunking
         from routers.repository import process_document_background
+        from services import task_queue
+        task_queue.enqueue(doc_id, "parse", f"Parsing (AI Review): {file.filename}", file.filename,
+                           (file_path, doc_id, file.filename, nomor, jenis, sektor, status, klasifikasi),
+                           uploader=current_user.get("username"))
         background_tasks.add_task(process_document_background, file_path, doc_id, file.filename, nomor, jenis, sektor, status, klasifikasi)
         
         return {"status": "success", "message": "Dokumen berhasil diunggah dan sedang diproses di latar belakang."}
@@ -595,32 +599,48 @@ def extract_text_multi_format(file_path: str, filename: str, use_ocr: bool = Fal
 @router.post("/check-compliance")
 async def check_compliance(file: UploadFile = File(...), use_ocr: str = Form("false")):
     """
-    Accepts a document upload (PDF, DOCX, XLSX, PPTX, JPG, PNG, TXT), extracts text, 
+    Accepts a document upload (PDF, DOCX, XLSX, PPTX, JPG, PNG, TXT), extracts text,
     and uses a multi-step LLM pipeline to cross-check clauses against the OJK repository.
+
+    All blocking work (file parsing, multiple LLM round trips, ThreadPoolExecutor clause
+    analysis) is offloaded to a threadpool via run_in_threadpool so the uvicorn event loop
+    remains free to serve other requests while the analysis runs.  The same fix was applied
+    to /analyze and /analyze-pasals (bug_reports.md 2026-10-07); this endpoint had the same
+    problem and is now patched consistently.
     """
     allowed_exts = ['.pdf', '.docx', '.xlsx', '.pptx', '.jpg', '.jpeg', '.png', '.txt']
     ext = os.path.splitext(file.filename.lower())[1]
-    
+
     if ext not in allowed_exts:
         raise HTTPException(status_code=400, detail="Format file tidak didukung. Harap unggah PDF, DOCX, XLSX, PPTX, JPG, PNG, atau TXT.")
-        
+
     MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
     file.file.seek(0, 2)
     file_size = file.file.tell()
     file.file.seek(0)
-    
+
     if file_size > MAX_FILE_SIZE:
         raise HTTPException(status_code=413, detail="File too large (max 50MB)")
-        
+
     upload_id = str(uuid.uuid4())[:8]
     temp_path = os.path.join(PDFS_DIR, f"temp_check_{upload_id}_{file.filename}")
-    
+
     with open(temp_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
-        
-    try:
-        # 🔍 Pass 0: Multi-Format Extraction 🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍🔍
-        from services.rag_service import understand_document, extract_signing_date, extract_duration_months, extract_explicit_end_date, extract_pasal_items, llm_extract_pasal_items
+
+    # ── Blocking pipeline extracted to a sync function ───────────────────────
+    # run_in_threadpool hands this to a worker thread so the event loop is
+    # free throughout the multi-minute analysis (file parsing, 4-6 sequential
+    # LLM calls, up to 20 parallel per-clause LLM calls via ThreadPoolExecutor).
+    # HTTPException is re-raised transparently; any other exception is wrapped
+    # in a 500 by the outer handler.
+    def _run_pipeline() -> dict:
+        from services.rag_service import (
+            understand_document, extract_signing_date, extract_duration_months,
+            extract_explicit_end_date, extract_pasal_items, llm_extract_pasal_items,
+        )
+
+        # 🔍 Pass 0: Multi-Format Extraction ──────────────────────────────────
         print(f"[Compliance] Starting extraction for: {file.filename}")
         is_ocr = use_ocr.lower() == "true"
         full_text = extract_text_multi_format(temp_path, file.filename, use_ocr=is_ocr)
@@ -632,24 +652,24 @@ async def check_compliance(file: UploadFile = File(...), use_ocr: str = Form("fa
                 detail="Dokumen tidak dapat dibaca. Coba unggah ulang atau pastikan PDF tidak terenkripsi."
             )
 
-        # ── Pass 0A: Document Metadata Understanding ────────────────────────
+        # ── Pass 0A: Document Metadata Understanding ──────────────────────
         print("[Compliance] Pass 0A: Extracting document metadata...")
-        doc_ctx = understand_document(full_text)
+        doc_ctx  = understand_document(full_text)
         doc_type = doc_ctx.get("jenis_dokumen", "Kontrak")
         pihak_1  = doc_ctx.get("pihak_pertama", "Pihak Pertama")
         pihak_2  = doc_ctx.get("pihak_kedua", "Pihak Kedua")
         sektor   = doc_ctx.get("sektor_bisnis", "umum")
         pokok    = doc_ctx.get("pokok_perjanjian", "")
 
-        # ── Pass 0B: Dedicated signing date extraction ──────────────────────
+        # ── Pass 0B: Dedicated signing date extraction ────────────────────
         print("[Compliance] Pass 0B: Extracting signing date...")
         tanggal_pembuatan = extract_signing_date(full_text)
 
-        # ── Pass 0C: Dedicated duration extraction ──────────────────────────
+        # ── Pass 0C: Dedicated duration extraction ────────────────────────
         print("[Compliance] Pass 0C: Extracting contract duration...")
         durasi_bulan = extract_duration_months(full_text)
 
-        # ── Compute expiry date ─────────────────────────────────────────────
+        # ── Compute expiry date ───────────────────────────────────────────
         tanggal_berakhir = None
         if tanggal_pembuatan and durasi_bulan:
             try:
@@ -659,13 +679,13 @@ async def check_compliance(file: UploadFile = File(...), use_ocr: str = Form("fa
                 print(f"[Compliance] Expiry computed: {tanggal_pembuatan} + {durasi_bulan}mo = {tanggal_berakhir}")
             except Exception as e:
                 print(f"[Compliance] Failed to compute expiry: {e}")
-                
-        # ── Pass 0D: Explicit end date fallback ─────────────────────────────
+
+        # ── Pass 0D: Explicit end date fallback ───────────────────────────
         if not tanggal_berakhir:
             print("[Compliance] Computation failed/missing, attempting explicit end date extraction...")
             tanggal_berakhir = extract_explicit_end_date(full_text)
 
-        # ── Pass 1: Clause Extraction ───────────────────────────────────────
+        # ── Pass 1: Clause Extraction ─────────────────────────────────────
         print("[Compliance] Pass 1: Extracting clauses...")
         pasal_items = extract_pasal_items(text_snippet, max_items=20, max_chars_per_pasal=1200)
 
@@ -680,22 +700,22 @@ async def check_compliance(file: UploadFile = File(...), use_ocr: str = Form("fa
 
         print(f"[Compliance] Found {len(pasal_items)} clauses. Running analysis...")
 
-        # ── Pass 2: Per-clause RAG + LLM Compliance Check ──────────────────
-        results = []
+        # ── Pass 2: Per-clause RAG + LLM Compliance Check ────────────────
         COSINE_THRESHOLD = 0.45  # tightened from 0.60 to reduce wrong-domain citations
 
         def worker(c):
             return process_single_pasal(c, doc_type, pihak_1, pihak_2, sektor, pokok, COSINE_THRESHOLD)
 
+        results = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
             for res in executor.map(worker, pasal_items[:20]):
                 if res:
                     results.append(res)
 
-        # ── Pass 4: Document-Level Summary ─────────────────────────────────
-        fatal_count    = sum(1 for r in results if r["status"] == "FATAL")
-        beresiko_count = sum(1 for r in results if r["status"] == "BERESIKO")
-        sesuai_count   = sum(1 for r in results if r["status"] == "SESUAI")
+        # ── Pass 4: Document-Level Summary ───────────────────────────────
+        fatal_count        = sum(1 for r in results if r["status"] == "FATAL")
+        beresiko_count     = sum(1 for r in results if r["status"] == "BERESIKO")
+        sesuai_count       = sum(1 for r in results if r["status"] == "SESUAI")
         tidak_diatur_count = sum(1 for r in results if r["status"] == "TIDAK DIATUR")
 
         # Calculate score only against regulated clauses
@@ -713,7 +733,7 @@ async def check_compliance(file: UploadFile = File(...), use_ocr: str = Form("fa
             "sesuai": sesuai_count,
             "beresiko": beresiko_count,
             "fatal": fatal_count,
-            "skor_kepatuhan": skor
+            "skor_kepatuhan": skor,
         }
 
         print(f"[Compliance] Done. Score: {summary['skor_kepatuhan']}% | "
@@ -721,6 +741,8 @@ async def check_compliance(file: UploadFile = File(...), use_ocr: str = Form("fa
 
         return {"report": results, "summary": summary}
 
+    try:
+        return await run_in_threadpool(_run_pipeline)
     except HTTPException:
         raise
     except Exception as e:
@@ -729,6 +751,8 @@ async def check_compliance(file: UploadFile = File(...), use_ocr: str = Form("fa
     finally:
         # Automagically clean up uploaded PKS memory footprint
         if os.path.exists(temp_path):
-            try: os.remove(temp_path)
-            except: pass
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
 

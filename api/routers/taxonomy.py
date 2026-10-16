@@ -14,6 +14,11 @@ router = APIRouter()
 
 class TaxonomyCreate(BaseModel):
     name: str
+    # Faithful undo restore (2026-10-12, critique Issue 2): the FE "Urungkan"
+    # action re-POSTs a deleted row — a deleted *inactive* type must not come
+    # back active. Additive optional field; None keeps the historical TRUE
+    # default, so every existing consumer stays byte-identical.
+    is_active: Optional[bool] = None
 
 class TaxonomyUpdate(BaseModel):
     name: Optional[str] = None
@@ -74,8 +79,8 @@ def create_taxonomy(req: TaxonomyCreate, current_user: dict = Depends(get_curren
     name = normalize_name(req.name)
     try:
         rows = pg_service.execute_returning(
-            "INSERT INTO document_taxonomy (name, is_active) VALUES (%s, TRUE) RETURNING id",
-            (name,)
+            "INSERT INTO document_taxonomy (name, is_active) VALUES (%s, %s) RETURNING id",
+            (name, True if req.is_active is None else req.is_active)
         )
     except pg_errors.UniqueViolation:
         raise HTTPException(status_code=400, detail="Jenis dokumen dengan nama tersebut sudah ada")

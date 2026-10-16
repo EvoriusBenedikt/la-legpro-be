@@ -38,6 +38,7 @@ import templates
 from routers import admin, engineer
 from routers import chat, chat_attachments, repository, knowledge_graph
 from routers import compliance, taxonomy
+from routers.notification import router as notification_router
 from services.app_state import API_STATS
 from services.db_service import init_main_db
 from services.scheduler import start_background_loops
@@ -142,6 +143,7 @@ app.include_router(repository.router)
 app.include_router(knowledge_graph.router)
 app.include_router(compliance.router)
 app.include_router(taxonomy.router, prefix="/api", tags=["taxonomy"])
+app.include_router(notification_router, prefix="/api", tags=["notification"])
 
 # Serve local PDFs as static files
 PDFS_DIR = os.path.join(BASE_DIR, "data", "pdfs")

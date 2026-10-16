@@ -24,6 +24,10 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     answer: str
     sources: List[dict] = []
+    # Populated only on the first message of a conversation (history == 1
+    # user message before this turn). The FE uses it to replace the default
+    # "Percakapan N" title with something descriptive. None = no change.
+    suggested_title: str | None = None
 
 class SessionRequest(BaseModel):
     title: str
@@ -44,7 +48,32 @@ async def chat_endpoint(req: ChatRequest, current_user: dict = Depends(auth.get_
     if not last_user_message:
         raise HTTPException(status_code=400, detail="Missing user message")
 
-    # 1. Retrieve Semantic Context
+    # ── Check for attachments first ────────────────────────────────────────
+    # If the user has uploaded documents in the current turn, check if the
+    # question is about the attachment. If so, skip knowledge base retrieval
+    # to avoid showing irrelevant citations.
+    from services import attachment_service
+    owner_id = str(current_user["id"])
+    user_msgs = [m for m in req.messages if m.role == "user"]
+    current_ids = list(user_msgs[-1].attachment_ids) if user_msgs else []
+    
+    # Patterns indicating the question is about uploaded attachments
+    _ATTACHMENT_QUESTION_PATTERNS = [
+        r"(ringkas|ringkasan|summarize|summary|sum up)\s+(tentang\s+)?(pdf|dokumen|document|file|lampiran)",
+        r"(apa|what|explain|jelaskan|ceritakan)\s+(isi|content|contents|tentang)\s+(pdf|dokumen|document|file|lampiran)",
+        r"(analisis|analyze|review|tinjau)\s+(pdf|dokumen|document|file|lampiran)",
+        r"(buatlah|buat|create|make)\s+ringkasan",
+        r"pdf\s+(ini|yang|aku|saya|i)\s+(kirim|upload|unggah)",
+        r"dokumen\s+(ini|yang|aku|saya|i)\s+(kirim|upload|unggah)",
+        r"(tentang|about|regarding)\s+(pdf|dokumen|document|file|lampiran)\s+(yang|aku|saya|i)",
+    ]
+    is_attachment_focused = (
+        current_ids and 
+        any(re.search(pat, last_user_message.lower(), re.IGNORECASE) 
+            for pat in _ATTACHMENT_QUESTION_PATTERNS)
+    )
+    
+    # 1. Retrieve Semantic Context (skip if question is clearly about uploaded attachment)
     from services.rag_service import retrieve_contexts
     from services.kg_service import retrieve_graph_contexts
     from services.db_service import log_audit
@@ -55,12 +84,21 @@ async def chat_endpoint(req: ChatRequest, current_user: dict = Depends(auth.get_
     # system prompt below forbids fabricated citations and a visible notice
     # is appended to the answer, so the degradation is loud, never silent.
     retrieval_degraded = False
-    try:
-        contexts = retrieve_contexts(last_user_message, current_user=current_user)
-    except Exception as e:
-        print(f"Chat retrieval failed, degrading to ungrounded answer: {e}")
+    
+    if is_attachment_focused:
+        # Skip knowledge base retrieval when the question is about the uploaded document
         contexts = []
-        retrieval_degraded = True
+        graph_context = ""
+    else:
+        try:
+            contexts = retrieve_contexts(last_user_message, current_user=current_user)
+        except Exception as e:
+            print(f"Chat retrieval failed, degrading to ungrounded answer: {e}")
+            contexts = []
+            retrieval_degraded = True
+        
+        # FR-16: 1.5 Retrieve Graph Context
+        graph_context = retrieve_graph_contexts(last_user_message, current_user=current_user)
     
     # FR-16: 1.5 Retrieve Graph Context
     graph_context = retrieve_graph_contexts(last_user_message, current_user=current_user)
@@ -92,10 +130,7 @@ async def chat_endpoint(req: ChatRequest, current_user: dict = Depends(auth.get_
     # Unusable ids (missing/foreign/processing/failed/over-cap) produce loud
     # notice lines appended to the answer — never a silent drop (house
     # grammar: retrieval_degraded).
-    from services import attachment_service
-    owner_id = str(current_user["id"])
-    user_msgs = [m for m in req.messages if m.role == "user"]
-    current_ids = list(user_msgs[-1].attachment_ids) if user_msgs else []
+    # (attachment_service and owner_id already initialized above for attachment detection)
     older_ids = [i for m in user_msgs[:-1] for i in m.attachment_ids]
     # dedupe preserving order, current turn first (vision + whole caps keep
     # the newest); whole-cap overflow falls to retrieval — its chunks exist
@@ -179,6 +214,90 @@ async def chat_endpoint(req: ChatRequest, current_user: dict = Depends(auth.get_
         lang_rule = "LANGUAGE: Your response MUST be entirely in English. Do NOT use Indonesian."
     else:
         lang_rule = "BAHASA: Jawablah sepenuhnya dalam Bahasa Indonesia. Jangan gunakan bahasa Inggris."
+
+    # ── Greeting short-circuit ──────────────────────────────────────────────
+    # Casual greetings (hello, halo, hi, selamat pagi, etc.) must never
+    # trigger retrieval or citation — they are social openers, not legal
+    # queries. We reply warmly in the detected language and return early with
+    # an empty sources list so the FE renders no citation section at all.
+    _GREETING_RE = re.compile(
+        r"^\s*("
+        r"hi+|hello+|hey+|hei+|halo+|hai+"
+        r"|howdy|greetings|yo|sup|heya"
+        r"|good\s*(morning|afternoon|evening|night|day)"
+        r"|selamat\s*(pagi|siang|sore|malam|datang|hari)"
+        r"|apa\s*kabar|kabar\s*(baik|nih|dong)?"
+        r"|how\s*(are\s*(you|ya|u)|do\s*you\s*do|is\s*(it\s*going|everything))"
+        r"|what'?s?\s*up"
+        r"|morning|evening|afternoon"
+        r"|p+a+g+i+|s+o+r+e+|m+a+l+a+m+"
+        r"|terima\s*kasih|thank\s*you|thanks|thx"
+        r")\W*$",
+        re.IGNORECASE,
+    )
+    
+    # Detect general/casual questions that don't need knowledge base retrieval
+    # These are non-legal, conversational questions that should get a direct answer
+    _GENERAL_QUESTION_PATTERNS = [
+        r"^(what|who|how)\s+(are|is)\s+you",  # "what are you", "who are you", "how are you"
+        r"^siapa\s+(kamu|anda)",  # "siapa kamu"
+        r"^apa\s+(yang\s+)?bisa\s+(kamu|anda)",  # "apa yang bisa kamu lakukan"
+        r"^what\s+(can|do)\s+you",  # "what can you do"
+        r"^help\s*me",  # "help me"
+        r"^tolong\s+(bantu|saya)",  # "tolong bantu"
+    ]
+    is_general_question = any(re.search(pat, last_user_message.strip(), re.IGNORECASE) 
+                              for pat in _GENERAL_QUESTION_PATTERNS)
+    
+    if _GREETING_RE.match(last_user_message) or is_general_question:
+        from services.db_service import log_audit
+        log_audit(current_user.get("id", ""), "SEARCH", "", f"Query: {last_user_message[:200]}")
+        
+        # Handle both greetings and general questions about the assistant
+        if is_general_question:
+            if user_lang == "english":
+                greeting_reply = (
+                    "I'm your Indonesian Legal Assistant, powered by AI. I can help you with:\n\n"
+                    "- **Contract Analysis** — Review contracts for compliance and risks\n"
+                    "- **Legal Opinions** — Answer questions about Indonesian regulations\n"
+                    "- **Document Research** — Search through legal documents and regulations\n"
+                    "- **Compliance Monitoring** — Track your documents for regulatory changes\n\n"
+                    "Feel free to ask me anything about Indonesian law, contracts, or regulations!"
+                )
+                greeting_title = "About Legal Assistant"
+            else:
+                greeting_reply = (
+                    "Saya adalah Asisten Hukum Indonesia berbasis AI. Saya dapat membantu Anda dengan:\n\n"
+                    "- **Analisis Kontrak** — Menganalisis kontrak untuk kepatuhan dan risiko\n"
+                    "- **Opini Legal** — Menjawab pertanyaan tentang regulasi Indonesia\n"
+                    "- **Penelusuran Dokumen** — Mencari dokumen dan regulasi hukum\n"
+                    "- **Monitor Kepatuhan** — Memantau dokumen Anda terhadap perubahan regulasi\n\n"
+                    "Silakan tanyakan apa saja tentang hukum, kontrak, atau regulasi Indonesia!"
+                )
+                greeting_title = "Tentang Asisten Legal"
+        else:
+            # Regular greeting
+            if user_lang == "english":
+                greeting_reply = (
+                    "Hello! 👋 I'm here to help with your Indonesian legal questions — "
+                    "feel free to ask about contracts, regulations, compliance, or anything else "
+                    "you'd like to explore."
+                )
+                greeting_title = "New Legal Consultation"
+            else:
+                greeting_reply = (
+                    "Halo! 👋 Ada yang bisa saya bantu terkait pertanyaan hukum Anda? "
+                    "Silakan tanyakan seputar kontrak, regulasi, kepatuhan, atau topik hukum lainnya."
+                )
+                greeting_title = "Konsultasi Hukum Baru"
+        
+        # Only suggest a title on the very first message; later greetings keep the existing title
+        user_message_count = sum(1 for m in req.messages if m.role == "user")
+        return ChatResponse(
+            answer=greeting_reply,
+            sources=[],
+            suggested_title=greeting_title if user_message_count == 1 else None,
+        )
 
     system_prompt = (
         "You are an expert technology lawyer and contract advisor in Indonesia (Focus: ITE Law, POJK, Civil Code, PDP Law, Human Rights Law). "
@@ -291,7 +410,44 @@ async def chat_endpoint(req: ChatRequest, current_user: dict = Depends(auth.get_
             "_Note: PDF attachment retrieval was unavailable; some attachment content may not be reflected._")
     if attachment_notes:
         answer += "\n\n---\n" + "\n".join(attachment_notes)
-    return ChatResponse(answer=answer, sources=sources_to_return)
+
+    # ── Conversation title generation (first message only) ──────────────────
+    # Only fires when the window contains exactly one user message — meaning
+    # this is the very first exchange in a new conversation. A tiny, cheap
+    # LLM call produces a short descriptive title (≤8 words, no quotes, no
+    # punctuation) in the user's language. Failure is silently swallowed:
+    # the FE falls back to its existing "slice of the user text" logic when
+    # suggested_title is None, so a title-gen hiccup never breaks the chat.
+    user_message_count = sum(1 for m in req.messages if m.role == "user")
+    suggested_title: str | None = None
+    if user_message_count == 1:
+        try:
+            if user_lang == "english":
+                title_instruction = (
+                    "Write a SHORT conversation title (maximum 8 words, no quotes, no punctuation at the end) "
+                    "that captures what the user is asking about. Reply with ONLY the title text, nothing else.\n\n"
+                    f"User question: {last_user_message}"
+                )
+            else:
+                title_instruction = (
+                    "Tulis JUDUL percakapan yang SINGKAT (maksimal 8 kata, tanpa tanda kutip, tanpa tanda baca di akhir) "
+                    "yang menggambarkan apa yang ditanyakan pengguna. Balas HANYA dengan teks judul, tidak ada yang lain.\n\n"
+                    f"Pertanyaan pengguna: {last_user_message}"
+                )
+            raw_title = call_glm(
+                [{"role": "user", "content": title_instruction}],
+                temperature=0.3,
+                timeout=15,
+            )
+            # Strip surrounding quotes/whitespace the model sometimes adds
+            clean = raw_title.strip().strip('"\'').strip()
+            if clean:
+                suggested_title = clean[:72]  # hard cap so the sidebar never overflows
+        except Exception as e:
+            print(f"Title generation failed (non-fatal): {e}")
+    # ── End title generation ────────────────────────────────────────────────
+
+    return ChatResponse(answer=answer, sources=sources_to_return, suggested_title=suggested_title)
 
 @router.post("/chat-session")
 async def save_chat_session(req: ChatRequest, current_user: dict = Depends(auth.get_current_user)):

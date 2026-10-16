@@ -17,7 +17,7 @@ import asyncio
 import psutil
 from datetime import datetime
 
-from services import backup_service, pg_service
+from services import backup_service, host_metrics, pg_service
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -28,7 +28,9 @@ async def system_metrics_loop():
         try:
             cpu = psutil.cpu_percent(interval=None)
             mem = psutil.virtual_memory()
-            disk = psutil.disk_usage('/')
+            # Same provenance as /api/engineer/health: the data volume, not
+            # the container overlay (bug 2026-10-12).
+            disk, _ = host_metrics.data_disk_usage()
 
             metadata_size, users_size = backup_service.group_sizes_mb()
 

@@ -167,7 +167,7 @@ async def get_pending_repository(current_user: dict = Depends(auth.require_role(
         # Decision D: a 'Memproses' row with no RUNNING task is stale (backend
         # restarted mid-scan) — flag it so the FE can offer a hint + reject.
         task = ACTIVE_TASKS.get(f"task_{doc_id_str}") if doc_id_str else None
-        stale = scanning and not (task and task.get("status") == "RUNNING")
+        stale = scanning and not (task and task.get("status") in ("QUEUED", "RUNNING"))
         uploaded_at = row["uploaded_at"]
         docs.append({
             "id": doc_id_str,
@@ -359,20 +359,27 @@ def _classify_threshold() -> int:
         return 80
 
 def process_document_background(file_path: str, doc_id: str, filename: str, nomor: str, jenis: str, sektor: str, status: str, klasifikasi: str):
-    from services.app_state import ACTIVE_TASKS
-    from datetime import datetime
-    task_id = f"task_{doc_id}"
-    ACTIVE_TASKS[task_id] = {"name": f"Parsing (AI Review): {filename}", "status": "RUNNING", "start_time": datetime.now(), "end_time": None}
+    from services import task_queue
+    retry_args = (file_path, doc_id, filename, nomor, jenis, sektor, status, klasifikasi)
+    task_id = task_queue.start(doc_id, "parse", f"Parsing (AI Review): {filename}", filename, retry_args)
+    if task_id is None:
+        return  # cancelled while still queued
     try:
+        if task_queue.ACTIVE_TASKS[task_id]["attempts"] > 1:
+            # Retry: the row went to 'Gagal - Error' last time; show it as in-flight again.
+            pg_service.execute(
+                "UPDATE regulations SET status = 'Memproses' WHERE id::text = %s", (doc_id,))
         # (R1 bugfix: hybrid PyMuPDF+VLM extraction replaces the dead
         # PaddleOCR chain; see la-legpro-doc/bug_reports.md.)
         from services.rag_service import extract_text_hybrid, classify_document_vlm
+        task_queue.begin_stage(task_id, 0)
         full_text = extract_text_hybrid(file_path)
 
         # ── AI scan + classification (FR-4; confidence-gated 2026-09-30) ────
         # Replaces the old one-word secrecy recommendation: one VLM pass over
         # page 1 + extracted text returns {klasifikasi, jenis, confidence,
         # reasoning}; classifier failures come back with confidence 0.
+        task_queue.begin_stage(task_id, 1)
         ai = classify_document_vlm(file_path, full_text)
         threshold = _classify_threshold()
         pg_service.execute(
@@ -391,12 +398,13 @@ def process_document_background(file_path: str, doc_id: str, filename: str, nomo
                                 final_klasifikasi=ai["klasifikasi"], final_jenis=ai["jenis"])
             print(f"Document {doc_id} auto-approved (confidence {ai['confidence']} >= {threshold}): "
                   f"{ai['klasifikasi']}/{ai['jenis']}")
-            ACTIVE_TASKS[task_id]["status"] = "COMPLETED"
-            ACTIVE_TASKS[task_id]["end_time"] = datetime.now()
+            task_queue.complete(task_id)
             # Same worker thread: ingest re-registers task_id with its own
-            # RUNNING→COMPLETED lifecycle, so the progress UI stays truthful.
+            # RUNNING→COMPLETED lifecycle (chained: attempts/uploader carry
+            # over), so the progress UI stays truthful.
             ingest_document_background(file_path, doc_id, filename, nomor,
-                                       ai["jenis"], sektor, "Berlaku", ai["klasifikasi"])
+                                       ai["jenis"], sektor, "Berlaku", ai["klasifikasi"],
+                                       _chained=True)
             return
 
         # Low confidence (or classifier error): human approval required.
@@ -406,12 +414,12 @@ def process_document_background(file_path: str, doc_id: str, filename: str, nomo
         record_upload_event(doc_id, "awaiting_approval", ai=ai)
         print(f"Document {doc_id} set to Pending Confirmation (confidence {ai['confidence']} < {threshold}, "
               f"AI recommendation: {ai['klasifikasi']}/{ai['jenis']})")
-        ACTIVE_TASKS[task_id]["status"] = "COMPLETED"
-        ACTIVE_TASKS[task_id]["end_time"] = datetime.now()
+        task_queue.complete(task_id)
 
+    except task_queue.TaskCancelled:
+        _mark_cancelled(task_id, doc_id, "Parsing/klasifikasi")
     except Exception as e:
-        ACTIVE_TASKS[task_id]["status"] = "FAILED"
-        ACTIVE_TASKS[task_id]["end_time"] = datetime.now()
+        task_queue.fail(task_id, e)
         print(f"Error in process_document_background: {e}")
         try:
             pg_service.execute(
@@ -424,21 +432,45 @@ def process_document_background(file_path: str, doc_id: str, filename: str, nomo
         except:
             pass
 
-def ingest_document_background(file_path: str, doc_id: str, filename: str, nomor: str, jenis: str, sektor: str, status: str, klasifikasi: str):
-    from services.app_state import ACTIVE_TASKS
-    from datetime import datetime
-    task_id = f"task_{doc_id}"
-    ACTIVE_TASKS[task_id] = {"name": f"Ingesting (Vector+KG): {filename}", "status": "RUNNING", "start_time": datetime.now(), "end_time": None}
+def _mark_cancelled(task_id: str, doc_id: str, phase: str):
+    """Operator cancelled the task at a stage boundary: close the task and
+    leave the row in a cleanable 'Gagal - Dibatalkan' state (matched by the
+    existing LIKE 'Gagal%' cleanup)."""
+    from services import task_queue
+    task_queue.cancelled(task_id)
     try:
+        pg_service.execute(
+            "UPDATE regulations SET status = 'Gagal - Dibatalkan' WHERE id::text = %s", (doc_id,))
+    except Exception:
+        pass
+    try:
+        from services.db_service import record_upload_event
+        record_upload_event(doc_id, "failed_error", detail=f"{phase} dibatalkan oleh operator.")
+    except Exception:
+        pass
+
+def ingest_document_background(file_path: str, doc_id: str, filename: str, nomor: str, jenis: str, sektor: str, status: str, klasifikasi: str, _chained: bool = False):
+    from services import task_queue
+    retry_args = (file_path, doc_id, filename, nomor, jenis, sektor, status, klasifikasi)
+    task_id = task_queue.start(doc_id, "ingest", f"Ingesting (Vector+KG): {filename}", filename,
+                               retry_args, chained=_chained)
+    if task_id is None:
+        return  # cancelled while still queued
+    try:
+        if task_queue.ACTIVE_TASKS[task_id]["attempts"] > 1 and not _chained:
+            pg_service.execute(
+                "UPDATE regulations SET status = 'Memproses' WHERE id::text = %s", (doc_id,))
         from pdf_parser import LegalChunker
         from services.rag_service import extract_text_hybrid
         chunker = LegalChunker()
         
         # (R1 bugfix: hybrid PyMuPDF+VLM extraction replaces the dead
         # PaddleOCR chain; see la-legpro-doc/bug_reports.md.)
+        task_queue.begin_stage(task_id, 0)
         full_text = extract_text_hybrid(file_path)
         
         # Duplicate Detection (FR-5)
+        task_queue.begin_stage(task_id, 1)
         # (Migration M3: pgvector cosine distance `<=>` replaces the Chroma
         # query -- same cosine metric, same 0.15 threshold.)
         fingerprint_text = full_text[:1500]
@@ -470,13 +502,15 @@ def ingest_document_background(file_path: str, doc_id: str, filename: str, nomor
                 from services.db_service import record_upload_event
                 record_upload_event(doc_id, "failed_duplicate",
                                     detail=f"Jarak kemiripan {dist:.3f} < 0.15 terhadap korpus yang ada.")
-                ACTIVE_TASKS[task_id]["status"] = "FAILED"
-                ACTIVE_TASKS[task_id]["end_time"] = datetime.now()
+                # Permanent: the source file is gone and a retry would fail the same way.
+                task_queue.fail(task_id, "Dokumen duplikat: terlalu mirip dengan dokumen yang sudah ada.",
+                                retryable=False)
                 return
 
         print(f"File saved to DB. Now parsing and embedding: {filename}")
         
         # Contextual Enrichment - Generate Global Document Summary
+        task_queue.begin_stage(task_id, 2)
         document_summary = ""
         try:
             from services.llm_client import call_glm
@@ -501,6 +535,7 @@ def ingest_document_background(file_path: str, doc_id: str, filename: str, nomor
             "status": status
         }
         
+        task_queue.begin_stage(task_id, 3)
         chunks = chunker.chunk_document(full_text, base_metadata, document_summary=document_summary)
         
         documents = []
@@ -551,18 +586,25 @@ def ingest_document_background(file_path: str, doc_id: str, filename: str, nomor
         # Knowledge Graph Extraction (real-time, FR-KG)
         judul = filename.replace('.pdf', '')
         try:
+            task_queue.begin_stage(task_id, 4)
+        except task_queue.TaskCancelled:
+            # The doc is already fully searchable ('Berlaku'); only the graph is
+            # skipped, so this is a clean finish, not a failed document.
+            task_queue.complete(task_id)
+            return
+        try:
             from services.kg_service import extract_and_store_graph
             extract_and_store_graph(doc_id, full_text, nomor, judul, jenis)
         except Exception as kg_err:
             print(f"[KG] Non-fatal extraction error for {nomor}: {kg_err}")
             
-        ACTIVE_TASKS[task_id]["status"] = "COMPLETED"
-        ACTIVE_TASKS[task_id]["end_time"] = datetime.now()
+        task_queue.complete(task_id)
         return
         
+    except task_queue.TaskCancelled:
+        _mark_cancelled(task_id, doc_id, "Ingest")
     except Exception as e:
-        ACTIVE_TASKS[task_id]["status"] = "FAILED"
-        ACTIVE_TASKS[task_id]["end_time"] = datetime.now()
+        task_queue.fail(task_id, e)
         print(f"Error processing PDF: {e}")
         try:
             pg_service.execute(
@@ -601,7 +643,7 @@ async def delete_document(doc_id: str, current_user: dict = Depends(auth.require
     # registering itself remains -- the guard shrinks it from ~20s to ~ms.)
     from services.app_state import ACTIVE_TASKS
     task = ACTIVE_TASKS.get(f"task_{doc_id}")
-    if task and task.get("status") == "RUNNING":
+    if task and task.get("status") in ("QUEUED", "RUNNING"):
         raise HTTPException(
             status_code=409,
             detail="Dokumen sedang diproses (ingest berjalan). Coba hapus lagi beberapa saat.")
@@ -707,7 +749,10 @@ async def confirm_pending_document(
 
     # Trigger vector DB injection and KG asynchronously
     filename = os.path.basename(local_path)
-    background_tasks.add_task(ingest_document_background, local_path, doc_id, filename, nomor, jenis_final, sektor, 'Berlaku', req.klasifikasi)
+    from services import task_queue
+    ingest_args = (local_path, doc_id, filename, nomor, jenis_final, sektor, 'Berlaku', req.klasifikasi)
+    task_queue.enqueue(doc_id, "ingest", f"Ingesting (Vector+KG): {filename}", filename, ingest_args)
+    background_tasks.add_task(ingest_document_background, *ingest_args, _chained=True)
     
     return {"message": "Dokumen berhasil dikonfirmasi dan dimasukkan ke repositori."}
 

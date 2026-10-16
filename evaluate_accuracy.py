@@ -3,7 +3,7 @@
 Retrieves public chunks for 20 golden questions from the PG chunks table
 (embedding via services.embed_service -- the vendored all-MiniLM-L6-v2 that
 replaced ChromaDB's default ONNX embedder), answers them through the shared
-services.llm_client.call_glm (MODEL_BASE_URL/MODEL_API_KEY/LLAMA_MODEL from
+services.llm_client.call_glm (MODEL_BASE_URL/MODEL_API_KEY/LLM_MODEL from
 .env, with the production retry + llm_metrics logging) and keyword-grades the
 answers.
 

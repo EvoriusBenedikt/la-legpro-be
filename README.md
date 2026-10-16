@@ -256,7 +256,7 @@ Copy `.env.example` to `.env` and fill in your values:
 JWT_SECRET=generate_via_openssl_rand_hex_32
 MODEL_BASE_URL=https://console.labahasa.ai/v1
 MODEL_API_KEY=your_key_here
-LLAMA_MODEL=llama-4-maverick-instruct
+LLM_MODEL=llama-4-maverick-instruct
 GLM_MAX_ATTEMPTS=5
 GLM_RETRY_BACKOFF_BASE=0.8
 ALLOWED_ORIGINS=https://legal-analyzer.lintasarta.dev,http://localhost:5173,http://localhost:3000,http://localhost
