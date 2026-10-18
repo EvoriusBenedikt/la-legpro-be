@@ -1,17 +1,20 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 import csv
 import io
 import json
+import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 from pydantic import BaseModel
 from psycopg import errors as pg_errors
 import auth
 from services import pg_service
 from services.db_service import log_audit
+from services.request_meta import get_client_ip
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
+logger = logging.getLogger(__name__)
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -159,8 +162,9 @@ async def add_kg_exclusion(req: KGExclusion, current_user: dict = Depends(auth.r
                 conn.execute("DELETE FROM kg_nodes WHERE id = ANY(%s)", (nodes_to_delete,))
     except pg_errors.UniqueViolation:
         raise HTTPException(status_code=400, detail="Entity already in exclusion list")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("add_kg_exclusion failed")
+        raise HTTPException(status_code=500, detail="Internal server error")
         
     return {"message": "Success", "deleted_nodes": deleted_nodes, "deleted_edges": deleted_edges}
 
@@ -262,7 +266,7 @@ async def admin_export_users(
     writer.writerow(COLS)
     for r in rows:
         writer.writerow(["" if r.get(c) is None else r.get(c) for c in COLS])
-    stamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     return Response(
         content=buf.getvalue(),
         media_type="text/csv; charset=utf-8",
@@ -297,11 +301,14 @@ async def admin_get_user(user_id: str,
 @router.post("/users/{user_id}/force-logout")
 async def admin_force_logout(user_id: str,
                              current_user: dict = Depends(auth.require_exact_role("admin"))):
-    """Invalidate the target's active session immediately — their next
-    authenticated request returns 401 (get_current_user re-reads is_active
-    but active_sessions deletion is the faster signal when they're still
-    active). Does NOT deactivate the account; the user can log back in."""
+    """Revoke every token the target holds: bumping users.token_version
+    (migration 011) makes get_current_user reject all JWTs issued before, so
+    their next authenticated request returns 401. The active_sessions delete
+    only clears the live-session list shown to admins; it does not revoke
+    anything by itself. Does NOT deactivate the account; the user can log
+    back in."""
     _managed_target(user_id, current_user)
+    pg_service.execute("UPDATE users SET token_version = token_version + 1 WHERE id = %s", (user_id,))
     pg_service.execute("DELETE FROM active_sessions WHERE user_id = %s", (user_id,))
     log_audit(current_user["id"], "FORCE_LOGOUT", user_id, "admin force-logout")
     return {"message": "Session invalidated"}
@@ -324,8 +331,9 @@ async def admin_reset_password(user_id: str,
                 and any(c.isdigit() for c in pwd)
                 and any(c in "!@#$%^&*()" for c in pwd)):
             break
+    # token_version bump revokes every JWT issued before the reset.
     pg_service.execute(
-        "UPDATE users SET password_hash = %s WHERE id = %s",
+        "UPDATE users SET password_hash = %s, token_version = token_version + 1 WHERE id = %s",
         (auth.get_password_hash(pwd), user_id),
     )
     # Also invalidate any live session so the new password takes effect now.
@@ -382,7 +390,10 @@ async def admin_change_role(user_id: str, req: RoleUpdate,
     old_role = (target["role"] or "pengguna").lower()
     if old_role == new_role:
         raise HTTPException(status_code=400, detail="User already has this role")
-    pg_service.execute("UPDATE users SET role = %s WHERE id = %s", (new_role, user_id))
+    # token_version bump: tokens issued under the old role stop working.
+    pg_service.execute(
+        "UPDATE users SET role = %s, token_version = token_version + 1 WHERE id = %s",
+        (new_role, user_id))
     log_audit(current_user["id"], "CHANGE_ROLE", user_id,
               f"{target['username']}: {old_role} -> {new_role}")
     return {"message": "Role updated", "id": user_id, "role": new_role}
@@ -396,14 +407,35 @@ async def admin_set_status(user_id: str, req: StatusUpdate,
     target = _managed_target(user_id, current_user)
     if bool(target["is_active"]) == req.is_active:
         raise HTTPException(status_code=400, detail="Account already in this state")
-    pg_service.execute("UPDATE users SET is_active = %s WHERE id = %s",
-                       (req.is_active, user_id))
-    if not req.is_active:
+    if req.is_active:
+        pg_service.execute("UPDATE users SET is_active = TRUE WHERE id = %s", (user_id,))
+    else:
+        # Deactivation also bumps token_version so tokens stay dead even if
+        # the account is reactivated later.
+        pg_service.execute(
+            "UPDATE users SET is_active = FALSE, token_version = token_version + 1 WHERE id = %s",
+            (user_id,))
         pg_service.execute("DELETE FROM active_sessions WHERE user_id = %s", (user_id,))
     log_audit(current_user["id"],
               "ACTIVATE_USER" if req.is_active else "DEACTIVATE_USER",
               user_id, target["username"])
     return {"message": "Status updated", "id": user_id, "is_active": req.is_active}
+
+@router.post("/users/{user_id}/unlock")
+async def admin_unlock_user(user_id: str, request: Request,
+                            current_user: dict = Depends(auth.require_exact_role("admin"))):
+    """Clear a login lockout (migration 011) for a managed account: resets
+    the failure counters on users and drops any login_attempts rows for that
+    username so the next sign-in starts clean."""
+    target = _managed_target(user_id, current_user)
+    pg_service.execute(
+        "UPDATE users SET failed_attempts = 0, locked_until = NULL, last_failed_at = NULL "
+        "WHERE id = %s", (user_id,))
+    pg_service.execute(
+        "DELETE FROM login_attempts WHERE username_lower = lower(%s)", (target["username"],))
+    log_audit(current_user["id"], "UNLOCK_USER", user_id,
+              f"{target['username']} ip={get_client_ip(request)}")
+    return {"message": "Account unlocked", "id": user_id}
 
 # ── Audit viewer (2026-10-06, critique P1) ─────────────────────────────────
 # Server-side pagination, date range, username join, and export replace the
@@ -490,7 +522,7 @@ async def admin_audit_export(
     rows = pg_service.query(
         f"{AUDIT_SELECT}{AUDIT_FROM_JOIN}{where_sql} ORDER BY a.id DESC LIMIT 100000",
         params)
-    stamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     disposition = f'attachment; filename="audit-logs-{stamp}.{fmt}"'
     if fmt == "csv":
         buf = io.StringIO()

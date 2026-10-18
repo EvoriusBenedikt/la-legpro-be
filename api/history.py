@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from typing import Optional
 import json
+import logging
 import uuid
 
 from auth import get_current_user
@@ -213,8 +214,9 @@ def test_alerts(current_user: dict = Depends(get_current_user)):
     try:
         check_expiring_contracts()
         return {"message": "Alerts check completed successfully. Check logs/email."}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logging.getLogger(__name__).exception("test_alerts failed")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @router.get("/compliance-history/{report_id}/calendar")
 def export_calendar(report_id: str, current_user: dict = Depends(get_current_user)):

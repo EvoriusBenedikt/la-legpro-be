@@ -39,12 +39,14 @@ from routers import admin, engineer
 from routers import chat, chat_attachments, repository, knowledge_graph
 from routers import compliance, taxonomy
 from routers.notification import router as notification_router
+from services.app_config import docs_kwargs
 from services.app_state import API_STATS
 from services.db_service import init_main_db
 from services.scheduler import start_background_loops
 
 # Setup FastAPI App
-app = FastAPI(title="Legal Analyzer API")
+# Swagger/ReDoc/OpenAPI are off unless ENABLE_DOCS=true (services/app_config.py).
+app = FastAPI(title="Legal Analyzer API", **docs_kwargs())
 
 # ── In-memory API stats for monitoring (FR-31) ──────────────────────────────
 # API_STATS / ACTIVE_TASKS live in services.app_state so the middleware below

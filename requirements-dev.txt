@@ -1,0 +1,5 @@
+# Test-only dependencies. Everything else the auth tests import (fastapi,
+# pydantic, PyJWT, bcrypt, psycopg, psycopg-pool, httpx, uvicorn, ...) is
+# already pinned in api/requirements.txt; install that subset (the torch CPU
+# stack is not needed) plus this file.
+pytest==8.3.4
