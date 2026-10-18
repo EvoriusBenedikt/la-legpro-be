@@ -8,8 +8,20 @@ services:
     # without manual `compose up` (FE already had restart: always; BE came up
     # Exited(255) after an engine restart during the pull-test verification).
     restart: unless-stopped
-    ports:
-      - "8080:8000"
+    # Port 8080 is NO LONGER published (auth hardening, 2026-10-14): it let
+    # anyone bypass nginx and its rate limits and spoof client-IP headers.
+    # The only way in is nginx (frontend repo) over the shared external
+    # network legpro-net, where this container answers to the alias
+    # `legpro-backend`. One-time: docker network create legpro-net
+    # Local dev needs the port back:
+    #   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+    expose:
+      - "8000"
+    networks:
+      default: {}
+      legpro-net:
+        aliases:
+          - legpro-backend
     volumes:
       # App data: uploaded PDFs, vendored model weights (data/models/), PG
       # backup tars. Also holds the legacy SQLite files until the migration is
@@ -31,6 +43,11 @@ services:
       - ./evaluate_accuracy.py:/app/evaluate_accuracy.py
     environment:
       - PYTHONUNBUFFERED=1
+      # uvicorn --proxy-headers only honours X-Forwarded-* from these peers
+      # (private ranges: nginx on legpro-net). Never set to `*`.
+      - FORWARDED_ALLOW_IPS=${FORWARDED_ALLOW_IPS:-10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.1}
+      # /docs, /redoc and /openapi.json are off unless explicitly enabled.
+      - ENABLE_DOCS=${ENABLE_DOCS:-false}
       # Migration M1: PostgreSQL + pgvector (compose interpolation reads la-legpro-be/.env)
       - DATABASE_URL=postgresql://legpro:${POSTGRES_PASSWORD:-legpro}@postgres:5432/legpro
       # Migration M3: huggingface.co is unreachable from this network (corporate
@@ -79,3 +96,10 @@ services:
 
 volumes:
   pg_data:
+
+networks:
+  # Shared with the frontend repo's nginx container. External: create once with
+  #   docker network create legpro-net
+  legpro-net:
+    external: true
+    name: legpro-net

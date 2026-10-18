@@ -42,5 +42,10 @@ ENV PYTHONPATH=/app
 # Expose the API port
 EXPOSE 8000
 
+# uvicorn reads FORWARDED_ALLOW_IPS natively: X-Forwarded-* is trusted only
+# from these peers (private ranges: nginx on the shared Docker network).
+# Never `*`. docker-compose.yml can override it.
+ENV FORWARDED_ALLOW_IPS="10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.1"
+
 # Run the FastAPI application
-CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers"]

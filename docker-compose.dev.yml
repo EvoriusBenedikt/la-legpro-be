@@ -1,0 +1,11 @@
+# Local-development override. NOT loaded automatically; production uses
+# docker-compose.yml alone (no published backend port).
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+# Publishes the API on loopback only (src/config.ts in the frontend defaults to
+# http://localhost:8080 in dev) and turns on /docs for convenience.
+services:
+  backend:
+    ports:
+      - "127.0.0.1:8080:8000"
+    environment:
+      - ENABLE_DOCS=true
