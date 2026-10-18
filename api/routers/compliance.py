@@ -7,7 +7,7 @@ from typing import Optional, Any
 from pydantic import BaseModel, field_validator
 import auth
 from fastapi.concurrency import run_in_threadpool
-from services import pg_service
+from services import pg_service, rate_limit
 from services.llm_client import call_glm, extract_json
 
 # M3 migration note: SQLite (legal_metadata.db) and ChromaDB are replaced by
@@ -180,8 +180,15 @@ def _fetch_doc_chunks(reg_id, nomor):
         "SELECT text FROM chunks WHERE doc_id = %s ORDER BY seq", (sib,))
 
 
+# Auth hardening (2026-10-14, D2/P7): these LLM endpoints used to be open to the
+# internet. /analyze and /analyze-pasals need a logged-in user (any role, incl.
+# insinyur ti: the engineer monitoring drawer calls them) plus a per-user rate limit.
 @router.post("/analyze")
-async def analyze_document(req: AnalyzeRequest):
+async def analyze_document(
+    req: AnalyzeRequest,
+    current_user: dict = Depends(auth.get_current_user),
+    _rl: dict = Depends(rate_limit.llm_rate_limit("analyze")),
+):
     """Analyzes a document from regulation chunks + LLM for overview and status."""
     
     # Step 1: Fetch all chunks for this specific document
@@ -280,7 +287,11 @@ async def analyze_document(req: AnalyzeRequest):
     }
 
 @router.post("/analyze-pasals")
-async def analyze_pasals(req: AnalyzeRequest):
+async def analyze_pasals(
+    req: AnalyzeRequest,
+    current_user: dict = Depends(auth.get_current_user),
+    _rl: dict = Depends(rate_limit.llm_rate_limit("analyze_pasals")),
+):
     """
     Deep analysis: uses LLM to analyze each Pasal individually,
     producing status, perbandingan (comparison), and hubungan (hierarchy).
@@ -596,8 +607,15 @@ def extract_text_multi_format(file_path: str, filename: str, use_ocr: bool = Fal
         return ""
 
 
+# require_role("pengguna") blocks insinyur ti (business feature) and is declared
+# before the limiter so a 403 never consumes rate-limit budget.
 @router.post("/check-compliance")
-async def check_compliance(file: UploadFile = File(...), use_ocr: str = Form("false")):
+async def check_compliance(
+    file: UploadFile = File(...),
+    use_ocr: str = Form("false"),
+    current_user: dict = Depends(auth.require_role("pengguna")),
+    _rl: dict = Depends(rate_limit.llm_rate_limit("check_compliance")),
+):
     """
     Accepts a document upload (PDF, DOCX, XLSX, PPTX, JPG, PNG, TXT), extracts text,
     and uses a multi-step LLM pipeline to cross-check clauses against the OJK repository.

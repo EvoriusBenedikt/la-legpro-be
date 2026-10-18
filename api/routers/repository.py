@@ -45,15 +45,69 @@ class AccessGrantRequest(BaseModel):
     reason: str
     expires_at: Optional[str] = None
 
+# Statuses of upload-queue rows (pending-first flow): only the sekretaris
+# perusahaan queue (role level 5+) may open these files.
+_PENDING_STATUSES = ("Menunggu Konfirmasi", "Memproses")
+
+
+def user_can_view_regulation(current_user: dict, reg_row: dict) -> bool:
+    """Same visibility rules as GET /api/repository, for ONE regulation row.
+
+    reg_row needs ``id``, ``klasifikasi`` and ``status``. Rules (plan D6):
+    admin never (FR-24); queue rows (Menunggu Konfirmasi / Memproses) only at
+    role level >= 5; otherwise klasifikasi Umum, plus Rahasia at level >= 2 and
+    Terbatas at level >= 3, or an unexpired access_grants row for this user.
+    """
+    role = (current_user.get("role") or "pengguna").lower()
+    if role == "admin":
+        return False
+    level = auth.get_role_level(role)
+    if (reg_row.get("status") or "") in _PENDING_STATUSES:
+        return level >= 5
+    allowed = ["Umum"]
+    if level >= 2:
+        allowed.append("Rahasia")
+    if level >= 3:
+        allowed.append("Terbatas")
+    # NULL klasifikasi matches nothing, exactly like the ANY(%s) filter in GET /api/repository.
+    if reg_row.get("klasifikasi") in allowed:
+        return True
+    grant = pg_service.query_one(
+        "SELECT 1 AS ok FROM access_grants "
+        "WHERE doc_id = %s AND granted_to = %s "
+        "AND (expires_at IS NULL OR expires_at >= NOW()) LIMIT 1",
+        (str(reg_row["id"]), current_user.get("id")))
+    return grant is not None
+
+
 @router.get("/pdf/{filename}")
-async def serve_pdf(filename: str):
+async def serve_pdf(filename: str, current_user: dict = Depends(auth.get_current_user)):
     """
     Return PDF bytes encoded as base64 JSON.
     IDM cannot intercept this because the Content-Type is application/json, not application/pdf.
     The frontend decodes the base64 and creates a blob:// URL to render in an iframe.
+
+    Auth hardening (2026-10-14, D6): this used to serve any file in data/pdfs to
+    anyone, including Rahasia/Terbatas documents. It now requires a login and
+    applies the repository ACL (user_can_view_regulation) to the regulation
+    whose local_path basename equals the requested name. A name that matches no
+    regulation row is a 404 (never reveals whether the file exists on disk).
     """
     import base64
+    if (current_user.get("role") or "").lower() == "admin":
+        raise HTTPException(status_code=403, detail="Admin sistem tidak memiliki kewenangan untuk mengakses repositori dokumen.")
     safe_filename = _basename_any(filename)  # prevent path traversal
+    # local_path values may hold Windows separators (see _basename_any), so the
+    # basename is taken in SQL by stripping everything up to the last / or \.
+    regs = pg_service.query(
+        "SELECT id, klasifikasi, status FROM regulations "
+        "WHERE local_path IS NOT NULL AND local_path <> '' "
+        "AND regexp_replace(local_path, '^.*[\\\\/]', '') = %s",
+        (safe_filename,))
+    if not regs:
+        raise HTTPException(status_code=404, detail=f"PDF '{safe_filename}' not found")
+    if not any(user_can_view_regulation(current_user, r) for r in regs):
+        raise HTTPException(status_code=403, detail="Anda tidak memiliki akses ke dokumen ini.")
     file_path = _find_pdf_file(safe_filename)
     if file_path is None:
         raise HTTPException(status_code=404, detail=f"PDF '{safe_filename}' not found")

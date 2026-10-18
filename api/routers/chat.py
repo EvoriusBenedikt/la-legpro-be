@@ -3,7 +3,7 @@ import os, re
 from typing import List
 from pydantic import BaseModel
 import auth
-from services import pg_service
+from services import pg_service, rate_limit
 from services.llm_client import call_glm
 
 router = APIRouter(prefix="/api", tags=["chat"])
@@ -37,7 +37,12 @@ class SessionRequest(BaseModel):
 # was never queried (retrieval goes through services.rag_service). Removed.
 
 @router.post("/chat", response_model=ChatResponse)
-async def chat_endpoint(req: ChatRequest, current_user: dict = Depends(auth.get_current_user)):
+async def chat_endpoint(
+    req: ChatRequest,
+    current_user: dict = Depends(auth.get_current_user),
+    # Auth hardening (2026-10-14, P7): per-user LLM rate limit (LLM_RATE_PER_MIN).
+    _rl: dict = Depends(rate_limit.llm_rate_limit("chat")),
+):
     # FR-24: Admin cannot access document content or search
     if current_user.get("role", "pengguna").lower() == "admin":
         raise HTTPException(status_code=403, detail="Admin sistem tidak memiliki kewenangan untuk mengakses konten dokumen.")

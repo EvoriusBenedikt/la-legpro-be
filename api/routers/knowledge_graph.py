@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, BackgroundTasks
 import json
 from pydantic import BaseModel
 import auth
-from services import pg_service
+from services import pg_service, rate_limit
 from services.llm_client import call_glm
 
 router = APIRouter(prefix="/api/knowledge-graph", tags=["kg"])
@@ -192,8 +192,15 @@ def _rebuild_kg_batch():
 class ScenarioAnalyzeRequest(BaseModel):
     scenario: str
 
+# Auth hardening (2026-10-14, D2/P7): was open; now pengguna+ (blocks insinyur ti,
+# like its KG siblings) with a per-user rate limit. Role check first so a 403
+# never consumes rate-limit budget.
 @router.post("/analyze-scenario")
-async def analyze_kg_scenario(req: ScenarioAnalyzeRequest):
+async def analyze_kg_scenario(
+    req: ScenarioAnalyzeRequest,
+    current_user: dict = Depends(auth.require_role("pengguna")),
+    _rl: dict = Depends(rate_limit.llm_rate_limit("analyze_scenario")),
+):
     """
     Uses LLM to dynamically select which node IDs are relevant to the requested scenario.
     """

@@ -75,6 +75,16 @@ def pytest_collection_modifyitems(config, items):
 
 
 @pytest.fixture(autouse=True)
+def _reset_rate_limit():
+    """The LLM limiter is process-wide state; start every test with it empty."""
+    if TEST_DB:
+        from services import rate_limit
+
+        rate_limit.limiter.reset()
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _clean_db(request):
     """Per-test reset for db-marked tests: empty the auth tables and the
     in-process housekeeping timer."""
@@ -118,18 +128,25 @@ def make_user():
 
 @pytest.fixture
 def client():
-    """TestClient over a small app: auth + admin routers. The peer address is
+    """TestClient over a small app: auth, admin and the LLM/PDF/notification routers. The peer address is
     the testclient's (private/loopback-free ``testclient``), so tests set the
     source IP through the X-Real-IP header only where they patch the peer."""
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
     import auth
-    from routers import admin
+    from routers import (admin, chat, compliance, knowledge_graph,
+                         notification, repository)
 
     app = FastAPI()
     app.include_router(auth.router, prefix="/api/auth")
     app.include_router(admin.router)
+    # FEAT-002: the formerly open endpoints, mounted exactly as in main.py.
+    app.include_router(compliance.router)
+    app.include_router(knowledge_graph.router)
+    app.include_router(repository.router)
+    app.include_router(chat.router)
+    app.include_router(notification.router, prefix="/api")
     # client=("10.0.0.2", 50000): a private peer, like the nginx container, so
     # X-Real-IP is honoured exactly as in production.
     return TestClient(app, client=("10.0.0.2", 50000))
