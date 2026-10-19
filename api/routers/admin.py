@@ -11,6 +11,8 @@ from psycopg import errors as pg_errors
 import auth
 from services import pg_service
 from services.db_service import log_audit
+from services.grant_policy import (AUDIT_DETAILS_SEARCH_SQL, active_grant_sql,
+                                   redact_audit_details)
 from services.request_meta import get_client_ip
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
@@ -83,8 +85,10 @@ async def admin_dashboard(current_user: dict = Depends(auth.require_role("admin"
     # 4. Active Access Grants count (Migration M3: expires_at is TIMESTAMPTZ
     # in PG -- the legacy empty-string case no longer exists)
     grants_row = pg_service.query_one(
-        "SELECT COUNT(*) AS n FROM access_grants "
-        "WHERE expires_at IS NULL OR expires_at >= NOW()")
+        "SELECT COUNT(*) AS n FROM access_grants ag "
+        "JOIN users recipient ON recipient.id = ag.granted_to "
+        "AND recipient.is_active = TRUE "
+        "WHERE " + active_grant_sql("ag"))
     active_grants = grants_row["n"] if grants_row else 0
 
     # 5. (Moved 2026-10-06, critique P1) Audit logs no longer ride this
@@ -121,6 +125,9 @@ async def admin_dashboard(current_user: dict = Depends(auth.require_role("admin"
             "chromadb": chroma_ok
         }
     }
+
+# GET /api/admin/access-grants (+ mutations, history) moved to
+# routers/admin_access_grants.py (migration 012).
 
 @router.get("/kg-exclusions")
 async def get_kg_exclusions(current_user: dict = Depends(auth.require_role("admin"))):
@@ -294,7 +301,9 @@ async def admin_get_user(user_id: str,
         (user_id,))
     total_row = pg_service.query_one(
         "SELECT COUNT(*) AS n FROM audit_logs WHERE user_id = %s", (user_id,))
-    payload["recent_activity"] = list(recent)
+    payload["recent_activity"] = [
+        {**r, "details": redact_audit_details(r["action_type"], r["details"])}
+        for r in recent]
     payload["activity_total"] = total_row["n"] if total_row else 0
     return payload
 
@@ -457,7 +466,7 @@ def _audit_filters(search: Optional[str], action: Optional[str],
     params: list = []
     if search:
         where_sql += (" AND (a.user_id LIKE %s OR u.username LIKE %s "
-                      "OR a.resource_id LIKE %s OR a.details LIKE %s)")
+                      "OR a.resource_id LIKE %s OR " + AUDIT_DETAILS_SEARCH_SQL("a") + " LIKE %s)")
         like = f"%{search}%"
         params.extend([like, like, like, like])
     if action and action != "Semua":
@@ -498,6 +507,8 @@ async def admin_audit_logs(
     logs = pg_service.query(
         f"{AUDIT_SELECT}{AUDIT_FROM_JOIN}{where_sql} ORDER BY a.id DESC LIMIT %s OFFSET %s",
         params + [page_size, (page - 1) * page_size])
+    for r in logs:
+        r["details"] = redact_audit_details(r["action_type"], r["details"])
     action_types = [r["action_type"] for r in pg_service.query(
         "SELECT DISTINCT action_type FROM audit_logs "
         "WHERE action_type IS NOT NULL ORDER BY action_type")]
@@ -522,6 +533,8 @@ async def admin_audit_export(
     rows = pg_service.query(
         f"{AUDIT_SELECT}{AUDIT_FROM_JOIN}{where_sql} ORDER BY a.id DESC LIMIT 100000",
         params)
+    for r in rows:
+        r["details"] = redact_audit_details(r["action_type"], r["details"])
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     disposition = f'attachment; filename="audit-logs-{stamp}.{fmt}"'
     if fmt == "csv":

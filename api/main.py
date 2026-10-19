@@ -35,7 +35,7 @@ import auth
 import history
 import internal_docs
 import templates
-from routers import admin, engineer
+from routers import admin, admin_access_grants, engineer
 from routers import chat, chat_attachments, repository, knowledge_graph
 from routers import compliance, taxonomy
 from routers.notification import router as notification_router
@@ -138,6 +138,7 @@ app.include_router(internal_docs.router, prefix="/api", tags=["internal_docs"])
 app.include_router(templates.router, prefix="/api", tags=["templates"])
 
 app.include_router(admin.router)
+app.include_router(admin_access_grants.router)
 app.include_router(engineer.router)
 app.include_router(chat.router)
 app.include_router(chat_attachments.router)

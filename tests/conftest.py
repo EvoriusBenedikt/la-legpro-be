@@ -37,7 +37,7 @@ _orig_gensalt = bcrypt.gensalt
 bcrypt.gensalt = lambda rounds=4, prefix=b"2b": _orig_gensalt(rounds=rounds, prefix=prefix)
 
 
-def apply_migrations(dsn: str, upto: int = 11) -> None:
+def apply_migrations(dsn: str, upto: int = 12) -> None:
     """Apply migrations/001..<upto> in order to ``dsn`` (multi-statement)."""
     import psycopg
 
@@ -96,6 +96,8 @@ def _clean_db(request):
     pg_service.execute(
         "TRUNCATE users, login_attempts, audit_logs, active_sessions RESTART IDENTITY CASCADE"
     )
+    # Test database only (TEST_DB guard above): grants/events are per-test too.
+    pg_service.execute("TRUNCATE access_grants, access_grant_events")
     import auth
 
     auth._last_housekeeping = 0.0
@@ -135,12 +137,14 @@ def client():
     from fastapi.testclient import TestClient
 
     import auth
-    from routers import (admin, chat, compliance, knowledge_graph,
-                         notification, repository)
+    from routers import (admin, admin_access_grants, chat, compliance,
+                         engineer, knowledge_graph, notification, repository)
 
     app = FastAPI()
     app.include_router(auth.router, prefix="/api/auth")
     app.include_router(admin.router)
+    app.include_router(admin_access_grants.router)
+    app.include_router(engineer.router)
     # FEAT-002: the formerly open endpoints, mounted exactly as in main.py.
     app.include_router(compliance.router)
     app.include_router(knowledge_graph.router)

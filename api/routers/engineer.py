@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 import auth
 from services import backup_service, hardware_info, host_metrics, pg_service, task_queue
+from services.grant_policy import AUDIT_DETAILS_SEARCH_SQL, redact_audit_details
 
 router = APIRouter(prefix="/api/engineer", tags=["engineer"])
 
@@ -158,7 +159,8 @@ async def get_audit_logs(
     params = []
 
     if search:
-        where_sql += " AND (user_id LIKE %s OR resource_id LIKE %s OR details LIKE %s)"
+        where_sql += (" AND (user_id LIKE %s OR resource_id LIKE %s OR "
+                      + AUDIT_DETAILS_SEARCH_SQL() + " LIKE %s)")
         like = f"%{search}%"
         params.extend([like, like, like])
     if action and action != "Semua":
@@ -177,6 +179,8 @@ async def get_audit_logs(
         f"FROM audit_logs {where_sql} ORDER BY id DESC LIMIT %s OFFSET %s",
         params + [limit, offset]
     )
+    for r in logs:
+        r["details"] = redact_audit_details(r["action_type"], r["details"])
 
     action_types = [r["action_type"] for r in pg_service.query(
         "SELECT DISTINCT action_type FROM audit_logs ORDER BY action_type")]

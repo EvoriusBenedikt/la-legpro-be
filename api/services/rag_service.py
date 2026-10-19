@@ -15,6 +15,7 @@ from typing import List
 from datetime import datetime
 import auth
 from services import pg_service
+from services import grant_policy
 from services.embed_service import embed_query
 from services.llm_client import call_glm, call_glm_vision, vlm_extract_page_image, VLM_PAGE_PROMPT, extract_json
 
@@ -770,12 +771,15 @@ def retrieve_contexts(query: str, current_user: dict, n_results=5, doc_category=
     granted_doc_ids = set()
     doc_klasifikasi_map = {}
     try:
+        # Migration 012: only active grants count, and only 'full' grants feed
+        # AI retrieval ('read' grants open the PDF but add no RAG context).
         for row in pg_service.query(
-                "SELECT doc_id FROM access_grants "
+                "SELECT doc_id, permission FROM access_grants "
                 "WHERE granted_to = %s::text "
-                "AND (expires_at IS NULL OR expires_at >= NOW())",
+                "AND " + grant_policy.active_grant_sql(),
                 (user_id,)):
-            granted_doc_ids.add(row["doc_id"])
+            if row["permission"] == "full":
+                granted_doc_ids.add(row["doc_id"])
             
         for row in pg_service.query("SELECT id, klasifikasi FROM regulations"):
             doc_klasifikasi_map[str(row["id"])] = row["klasifikasi"] or "Umum"
@@ -789,6 +793,15 @@ def retrieve_contexts(query: str, current_user: dict, n_results=5, doc_category=
             return True
         doc_klas = doc_klasifikasi_map.get(reg_id, "Umum")
         return doc_klas in allowed_klasifikasi
+
+    def _touch_grant_only(ctxs):
+        """Record last access for docs reachable ONLY through a grant."""
+        grant_only = {
+            str(c.get("doc_id")) for c in ctxs
+            if str(c.get("doc_id")) in granted_doc_ids
+            and doc_klasifikasi_map.get(str(c.get("doc_id")), "Umum") not in allowed_klasifikasi}
+        if grant_only:
+            grant_policy.touch_grants(user_id, grant_only)
 
     # Over-fetch for Post-Retrieval Filtering
     overfetch_n = 50
@@ -873,6 +886,7 @@ def retrieve_contexts(query: str, current_user: dict, n_results=5, doc_category=
                             "judul": best_top_meta["judul"] or ''
                         })
                         _attach_filenames(contexts)
+                        _touch_grant_only(contexts)
                         return contexts
                     # If it exceeds 25,000 chars, we DO NOT return contexts here. 
                     # We let it fall through to the standard chunk-based RAG below so the LLM gets the most relevant snippets instead of just the first 25k chars.
@@ -1022,4 +1036,5 @@ def retrieve_contexts(query: str, current_user: dict, n_results=5, doc_category=
         contexts.append(cand)
 
     _attach_filenames(contexts)
+    _touch_grant_only(contexts)
     return contexts

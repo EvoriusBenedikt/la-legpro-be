@@ -34,7 +34,7 @@ BACKUP_SUFFIX = ".tar"
 # Table groups mirroring the two former SQLite databases; they back the
 # metadata_db_mb / users_db_mb figures the FE monitoring has always shown.
 METADATA_TABLES = [
-    "regulations", "access_grants", "audit_logs",
+    "regulations", "access_grants", "access_grant_events", "audit_logs",
     "kg_nodes", "kg_edges", "kg_exclusions", "kg_rebuild_history",
     "system_metrics", "llm_metrics", "document_taxonomy", "chunks",
 ]

@@ -1,9 +1,12 @@
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 import os
+from datetime import timezone
 from pydantic import BaseModel
 from typing import Optional
 import auth
 from services import pg_service
+from services import grant_policy
+from services.grant_policy import active_grant_sql, touch_grants
 
 router = APIRouter(prefix="/api", tags=["repository"])
 
@@ -75,9 +78,13 @@ def user_can_view_regulation(current_user: dict, reg_row: dict) -> bool:
     grant = pg_service.query_one(
         "SELECT 1 AS ok FROM access_grants "
         "WHERE doc_id = %s AND granted_to = %s "
-        "AND (expires_at IS NULL OR expires_at >= NOW()) LIMIT 1",
+        "AND " + active_grant_sql() + " LIMIT 1",
         (str(reg_row["id"]), current_user.get("id")))
-    return grant is not None
+    if grant is not None:
+        # Grant was the deciding factor: record (throttled) last access.
+        touch_grants(current_user.get("id"), [str(reg_row["id"])])
+        return True
+    return False
 
 
 @router.get("/pdf/{filename}")
@@ -155,7 +162,7 @@ async def get_repository(current_user: dict = Depends(auth.get_current_user)):
         "    OR id::text IN ( "
         "        SELECT doc_id FROM access_grants "
         "        WHERE granted_to = %s "
-        "        AND (expires_at IS NULL OR expires_at >= NOW()) "
+        "        AND " + active_grant_sql() + " "
         "    ) "
         ")",
         (allowed_klasifikasi, user_id))
@@ -343,15 +350,27 @@ async def grant_document_access(
     grant_id = str(uuid.uuid4())
     # expires_at: '' (legacy empty string) becomes NULL -- TIMESTAMPTZ cannot
     # store empty strings.
-    pg_service.execute(
-        "INSERT INTO access_grants (id, doc_id, granted_by, granted_to, reason, expires_at) "
-        "VALUES (%s, %s, %s, %s, %s, %s)",
-        (grant_id, doc_id, current_user["id"], req.granted_to, req.reason, req.expires_at or None))
+    # Grant row and its 'granted' history event commit together (migration 012):
+    # a failed event rolls the grant back so a retry cannot duplicate it.
+    with pg_service.get_conn() as conn:
+        conn.execute(
+            "INSERT INTO access_grants (id, doc_id, granted_by, granted_to, reason, expires_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s)",
+            (grant_id, doc_id, current_user["id"], req.granted_to, req.reason, req.expires_at or None))
+        grantee_row = conn.execute(
+            "SELECT username FROM users WHERE id = %s", (req.granted_to,)).fetchone()
+        grant_policy.record_event(
+            conn,
+            {"id": grant_id, "doc_id": doc_id, "granted_to": req.granted_to,
+             "grantee_name": grantee_row["username"] if grantee_row else None,
+             "judul": doc["judul"]},
+            "granted", current_user)
     
-    # FR-25: Audit log the grant
+    # FR-25: Audit log the grant (the reason is deliberately NOT written here:
+    # it may be hidden per grant; it lives only in access_grants.reason).
     from services.db_service import log_audit
     log_audit(current_user.get("id", ""), "GRANT_ACCESS", doc_id, 
-              f"Diberikan kepada: {req.granted_to}, Dokumen: {doc_judul}, Alasan: {req.reason}")
+              f"Diberikan kepada: {req.granted_to}, Dokumen: {doc_judul}")
     
     return {"message": "Akses berhasil diberikan."}
 
@@ -366,7 +385,9 @@ async def get_all_grants(current_user: dict = Depends(auth.get_current_user)):
     # (Migration M3: to_char keeps the legacy TEXT timestamp format for the FE;
     # the join needs r.id::text because ag.doc_id is TEXT.)
     base_sql = (
-        "SELECT ag.id, ag.doc_id, ag.granted_by, ag.granted_to, ag.reason, "
+        "SELECT ag.id, ag.doc_id, ag.granted_by, ag.granted_to, "
+        "CASE WHEN ag.reason_visible THEN ag.reason ELSE NULL END AS reason, "
+        "NOT ag.reason_visible AS reason_hidden, "
         "to_char(ag.expires_at, 'YYYY-MM-DD HH24:MI:SS') AS expires_at, "
         "to_char(ag.created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at, "
         "r.judul, r.klasifikasi "
@@ -375,10 +396,12 @@ async def get_all_grants(current_user: dict = Depends(auth.get_current_user)):
     
     # FR-23: Sekretaris Perusahaan sees everything; others see only what they granted
     if user_level >= 5:  # Sekretaris Perusahaan
-        rows = pg_service.query(base_sql + "ORDER BY ag.created_at DESC")
+        rows = pg_service.query(
+            base_sql + "WHERE ag.revoked_at IS NULL ORDER BY ag.created_at DESC")
     else:
         rows = pg_service.query(
-            base_sql + "WHERE ag.granted_by = %s ORDER BY ag.created_at DESC",
+            base_sql + "WHERE ag.revoked_at IS NULL AND ag.granted_by = %s "
+            "ORDER BY ag.created_at DESC",
             (current_user["id"],))
     
     return {"grants": rows}
@@ -390,12 +413,29 @@ async def revoke_grant(grant_id: str, current_user: dict = Depends(auth.get_curr
     if user_level < 5:  # Only Sekretaris Perusahaan
         raise HTTPException(status_code=403, detail="Hanya Sekretaris Perusahaan yang dapat mencabut pemberian akses.")
     
-    row = pg_service.query_one(
-        "SELECT doc_id, granted_to FROM access_grants WHERE id = %s", (grant_id,))
-    if not row:
+    if not grant_policy.is_grant_id(grant_id):
         raise HTTPException(status_code=404, detail="Grant tidak ditemukan.")
-    
-    pg_service.execute("DELETE FROM access_grants WHERE id = %s", (grant_id,))
+
+    # Soft revoke (migration 012): the row stays for history. Idempotent
+    # guard: only the first call revokes; later calls get 409 and write nothing.
+    with pg_service.get_conn() as conn:
+        row = conn.execute(
+            "SELECT ag.id, ag.doc_id, ag.granted_to, ag.expires_at, ag.revoked_at, "
+            "ru.username AS grantee_name, r.judul "
+            "FROM access_grants ag "
+            "LEFT JOIN users ru ON ru.id = ag.granted_to "
+            "LEFT JOIN regulations r ON ag.doc_id = r.id::text "
+            "WHERE ag.id = %s FOR UPDATE OF ag", (grant_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Grant tidak ditemukan.")
+        if row["revoked_at"] is not None:
+            raise HTTPException(status_code=409, detail="Akses sudah dicabut.")
+        conn.execute(
+            "UPDATE access_grants SET revoked_at = NOW(), revoked_by = %s WHERE id = %s",
+            (current_user["id"], grant_id))
+        exp = row["expires_at"]
+        old = exp.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if exp else "none"
+        grant_policy.record_event(conn, row, "revoked", current_user, old=old)
     
     from services.db_service import log_audit
     log_audit(current_user.get("id", ""), "REVOKE_ACCESS", row["doc_id"], f"Akses dicabut dari: {row['granted_to']}")
