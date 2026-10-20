@@ -13,6 +13,9 @@ weights are available:
 import os, sys, time
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+API_DIR = os.path.join(BASE_DIR, "api")
+if API_DIR not in sys.path:
+    sys.path.insert(0, API_DIR)
 SCRAPER_DIR = os.path.join(BASE_DIR, "scraper", "jdih")
 sys.path.insert(0, SCRAPER_DIR)
 
@@ -32,16 +35,41 @@ SCRAPERS = [
     ("BPJS Ketenagakerjaan", "bpjs_ketenagakerjaan", "BPJSKetenagakerjaanScraper"),
 ]
 
+def _selected(scrapers, inactive):
+    return [scraper for scraper in scrapers if scraper[1] not in inactive]
+
+
+def _inactive_ids():
+    from services import pg_service
+
+    return {
+        row["scraper_id"]
+        for row in pg_service.query(
+            "SELECT scraper_id FROM scraper_config WHERE active = false"
+        )
+    }
+
+
 def run_all():
     total_start = time.time()
     results = []
+    try:
+        inactive = _inactive_ids()
+    except Exception as e:
+        print(f"[WARN] Could not load scraper configuration; running all: {e}")
+        inactive = set()
+    selected = _selected(SCRAPERS, inactive)
 
     print("=" * 60)
     print("  MASTER SCRAPER RUNNER")
-    print(f"  Running {len(SCRAPERS)} scrapers")
+    print(f"  Running {len(selected)} of {len(SCRAPERS)} scrapers")
     print("=" * 60)
 
     for label, module_name, class_name in SCRAPERS:
+        if module_name in inactive:
+            print(f"\n>>> [{label}]\n  [SKIP] {label} (inactive)")
+            results.append((label, "SKIPPED", 0))
+            continue
         print(f"\n>>> [{label}]")
         t0 = time.time()
         try:
@@ -70,8 +98,8 @@ def run_all():
     print(f"  ALL DONE  (total: {m:02d}m {s:02d}s)")
     print("=" * 60)
     for label, status, elapsed in results:
-        icon = "OK" if status == "OK" else "!!"
-        print(f"  [{icon}] {label:30s} {elapsed:.1f}s  {status if status != 'OK' else ''}")
+        icon = "OK" if status == "OK" else "--" if status == "SKIPPED" else "!!"
+        print(f"  [{icon}] {label:30s} {elapsed:.1f}s  {status if status not in ('OK', 'SKIPPED') else ''}")
 
 if __name__ == "__main__":
     run_all()

@@ -37,7 +37,7 @@ import internal_docs
 import templates
 from routers import admin, admin_access_grants, engineer
 from routers import chat, chat_attachments, repository, knowledge_graph
-from routers import compliance, taxonomy
+from routers import compliance, scraper, taxonomy
 from routers.notification import router as notification_router
 from services.app_config import docs_kwargs
 from services.app_state import API_STATS
@@ -146,6 +146,7 @@ app.include_router(repository.router)
 app.include_router(knowledge_graph.router)
 app.include_router(compliance.router)
 app.include_router(taxonomy.router, prefix="/api", tags=["taxonomy"])
+app.include_router(scraper.router, prefix="/api", tags=["scraper"])
 app.include_router(notification_router, prefix="/api", tags=["notification"])
 
 # Serve local PDFs as static files

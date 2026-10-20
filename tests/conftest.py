@@ -26,6 +26,7 @@ if TEST_DB:
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 MIGRATIONS = ROOT / "migrations"
 sys.path.insert(0, str(ROOT / "api"))
+sys.path.insert(0, str(ROOT))
 
 # bcrypt cost 4 instead of 12 so the suite (hundreds of hashes) stays fast.
 # Real hashes verify at whatever cost is embedded in them, so behaviour under
@@ -37,7 +38,7 @@ _orig_gensalt = bcrypt.gensalt
 bcrypt.gensalt = lambda rounds=4, prefix=b"2b": _orig_gensalt(rounds=rounds, prefix=prefix)
 
 
-def apply_migrations(dsn: str, upto: int = 12) -> None:
+def apply_migrations(dsn: str, upto: int = 13) -> None:
     """Apply migrations/001..<upto> in order to ``dsn`` (multi-statement)."""
     import psycopg
 
@@ -98,6 +99,7 @@ def _clean_db(request):
     )
     # Test database only (TEST_DB guard above): grants/events are per-test too.
     pg_service.execute("TRUNCATE access_grants, access_grant_events")
+    pg_service.execute("TRUNCATE scraper_config")
     import auth
 
     auth._last_housekeeping = 0.0
@@ -138,7 +140,8 @@ def client():
 
     import auth
     from routers import (admin, admin_access_grants, chat, compliance,
-                         engineer, knowledge_graph, notification, repository)
+                         engineer, knowledge_graph, notification, repository,
+                         scraper)
 
     app = FastAPI()
     app.include_router(auth.router, prefix="/api/auth")
@@ -151,6 +154,7 @@ def client():
     app.include_router(repository.router)
     app.include_router(chat.router)
     app.include_router(notification.router, prefix="/api")
+    app.include_router(scraper.router, prefix="/api")
     # client=("10.0.0.2", 50000): a private peer, like the nginx container, so
     # X-Real-IP is honoured exactly as in production.
     return TestClient(app, client=("10.0.0.2", 50000))
