@@ -1,5 +1,4 @@
 import pytest
-import pytest
 
 pytestmark = pytest.mark.db
 
