@@ -158,13 +158,30 @@ def test_runner_reads_persisted_inactive_flag(client, make_user, mint_token, mon
 
 
 def test_runner_reports_skipped_without_failure(monkeypatch, capsys):
+    import sys
+    import types
     import run_all_scrapers
 
-    selected_id = SCRAPERS[0][1]
-    monkeypatch.setattr(run_all_scrapers, "_inactive_ids", lambda: {selected_id})
+    ran = []
+    active_module = types.ModuleType("active_stub")
+
+    class ActiveScraper:
+        def scrape(self, limit=100):
+            ran.append(limit)
+
+    active_module.ActiveScraper = ActiveScraper
+    monkeypatch.setitem(sys.modules, "active_stub", active_module)
+    monkeypatch.setattr(
+        run_all_scrapers,
+        "SCRAPERS",
+        [("Active", "active_stub", "ActiveScraper"), ("Inactive", "inactive_stub", "InactiveScraper")],
+    )
+    monkeypatch.setattr(run_all_scrapers, "_inactive_ids", lambda: {"inactive_stub"})
     monkeypatch.setattr(run_all_scrapers.os, "system", lambda command: 0)
+
     run_all_scrapers.run_all()
     output = capsys.readouterr().out
-    assert "Running 11 of 12 scrapers" in output
-    assert f"[SKIP] {SCRAPERS[0][0]} (inactive)" in output
-    assert "[--]" in output
+    assert ran == [100]
+    assert "Running 1 of 2 scrapers" in output
+    assert "[SKIP] Inactive (inactive)" in output
+    assert "[--] Inactive" in output
