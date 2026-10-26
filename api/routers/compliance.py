@@ -384,7 +384,7 @@ async def analyze_pasals(
         return {"pasals": [], "error": str(e)}
 
 
-def process_single_pasal(c, doc_type, pihak_1, pihak_2, sektor, pokok, COSINE_THRESHOLD, uid, excluded):
+def process_single_pasal(c, doc_type, pihak_1, pihak_2, sektor, pokok, COSINE_THRESHOLD, uid, excluded, report_id):
     pasal_label = c.get("pasal", "Pasal")
     desc = c.get("deskripsi", "")
     if not desc or len(desc) < 10:
@@ -414,9 +414,10 @@ def process_single_pasal(c, doc_type, pihak_1, pihak_2, sektor, pokok, COSINE_TH
             "WHERE embedding IS NOT NULL "
             "AND ( doc_category = ANY(%s) "
             "      OR (visibility = 'private' AND user_id = %s::text "
-            "          AND doc_id IS NULL AND id LIKE 'internal\\_%%') ) "
+            "          AND doc_id IS NULL AND id LIKE 'internal\\_%%' "
+            "          AND (report_id IS NULL OR report_id = %s)) ) "
             "ORDER BY embedding <=> %s::vector LIMIT 3",
-            (query_vec, [doc_cat, "UMUM"], uid, query_vec))
+            (query_vec, [doc_cat, "UMUM"], uid, report_id, query_vec))
         sr_rows = cur.fetchall()
 
     # B2: drop deselected sources before the distance/relevance loop.
@@ -629,6 +630,7 @@ def extract_text_multi_format(file_path: str, filename: str, use_ocr: bool = Fal
 async def check_compliance(
     file: UploadFile = File(...),
     use_ocr: str = Form("false"),
+    report_id: str | None = Form(None),   # B3: current workspace; None => no narrowing
     current_user: dict = Depends(auth.require_role("pengguna")),
     _rl: dict = Depends(rate_limit.llm_rate_limit("check_compliance")),
 ):
@@ -741,9 +743,10 @@ async def check_compliance(
         # clauses would otherwise re-read it); uid binds the internal-chunk branch.
         uid = str(current_user["id"])
         excluded = get_user_exclusions(current_user["id"])
+        rid = report_id if report_id else None   # B3: '' / None => no narrowing
 
         def worker(c):
-            return process_single_pasal(c, doc_type, pihak_1, pihak_2, sektor, pokok, COSINE_THRESHOLD, uid, excluded)
+            return process_single_pasal(c, doc_type, pihak_1, pihak_2, sektor, pokok, COSINE_THRESHOLD, uid, excluded, rid)
 
         results = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:

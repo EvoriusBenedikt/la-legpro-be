@@ -65,6 +65,16 @@ if TEST_DB and not _schema_present():
     # schema has to exist before any test module imports auth.
     apply_migrations(TEST_DB)
 
+if TEST_DB:
+    # B3 (016): retrieve_contexts/process_single_pasal reference chunks.report_id.
+    # The harness stops at migration 013, so add the column idempotently here —
+    # order-independent, so every retrieval test has it regardless of which
+    # module runs first. Additive + harmless on a DB that already has it.
+    import psycopg as _psycopg
+
+    with _psycopg.connect(TEST_DB, autocommit=True) as _c:
+        _c.execute("ALTER TABLE chunks ADD COLUMN IF NOT EXISTS report_id TEXT")
+
 
 def pytest_collection_modifyitems(config, items):
     if TEST_DB:

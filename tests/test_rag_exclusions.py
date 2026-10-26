@@ -188,12 +188,12 @@ def test_compliance_empty_set_and_public_exclusion(seed, monkeypatch):
 
     clause = {"pasal": "Pasal 1", "deskripsi": "klausul pembayaran yang cukup panjang untuk lolos filter."}
     base = process_single_pasal(clause, "PKS", "A", "B", "umum", "pokok", 0.45,
-                                user["id"], set())
+                                user["id"], set(), None)
     base_regs = {r["nomor"] for r in base["supporting_regulations"]}
     assert base_regs  # the public reg was cited
 
     out = process_single_pasal(clause, "PKS", "A", "B", "umum", "pokok", 0.45,
-                               user["id"], {f"reg:{rid}"})
+                               user["id"], {f"reg:{rid}"}, None)
     assert out["supporting_regulations"] == [] and out["status"] == "TIDAK DIATUR"
 
 
@@ -206,9 +206,9 @@ def test_compliance_internal_exclusion(seed, monkeypatch):
     clause = {"pasal": "Pasal 1", "deskripsi": "klausul kerahasiaan yang cukup panjang untuk lolos filter."}
     # Admitted (internal doc appears as an authoritative reference).
     base = process_single_pasal(clause, "PKS", "A", "B", "umum", "pokok", 0.45,
-                                user["id"], set())
+                                user["id"], set(), None)
     assert base["supporting_regulations"]
 
     out = process_single_pasal(clause, "PKS", "A", "B", "umum", "pokok", 0.45,
-                               user["id"], {f"internal:{up}"})
+                               user["id"], {f"internal:{up}"}, None)
     assert out["supporting_regulations"] == []

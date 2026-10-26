@@ -20,6 +20,7 @@ class ChatMessage(BaseModel):
 
 class ChatRequest(BaseModel):
     messages: List[ChatMessage] = []
+    report_id: str | None = None   # B3: current workspace; None => no narrowing
 
 class ChatResponse(BaseModel):
     answer: str
@@ -96,7 +97,8 @@ async def chat_endpoint(
         graph_context = ""
     else:
         try:
-            contexts = retrieve_contexts(last_user_message, current_user=current_user)
+            contexts = retrieve_contexts(last_user_message, current_user=current_user,
+                                         report_id=req.report_id)
         except Exception as e:
             print(f"Chat retrieval failed, degrading to ungrounded answer: {e}")
             contexts = []

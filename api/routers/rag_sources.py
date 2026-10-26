@@ -35,7 +35,12 @@ class ExclusionUpdate(BaseModel):
 
 
 @router.get("/rag-sources/list")   # router prefix="/api" -> /api/rag-sources/list
-async def list_sources(current_user: dict = Depends(auth.get_current_user)):
+async def list_sources(report_id: str | None = None,
+                       current_user: dict = Depends(auth.get_current_user)):
+    # B3: internal refs are workspace-scoped. A no-report_id call returns ONLY
+    # the user's legacy (NULL-report_id) internal refs; workspace-scoped refs
+    # require passing report_id. Public regs stay global-per-user (unchanged).
+    rid = report_id if report_id else None   # '' / absent => None (no narrowing)
     base = await repository.get_repository(current_user)   # same role ACL, id already str
     uid = str(current_user["id"])
     excluded = {r["source_ref"] for r in pg_service.query(
@@ -50,13 +55,18 @@ async def list_sources(current_user: dict = Depends(auth.get_current_user)):
     # private internal_* chunks. split_part(id,'_',2) == the upload_id; it MUST
     # map a chunk to the SAME upload_id as chunk_source_ref's split('_')[1]
     # (both derive from internal_docs.py's internal_<upload_id>_<i> id shape).
+    # B3: scope to THIS workspace (report_id = rid) PLUS legacy unscoped refs
+    # (report_id IS NULL, ingested before B3 — kept visible to their owner
+    # everywhere). rid=None (no workspace) => only the NULL-report_id legacy
+    # refs surface, reproducing pre-B3 behavior for callers with no workspace.
     internal = pg_service.query(
         "SELECT split_part(id, '_', 2) AS upload_id, min(judul) AS fname "
         "FROM chunks "
         "WHERE visibility = 'private' AND user_id = %s::text "
         "AND doc_id IS NULL AND id LIKE 'internal\\_%%' "
+        "AND (report_id IS NULL OR report_id = %s) "
         "GROUP BY split_part(id, '_', 2)",
-        (uid,))
+        (uid, rid))
     for row in internal:
         ref = f"internal:{row['upload_id']}"
         fname = row["fname"] or "Dokumen Internal"

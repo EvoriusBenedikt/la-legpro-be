@@ -781,11 +781,15 @@ def _attach_filenames(contexts: List[dict]) -> None:
         print(f"Filename lookup for chat sources failed: {e}")
 
 
-def retrieve_contexts(query: str, current_user: dict, n_results=5, doc_category=None, hybrid_cag=True) -> List[dict]:
+def retrieve_contexts(query: str, current_user: dict, n_results=5, doc_category=None, hybrid_cag=True, report_id=None) -> List[dict]:
     """Searches Vector DB and returns structured raw dictionaries.
        If hybrid_cag=True, uses RAG to find the best document, then CAG to inject the full text.
        Enforces FR-17 by strictly filtering out classified documents the user cannot access.
+       B3: report_id narrows the caller's PRIVATE internal chunks to the current
+       workspace; None (no workspace) => only public law + the user's
+       NULL-report_id legacy private rows, i.e. pre-B3 behavior.
     """
+    report_id = report_id or None   # '' => None (no narrowing); bound as a param below
     user_id = current_user.get("id")
     role_level = auth.get_role_level(current_user.get("role", "pengguna"))
     
@@ -841,8 +845,13 @@ def retrieve_contexts(query: str, current_user: dict, n_results=5, doc_category=
     # (Migration M3: the Chroma `where` dict becomes a SQL fragment --
     # visibility / user_id / doc_category are columns on chunks now. NULL
     # columns never match, exactly like absent Chroma metadata keys did.)
-    where_sql = "(visibility = 'public' OR user_id = %s::text)"
-    where_params = [user_id]
+    # B3: private (internal) chunks are workspace-scoped. A NULL report_id is
+    # unscoped-legacy (pre-B3) and stays visible to its owner everywhere; a
+    # non-NULL report_id is narrowed to the current workspace. report_id=None
+    # (no workspace) => only public + the user's NULL-report_id legacy private rows.
+    where_sql = ("(visibility = 'public' OR (user_id = %s::text "
+                 "AND (report_id IS NULL OR report_id = %s)))")
+    where_params = [user_id, report_id]
     if doc_category:
         where_sql += " AND doc_category = ANY(%s)"
         where_params.append([doc_category, "UMUM"])
