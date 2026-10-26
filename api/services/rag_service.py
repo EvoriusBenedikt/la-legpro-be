@@ -46,6 +46,37 @@ def _cap_context_text(text):
     return text
 
 
+# ── B2 reference-base exclusion set ─────────────────────────────────────────
+# Per-user DESELECTED sources (migration 015). Purely subtractive: a ref in the
+# set only removes a candidate from retrieval, never adds or surfaces one, so an
+# empty set reproduces current behavior byte-for-byte.
+def get_user_exclusions(user_id) -> set:
+    try:
+        return {r["source_ref"] for r in pg_service.query(
+            "SELECT source_ref FROM rag_source_exclusions WHERE user_id = %s",
+            (str(user_id),))}
+    except Exception as e:
+        print(f"Error fetching rag exclusions: {e}")
+        return set()   # fail-open: subtractive-only, so this can only fail to
+                       # exclude a deselected source, never leak an unauthorized one.
+
+
+def chunk_source_ref(doc_id, chunk_id) -> str | None:
+    """Map a chunks row to its exclusion source_ref, or None (never excluded).
+
+    Public law: 'reg:<doc_id>' (doc_id is already regulations.id::text).
+    Internal upload: 'internal:<upload_id>' from the internal_<upload_id>_<i>
+    chunk-id shape in internal_docs.py — split('_')[1] MUST match the
+    /rag-sources/list split_part(id,'_',2) derivation. The startswith guard
+    makes the split index-safe (an internal_ id always contains a '_').
+    """
+    if doc_id:
+        return f"reg:{doc_id}"
+    if chunk_id and chunk_id.startswith("internal_"):
+        return f"internal:{chunk_id.split('_')[1]}"
+    return None
+
+
 def get_reranker():
     # Double-checked locking (2026-09-29 RAG audit): the startup warm thread
     # and a concurrent first query must not load the model twice.
@@ -770,6 +801,8 @@ def retrieve_contexts(query: str, current_user: dict, n_results=5, doc_category=
     # access_grants.doc_id are TEXT -> map keys normalized with str().)
     granted_doc_ids = set()
     doc_klasifikasi_map = {}
+    # B2: per-user reference-base exclusion set (empty => no-op, current behavior).
+    excluded = get_user_exclusions(user_id)
     try:
         # Migration 012: only active grants count, and only 'full' grants feed
         # AI retrieval ('read' grants open the PDF but add no RAG context).
@@ -846,7 +879,9 @@ def retrieve_contexts(query: str, current_user: dict, n_results=5, doc_category=
             for meta in discovery_rows:
                 reg_id = meta["doc_id"]
                 
-                if is_allowed(reg_id):
+                # B2: an excluded source is skipped like an unauthorized one, so
+                # the CAG whole-document winner can never be a deselected doc.
+                if is_allowed(reg_id) and chunk_source_ref(reg_id, meta["id"]) not in excluded:
                     best_reg_id = reg_id
                     best_top_meta = meta
                     break # Found the highest ranked authorized document
@@ -919,6 +954,8 @@ def retrieve_contexts(query: str, current_user: dict, n_results=5, doc_category=
             
             if not is_allowed(reg_id):
                 continue
+            if chunk_source_ref(reg_id, meta["id"]) in excluded:  # B2
+                continue
                 
             chunk_id = meta["id"]
             window_doc = _cap_context_text(meta["window_context"] if meta["window_context"] else meta["text"])
@@ -966,6 +1003,8 @@ def retrieve_contexts(query: str, current_user: dict, n_results=5, doc_category=
         for row in sparse_rows:
             chunk_id, doc_id = row["id"], row["doc_id"]
             if not is_allowed(doc_id):
+                continue
+            if chunk_source_ref(doc_id, chunk_id) in excluded:  # B2
                 continue
                 
             sparse_ranks[chunk_id] = sparse_rank

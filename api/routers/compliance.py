@@ -384,7 +384,7 @@ async def analyze_pasals(
         return {"pasals": [], "error": str(e)}
 
 
-def process_single_pasal(c, doc_type, pihak_1, pihak_2, sektor, pokok, COSINE_THRESHOLD):
+def process_single_pasal(c, doc_type, pihak_1, pihak_2, sektor, pokok, COSINE_THRESHOLD, uid, excluded):
     pasal_label = c.get("pasal", "Pasal")
     desc = c.get("deskripsi", "")
     if not desc or len(desc) < 10:
@@ -399,14 +399,30 @@ def process_single_pasal(c, doc_type, pihak_1, pihak_2, sektor, pokok, COSINE_TH
     query_vec = embed_query(search_query)
     with pg_service.get_conn() as conn:
         conn.execute("SET LOCAL hnsw.ef_search = 100")
+        # B2: also admit the caller's OWN internal uploads (doc_category NULL,
+        # so they never matched before). Additive: it can only add the user's
+        # private internal rows to the candidate pool; the < 0.45 distance gate
+        # and is_regulation_relevant micro-check still reject irrelevant ones.
+        # shortcut: keep LIMIT 3 — shared across public + admitted internal
+        # candidates, so a user with many internal chunks could crowd out public
+        # law for a clause (moot today: no FE path produces internal chunks).
+        # Revisit raising it only if internal docs crowd out public law in testing.
         cur = conn.execute(
-            "SELECT text, jenis, nomor, sektor, "
+            "SELECT id, doc_id, text, jenis, nomor, sektor, "
             "embedding <=> %s::vector AS dist "
             "FROM chunks "
-            "WHERE embedding IS NOT NULL AND doc_category = ANY(%s) "
+            "WHERE embedding IS NOT NULL "
+            "AND ( doc_category = ANY(%s) "
+            "      OR (visibility = 'private' AND user_id = %s::text "
+            "          AND doc_id IS NULL AND id LIKE 'internal\\_%%') ) "
             "ORDER BY embedding <=> %s::vector LIMIT 3",
-            (query_vec, [doc_cat, "UMUM"], query_vec))
+            (query_vec, [doc_cat, "UMUM"], uid, query_vec))
         sr_rows = cur.fetchall()
+
+    # B2: drop deselected sources before the distance/relevance loop.
+    from services.rag_service import chunk_source_ref
+    sr_rows = [r for r in sr_rows
+               if chunk_source_ref(r["doc_id"], r["id"]) not in excluded]
 
     supporting_regulations = []
     relevant_refs = []
@@ -656,6 +672,7 @@ async def check_compliance(
         from services.rag_service import (
             understand_document, extract_signing_date, extract_duration_months,
             extract_explicit_end_date, extract_pasal_items, llm_extract_pasal_items,
+            get_user_exclusions,
         )
 
         # 🔍 Pass 0: Multi-Format Extraction ──────────────────────────────────
@@ -720,9 +737,13 @@ async def check_compliance(
 
         # ── Pass 2: Per-clause RAG + LLM Compliance Check ────────────────
         COSINE_THRESHOLD = 0.45  # tightened from 0.60 to reduce wrong-domain citations
+        # B2: load the per-user exclusion set once (≤5 worker threads × ≤20
+        # clauses would otherwise re-read it); uid binds the internal-chunk branch.
+        uid = str(current_user["id"])
+        excluded = get_user_exclusions(current_user["id"])
 
         def worker(c):
-            return process_single_pasal(c, doc_type, pihak_1, pihak_2, sektor, pokok, COSINE_THRESHOLD)
+            return process_single_pasal(c, doc_type, pihak_1, pihak_2, sektor, pokok, COSINE_THRESHOLD, uid, excluded)
 
         results = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
