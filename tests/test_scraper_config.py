@@ -178,9 +178,11 @@ def test_runner_reports_skipped_without_failure(monkeypatch, capsys):
     monkeypatch.setattr(run_all_scrapers, "_inactive_ids", lambda: {"inactive_stub"})
     monkeypatch.setattr(run_all_scrapers.os, "system", lambda command: 0)
 
-    run_all_scrapers.run_all()
+    results = run_all_scrapers.run_all()
     output = capsys.readouterr().out
     assert ran == [100]
+    assert results[0][0] == "active_stub"
+    assert results[1][2] == "SKIPPED"
     assert "Running 1 of 2 scrapers" in output
     assert "[SKIP] Inactive (inactive)" in output
     assert "[--] Inactive" in output

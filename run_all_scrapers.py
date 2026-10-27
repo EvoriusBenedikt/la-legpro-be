@@ -10,6 +10,7 @@ the backend container so psycopg, the embedder and the vendored MiniLM
 weights are available:
     docker exec legpro-backend python /app/run_all_scrapers.py
 """
+import json
 import os, sys, time
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -68,7 +69,7 @@ def run_all():
     for label, module_name, class_name in SCRAPERS:
         if module_name in inactive:
             print(f"\n>>> [{label}]\n  [SKIP] {label} (inactive)")
-            results.append((label, "SKIPPED", 0))
+            results.append((module_name, label, "SKIPPED", 0))
             continue
         print(f"\n>>> [{label}]")
         t0 = time.time()
@@ -78,11 +79,11 @@ def run_all():
             instance = cls()
             instance.scrape(limit=100)
             elapsed = time.time() - t0
-            results.append((label, "OK", elapsed))
+            results.append((module_name, label, "OK", elapsed))
         except Exception as e:
             elapsed = time.time() - t0
             print(f"  [ERROR] {label}: {e}")
-            results.append((label, f"ERROR: {e}", elapsed))
+            results.append((module_name, label, f"ERROR: {e}", elapsed))
 
     # Fast-ingest all new .txt files
     print("\n" + "=" * 60)
@@ -97,9 +98,14 @@ def run_all():
     print("\n" + "=" * 60)
     print(f"  ALL DONE  (total: {m:02d}m {s:02d}s)")
     print("=" * 60)
-    for label, status, elapsed in results:
+    for _, label, status, elapsed in results:
         icon = "OK" if status == "OK" else "--" if status == "SKIPPED" else "!!"
         print(f"  [{icon}] {label:30s} {elapsed:.1f}s  {status if status not in ('OK', 'SKIPPED') else ''}")
+    return results
 
 if __name__ == "__main__":
-    run_all()
+    result = run_all()
+    print("SCRAPE_RESULT_JSON: " + json.dumps([
+        {"id": module_name, "label": label, "status": status, "seconds": round(elapsed, 3)}
+        for module_name, label, status, elapsed in result
+    ]))

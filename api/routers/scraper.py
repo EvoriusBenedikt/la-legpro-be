@@ -21,7 +21,7 @@ REGISTRY = [(module_name, label) for label, module_name, _ in SCRAPERS]
 REGISTRY_BY_ID = dict(REGISTRY)
 
 from auth import get_current_user
-from services import pg_service
+from services import pg_service, scraper_runner
 from services.db_service import log_audit
 
 router = APIRouter()
@@ -56,15 +56,19 @@ def _current():
     }
 
 
+def _config_error():
+    return HTTPException(
+        status_code=503,
+        detail="Konfigurasi scraper belum tersedia (migrasi 013 belum diterapkan)",
+    )
+
+
 @router.get("/scraper/config")
 def get_scraper_config(current_user: dict = Depends(scraper_role)):
     try:
         return _current()
     except pg_errors.UndefinedTable:
-        raise HTTPException(
-            status_code=503,
-            detail="Konfigurasi scraper belum tersedia (migrasi 013 belum diterapkan)",
-        )
+        raise _config_error()
 
 
 @router.put("/scraper/config")
@@ -99,10 +103,7 @@ def update_scraper_config(
                     (scraper.id, scraper.active, str(current_user["id"])),
                 )
     except pg_errors.UndefinedTable:
-        raise HTTPException(
-            status_code=503,
-            detail="Konfigurasi scraper belum tersedia (migrasi 013 belum diterapkan)",
-        )
+        raise _config_error()
 
     for scraper_id, active in changed:
         log_audit(current_user["id"], "UPDATE_SCRAPER_CONFIG", scraper_id,
@@ -111,7 +112,28 @@ def update_scraper_config(
     try:
         return _current()
     except pg_errors.UndefinedTable:
-        raise HTTPException(
-            status_code=503,
-            detail="Konfigurasi scraper belum tersedia (migrasi 013 belum diterapkan)",
-        )
+        raise _config_error()
+
+
+@router.post("/scraper/run", status_code=202)
+def start_scraper_run(current_user: dict = Depends(scraper_role)):
+    def audit_started():
+        log_audit(current_user["id"], "SCRAPE_STARTED", "", f"sources={len(scraper_runner.snapshot()['sources'])}")
+
+    def audit_finished(state):
+        log_audit(current_user["id"], "SCRAPE_FINISHED" if state == "completed" else "SCRAPE_FAILED")
+
+    try:
+        result = scraper_runner.start(current_user, audit_finished, audit_started)
+    except scraper_runner.AlreadyRunning:
+        raise HTTPException(status_code=409, detail="Scraping sedang berjalan")
+    except scraper_runner.NoActiveSources:
+        raise HTTPException(status_code=400, detail="Tidak ada sumber aktif")
+    except pg_errors.UndefinedTable:
+        raise _config_error()
+    return result
+
+
+@router.get("/scraper/run")
+def get_scraper_run(current_user: dict = Depends(scraper_role)):
+    return scraper_runner.snapshot()
