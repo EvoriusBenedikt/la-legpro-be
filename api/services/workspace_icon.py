@@ -68,7 +68,7 @@ _CURATED_ICONS_SET = set(CURATED_WORKSPACE_ICONS)
 
 # 12 Canonical legal contract classification rules with strict word boundary protection (\b)
 CANONICAL_ICON_RULES: list[tuple[re.Pattern, str]] = [
-    (re.compile(r"\b(pks|perjanjian\s+kerjas?ama|partnership)\b", re.IGNORECASE), "handshake"),
+    (re.compile(r"\b(pks|perjanjian\s+kerja\s*sama|partnership)\b", re.IGNORECASE), "handshake"),
     (re.compile(r"\b(bast|serah\s+terima|handover)\b", re.IGNORECASE), "clipboard-check"),
     (re.compile(r"\b(addendum|amandemen|amendment)\b", re.IGNORECASE), "file-plus"),
     (re.compile(r"\b(data\s+sharing|dsa|berbagi\s+data)\b", re.IGNORECASE), "share-2"),

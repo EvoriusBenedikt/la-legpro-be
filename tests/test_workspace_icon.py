@@ -14,6 +14,7 @@ def test_detect_canonical_icons():
     # 1. PKS / Partnership -> handshake
     assert detect_canonical_icon("PKS Lintasarta 2026") == "handshake"
     assert detect_canonical_icon("Perjanjian Kerjasama Tripartit") == "handshake"
+    assert detect_canonical_icon("Perjanjian Kerja Sama Tripartit") == "handshake"
     assert detect_canonical_icon("Strategic Partnership 2026") == "handshake"
 
     # 2. BAST / Handover -> clipboard-check

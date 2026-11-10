@@ -4,7 +4,7 @@
 ALTER TABLE notebooks ADD COLUMN IF NOT EXISTS icon VARCHAR(64) DEFAULT 'folder' NOT NULL;
 
 -- Backfill existing workspaces based on canonical contract patterns with word boundaries
-UPDATE notebooks SET icon = 'handshake' WHERE icon = 'folder' AND name ~* '\y(pks|perjanjian kerjas?ama|partnership)\y';
+UPDATE notebooks SET icon = 'handshake' WHERE icon = 'folder' AND name ~* '\y(pks|perjanjian kerja\s*sama|partnership)\y';
 UPDATE notebooks SET icon = 'clipboard-check' WHERE icon = 'folder' AND name ~* '\y(bast|serah terima|handover)\y';
 UPDATE notebooks SET icon = 'file-plus' WHERE icon = 'folder' AND name ~* '\y(addendum|amandemen|amendment)\y';
 UPDATE notebooks SET icon = 'share-2' WHERE icon = 'folder' AND name ~* '\y(data sharing|dsa|berbagi data)\y';
