@@ -1,13 +1,7 @@
-import os
 import pathlib
 import uuid
 import pytest
-import conftest
 from services import pg_service
-
-# Ensure TEST_DB is populated so db tests run even if TEST_DATABASE_URL wasn't pre-set in the shell
-if not getattr(conftest, "TEST_DB", None):
-    conftest.TEST_DB = os.getenv("DATABASE_URL", "postgresql://legpro:legpro@127.0.0.1:5432/legpro")
 
 pytestmark = pytest.mark.db
 
@@ -45,8 +39,10 @@ def test_migration_023_is_idempotent():
 
 
 def test_migration_023_backfill_patterns():
-    """Verify that existing rows matching canonical contract patterns get backfilled."""
+    """Verify that existing rows matching canonical contract patterns get backfilled,
+    while non-contract names and common false-positive substrings fall back to 'folder'."""
     test_cases = [
+        # Canonical contract patterns (positive cases)
         ("PKS Pengadaan Jaringan", "handshake"),
         ("Perjanjian Kerjasama Tripartit", "handshake"),
         ("Strategic Partnership 2026", "handshake"),
@@ -87,12 +83,20 @@ def test_migration_023_backfill_patterns():
         ("Distributor Tunggal Jawa Barat", "store"),
         ("Mitra Usaha Bersama", "store"),
         ("Proyek Internal Non-Contract", "folder"),
+
+        # False-positive boundary protection (negative cases: substrings must NOT trigger)
+        ("Laporan Keuangan", "folder"),       # 'po' in 'Laporan'
+        ("Agenda Rapat", "folder"),           # 'nda' in 'Agenda'
+        ("Standar Dokumen", "folder"),        # 'nda' in 'Standar'
+        ("Kelompok Diskusi", "folder"),       # 'po' in 'Kelompok'
+        ("Legislatif Nasional", "folder"),    # 'sla' in 'Legislatif'
+        ("Pasal Pidana Khusus", "folder"),    # 'pks' in 'Pasal Pidana Khusus' without boundary? No, but acronyms
+        ("Disposisi Surat", "folder"),        # 'po' in 'Disposisi'
     ]
 
     user_id = f"test_user_{uuid.uuid4().hex[:8]}"
     inserted_ids = []
     try:
-        # First ensure migration is applied so we can insert with or without icon
         if MIGRATION_FILE.exists():
             apply_migration()
         else:
