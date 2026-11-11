@@ -101,6 +101,9 @@ async def serve_pdf(filename: str, current_user: dict = Depends(auth.get_current
     regulation row is a 404 (never reveals whether the file exists on disk).
     """
     import base64
+    import json
+    from fastapi.responses import StreamingResponse
+
     if (current_user.get("role") or "").lower() == "admin":
         raise HTTPException(status_code=403, detail="Admin sistem tidak memiliki kewenangan untuk mengakses repositori dokumen.")
     safe_filename = _basename_any(filename)  # prevent path traversal
@@ -118,9 +121,20 @@ async def serve_pdf(filename: str, current_user: dict = Depends(auth.get_current
     file_path = _find_pdf_file(safe_filename)
     if file_path is None:
         raise HTTPException(status_code=404, detail=f"PDF '{safe_filename}' not found")
-    with open(file_path, "rb") as f:
-        pdf_bytes = f.read()
-    return {"filename": safe_filename, "data": base64.b64encode(pdf_bytes).decode("utf-8")}
+
+    def iter_pdf():
+        # Divisible by 3 (48KB) so base64 chunks stream cleanly without intermediate padding
+        prefix = (json.dumps({"filename": safe_filename})[:-1] + ', "data": "').encode("utf-8")
+        yield prefix
+        with open(file_path, "rb") as f:
+            while True:
+                chunk = f.read(48 * 1024)
+                if not chunk:
+                    break
+                yield base64.b64encode(chunk)
+        yield b'"}'
+
+    return StreamingResponse(iter_pdf(), media_type="application/json")
 
 @router.get("/repository")
 async def get_repository(current_user: dict = Depends(auth.get_current_user)):

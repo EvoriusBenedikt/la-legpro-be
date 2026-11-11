@@ -23,6 +23,18 @@ if not SECRET_KEY:
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 # 24 hours
 
+_SESSION_LAST_SEEN_CACHE: dict = {}
+
+def _should_update_last_seen(uid: str) -> bool:
+    now = time.time()
+    last = _SESSION_LAST_SEEN_CACHE.get(uid, 0.0)
+    if (now - last) >= 60.0:
+        if len(_SESSION_LAST_SEEN_CACHE) > 5000:
+            _SESSION_LAST_SEEN_CACHE.clear()
+        _SESSION_LAST_SEEN_CACHE[uid] = now
+        return True
+    return False
+
 security = HTTPBearer()
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -37,31 +49,35 @@ router = APIRouter()
 # template seed remains, still run at import time exactly as before.
 def init_db():
     """Seed the dummy document templates on a fresh database (idempotent)."""
-    if pg_service.query_one("SELECT 1 FROM document_templates LIMIT 1") is not None:
-        return
-    dummy_templates = [
-        (
-            "tpl_pks_01",
-            "Perjanjian Kerja Sama (PKS) Standar",
-            "Template PKS standar untuk kerja sama B2B umum dengan penyedia layanan teknologi.",
-            "# PERJANJIAN KERJA SAMA\n\nPada hari ini, dibuat kesepakatan antara:\n1. PIHAK PERTAMA: [Nama Perusahaan 1]\n2. PIHAK KEDUA: [Nama Perusahaan 2]\n\n## PASAL 1 - RUANG LINGKUP\nKerja sama ini mencakup [Deskripsi Layanan].\n\n## PASAL 2 - JANGKA WAKTU\nPerjanjian ini berlaku selama [Durasi Bulan/Tahun].",
-            "PKS"
-        ),
-        (
-            "tpl_nda_01",
-            "Non-Disclosure Agreement (NDA)",
-            "Template perjanjian kerahasiaan dua arah untuk diskusi awal komersial.",
-            "# NON-DISCLOSURE AGREEMENT\n\nPerjanjian kerahasiaan ini ditandatangani oleh:\n1. PIHAK PENGUNGKAP: [Nama Pengungkap]\n2. PIHAK PENERIMA: [Nama Penerima]\n\n## PASAL 1 - INFORMASI RAHASIA\nInformasi yang dilindungi adalah [Jenis Informasi Rahasia].",
-            "NDA"
+    try:
+        if pg_service.query_one("SELECT 1 FROM document_templates LIMIT 1") is not None:
+            return
+        dummy_templates = [
+            (
+                "tpl_pks_01",
+                "Perjanjian Kerja Sama (PKS) Standar",
+                "Template PKS standar untuk kerja sama B2B umum dengan penyedia layanan teknologi.",
+                "# PERJANJIAN KERJA SAMA\n\nPada hari ini, dibuat kesepakatan antara:\n1. PIHAK PERTAMA: [Nama Perusahaan 1]\n2. PIHAK KEDUA: [Nama Perusahaan 2]\n\n## PASAL 1 - RUANG LINGKUP\nKerja sama ini mencakup [Deskripsi Layanan].\n\n## PASAL 2 - JANGKA WAKTU\nPerjanjian ini berlaku selama [Durasi Bulan/Tahun].",
+                "PKS"
+            ),
+            (
+                "tpl_nda_01",
+                "Non-Disclosure Agreement (NDA)",
+                "Template perjanjian kerahasiaan dua arah untuk diskusi awal komersial.",
+                "# NON-DISCLOSURE AGREEMENT\n\nPerjanjian kerahasiaan ini ditandatangani oleh:\n1. PIHAK PENGUNGKAP: [Nama Pengungkap]\n2. PIHAK PENERIMA: [Nama Penerima]\n\n## PASAL 1 - INFORMASI RAHASIA\nInformasi yang dilindungi adalah [Jenis Informasi Rahasia].",
+                "NDA"
+            )
+        ]
+        pg_service.execute_many(
+            "INSERT INTO document_templates (id, title, description, content_template, category) "
+            "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (id) DO NOTHING",
+            dummy_templates,
         )
-    ]
-    pg_service.execute_many(
-        "INSERT INTO document_templates (id, title, description, content_template, category) "
-        "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (id) DO NOTHING",
-        dummy_templates,
-    )
+    except Exception:
+        pass
 
-init_db()
+if not os.environ.get("PYTEST_CURRENT_TEST"):
+    init_db()
 
 # --- Security Utils & RBAC ---
 ROLE_LEVELS = {
@@ -149,18 +165,19 @@ async def get_current_user(request: Request,
             raise
         except Exception:
             pass
-        # FR-31: Refresh last_seen for active session tracking
-        try:
-            pg_service.execute(
-                "INSERT INTO active_sessions (user_id, username, role, last_seen, ip_address) "
-                "VALUES (%s, %s, %s, NOW(), %s) "
-                "ON CONFLICT (user_id) DO UPDATE SET last_seen = NOW(), "
-                "role = EXCLUDED.role, username = EXCLUDED.username, "
-                "ip_address = EXCLUDED.ip_address",
-                (user_id, user_data["username"], user_data["role"], get_client_ip(request))
-            )
-        except Exception:
-            pass
+        # FR-31: Refresh last_seen for active session tracking (throttled to 60s per user)
+        if _should_update_last_seen(user_id):
+            try:
+                pg_service.execute(
+                    "INSERT INTO active_sessions (user_id, username, role, last_seen, ip_address) "
+                    "VALUES (%s, %s, %s, NOW(), %s) "
+                    "ON CONFLICT (user_id) DO UPDATE SET last_seen = NOW(), "
+                    "role = EXCLUDED.role, username = EXCLUDED.username, "
+                    "ip_address = EXCLUDED.ip_address",
+                    (user_id, user_data["username"], user_data["role"], get_client_ip(request))
+                )
+            except Exception:
+                pass
         return user_data
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token has expired")

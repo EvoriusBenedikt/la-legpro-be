@@ -21,7 +21,7 @@ Conventions for call sites (M3):
 
 Env:
   DATABASE_URL  full libpq-style URL (default targets the compose service)
-  PG_POOL_MIN / PG_POOL_MAX  pool bounds (default 2 / 10)
+  PG_POOL_MIN / PG_POOL_MAX  pool bounds (default 4 / 25)
 """
 import os
 from contextlib import contextmanager
@@ -45,8 +45,8 @@ def get_pool() -> ConnectionPool:
     if _pool is None:
         _pool = ConnectionPool(
             DATABASE_URL,
-            min_size=int(os.getenv("PG_POOL_MIN", "2")),
-            max_size=int(os.getenv("PG_POOL_MAX", "10")),
+            min_size=int(os.getenv("PG_POOL_MIN", "4")),
+            max_size=int(os.getenv("PG_POOL_MAX", "25")),
             kwargs={"row_factory": dict_row},
             open=True,
         )

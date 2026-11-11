@@ -50,6 +50,8 @@ services:
       - ENABLE_DOCS=${ENABLE_DOCS:-false}
       # Migration M1: PostgreSQL + pgvector (compose interpolation reads la-legpro-be/.env)
       - DATABASE_URL=postgresql://legpro:${POSTGRES_PASSWORD:-legpro}@postgres:5432/legpro
+      - PG_POOL_MIN=${PG_POOL_MIN:-4}
+      - PG_POOL_MAX=${PG_POOL_MAX:-25}
       # Migration M3: huggingface.co is unreachable from this network (corporate
       # SNI/DNS block), so the embedder + reranker weights are vendored in the
       # mounted ./data/models dir (fetched once from ModelScope mirrors of the

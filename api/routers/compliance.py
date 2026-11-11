@@ -8,6 +8,7 @@ from pydantic import BaseModel, field_validator
 import auth
 from fastapi.concurrency import run_in_threadpool
 from services import pg_service, rate_limit
+from services import favorability
 from services.llm_client import call_glm, extract_json
 
 # M3 migration note: SQLite (legal_metadata.db) and ChromaDB are replaced by
@@ -52,15 +53,19 @@ async def upload_document(
     if file_size > MAX_FILE_SIZE:
         raise HTTPException(status_code=413, detail="File too large (max 50MB)")
         
-    import uuid
-    
+    clean_filename = os.path.basename(file.filename)
+    if not clean_filename or clean_filename in ('.', '..'):
+        raise HTTPException(status_code=400, detail="Nama file tidak valid.")
+
     # Setup directories
     pdfs_dir = os.path.join(BASE_DIR, "data", "pdfs")
     os.makedirs(pdfs_dir, exist_ok=True)
     
-    file_path = os.path.join(pdfs_dir, file.filename)
+    unique_prefix = str(uuid.uuid4())[:8]
+    stored_filename = f"{unique_prefix}_{clean_filename}"
+    file_path = os.path.join(pdfs_dir, stored_filename)
     
-    # Save physical file temporarily
+    # Save physical file
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
         
@@ -68,8 +73,8 @@ async def upload_document(
         # ── Proceed with Saving Metadata (schema owned by migrations/) ───────
                       
         # Generate ID and Metadata
-        doc_id = str(uuid.uuid4())[:8]
-        judul = file.filename.replace('.pdf', '')
+        doc_id = unique_prefix
+        judul = clean_filename.replace('.pdf', '')
         nomor = f"CUSTOM-{doc_id}"
         
         if doc_type == "internal":
@@ -97,19 +102,24 @@ async def upload_document(
         # for the Riwayat Unggahan tab; pipeline transitions in repository.py
         # update it (awaiting_approval / auto_approved / failed_* / ...).
         from services.db_service import log_upload_intake
-        log_upload_intake(doc_id, file.filename, judul, current_user)
+        log_upload_intake(doc_id, clean_filename, judul, current_user)
         
         # Launch async background task for actual text extraction and chunking
         from routers.repository import process_document_background
         from services import task_queue
-        task_queue.enqueue(doc_id, "parse", f"Parsing (AI Review): {file.filename}", file.filename,
-                           (file_path, doc_id, file.filename, nomor, jenis, sektor, status, klasifikasi),
+        task_queue.enqueue(doc_id, "parse", f"Parsing (AI Review): {clean_filename}", clean_filename,
+                           (file_path, doc_id, clean_filename, nomor, jenis, sektor, status, klasifikasi),
                            uploader=current_user.get("username"))
-        background_tasks.add_task(process_document_background, file_path, doc_id, file.filename, nomor, jenis, sektor, status, klasifikasi)
+        background_tasks.add_task(process_document_background, file_path, doc_id, clean_filename, nomor, jenis, sektor, status, klasifikasi)
         
         return {"status": "success", "message": "Dokumen berhasil diunggah dan sedang diproses di latar belakang."}
         
     except Exception as e:
+        if os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except Exception:
+                pass
         print(f"Upload error: {e}")
         raise HTTPException(status_code=500, detail="Terjadi kesalahan saat memproses dokumen.")
 
@@ -384,7 +394,8 @@ async def analyze_pasals(
         return {"pasals": [], "error": str(e)}
 
 
-def process_single_pasal(c, doc_type, pihak_1, pihak_2, sektor, pokok, COSINE_THRESHOLD, uid, excluded, report_id):
+def process_single_pasal(c, doc_type, pihak_1, pihak_2, sektor, pokok, COSINE_THRESHOLD, uid, excluded, report_id,
+                         pihak_kita_nama="", peran_kita=None):
     pasal_label = c.get("pasal", "Pasal")
     desc = c.get("deskripsi", "")
     if not desc or len(desc) < 10:
@@ -449,14 +460,19 @@ def process_single_pasal(c, doc_type, pihak_1, pihak_2, sektor, pokok, COSINE_TH
                     print(f"  [Relevance] {reg_name} rejected for {pasal_label}")
 
     if not relevant_refs:
+        # No regulation matched: no LLM call here, so the commercial-position
+        # fields start neutral and are filled later by the batched sweep
+        # (favorability.sweep) — otherwise price/term/liability clauses, the
+        # ones where "is this good for us?" matters most, would stay blank.
         return {
             "pasal": pasal_label,
-            "isi_pasal": desc[:500],
+            "isi_pasal": desc,
             "status": "TIDAK DIATUR",
             "penjelasan": "Tidak ditemukan regulasi yang secara langsung relevan dengan klausul ini dalam database saat ini.",
             "rekomendasi": "Pastikan klausul ini wajar secara keperdataan dan tidak bertentangan dengan KUH Perdata.",
             "ai_analysis": "",
-            "supporting_regulations": supporting_regulations
+            "supporting_regulations": supporting_regulations,
+            **favorability.empty_position(),
         }
 
     combined_regs = "\n\n".join(relevant_refs)
@@ -484,13 +500,23 @@ def process_single_pasal(c, doc_type, pihak_1, pihak_2, sektor, pokok, COSINE_TH
         "   - SESUAI: klausul patuh dan tidak berisiko\n"
         "   - BERESIKO: klausul perlu perbaikan atau klarifikasi\n"
         "   - FATAL: klausul melanggar ketentuan wajib regulasi\n\n"
+
+        # Commercial position is a SECOND axis (2026-11-11): instruction 3 stays
+        # untouched so `penjelasan` remains comparable with reports analyzed
+        # before this feature; the plus/minus verdict is additive.
+        + favorability.position_prompt_block(pihak_kita_nama or pihak_1, peran_kita) +
+
         "Kembalikan HANYA JSON berikut (tanpa markdown, tanpa teks lain):\n"
         '{\n'
         '  "status": "SESUAI" | "BERESIKO" | "FATAL",\n'
         '  "pasal_regulasi_terkait": "misal: Pasal 15 ayat (3) PP 45/2015",\n'
         '  "penjelasan": "penjelasan spesifik 1-2 kalimat merujuk regulasi",\n'
         '  "rekomendasi": "saran perbaikan konkret (kosongkan jika SESUAI)",\n'
-        '  "ai_analysis": "dampak bisnis jangka panjang (isi hanya jika BERESIKO atau FATAL)"\n'
+        '  "ai_analysis": "dampak bisnis jangka panjang (isi hanya jika BERESIKO atau FATAL)",\n'
+        '  "kelebihan": [{"poin": "...", "alasan": "...", "dasar": "hukum"}],\n'
+        '  "kekurangan": [{"poin": "...", "alasan": "...", "dasar": "komersial"}],\n'
+        '  "posisi_perusahaan": "MENGUNTUNGKAN" | "NETRAL" | "MERUGIKAN",\n'
+        '  "catatan_posisi": "satu kalimat"\n'
         '}'
     )
 
@@ -508,35 +534,255 @@ def process_single_pasal(c, doc_type, pihak_1, pihak_2, sektor, pokok, COSINE_TH
         elif "TIDAK DIATUR" in status_raw: status_final = "TIDAK DIATUR"
         else:                              status_final = "BERESIKO"
 
-        return {
+        return favorability.apply_position({
             "pasal": pasal_label,
-            "isi_pasal": desc[:500],
+            "isi_pasal": desc,
             "status": status_final,
             "pasal_regulasi_terkait": ans.get("pasal_regulasi_terkait", ""),
             "penjelasan": ans.get("penjelasan", "Gagal diverifikasi"),
             "rekomendasi": ans.get("rekomendasi", ""),
             "ai_analysis": ans.get("ai_analysis", ""),
             "supporting_regulations": supporting_regulations
-        }
+        }, ans)
 
     except HTTPException as e:
         print(f"[Compliance] Verification HTTP error: {e.detail}")
         return {
-            "pasal": pasal_label, "isi_pasal": desc[:500], "status": "ERROR",
+            "pasal": pasal_label, "isi_pasal": desc, "status": "ERROR",
             "pasal_regulasi_terkait": "",
             "penjelasan": "Layanan AI sedang mengalami gangguan koneksi sementara. Silakan coba lagi dalam beberapa saat.",
             "rekomendasi": "Coba ulang analisis.",
-            "ai_analysis": "", "supporting_regulations": supporting_regulations
+            "ai_analysis": "", "supporting_regulations": supporting_regulations,
+            **favorability.empty_position(),
         }
     except Exception as e:
         print(f"[Compliance] Parsing error for {pasal_label}: {e}")
         return {
-            "pasal": pasal_label, "isi_pasal": desc[:500], "status": "ERROR",
+            "pasal": pasal_label, "isi_pasal": desc, "status": "ERROR",
             "pasal_regulasi_terkait": "",
             "penjelasan": "Format respons LLM tidak valid.",
             "rekomendasi": "-",
-            "ai_analysis": "", "supporting_regulations": supporting_regulations
+            "ai_analysis": "", "supporting_regulations": supporting_regulations,
+            **favorability.empty_position(),
         }
+
+def extract_docx_content(file_path: str, filename: str, use_ocr: bool = False) -> str:
+    """
+    Extracts text from DOCX documents with robust multi-layer handling:
+    1. Standard paragraphs, table cells, Content Controls (w:sdt), floating textboxes (w:txbxContent),
+       headers/footers, and DrawingML shapes in natural document order.
+    2. Scanned pages / embedded images in word/media/:
+       If extracted text < 100 chars (scanned document / image-heavy docx),
+       extracts page images in document sequence, normalizes them via Pillow (supporting PNG, JPEG,
+       single/multi-page TIFF, BMP, GIF, WEBP), and passes them through VLM in parallel.
+    3. Fallback to PyMuPDF rendering if images are vector metafiles (EMF/WMF) or non-standard DOCX.
+    """
+    import io
+    import re
+    import docx
+    import zipfile
+    import xml.etree.ElementTree as ET
+    from PIL import Image
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+    from services.llm_client import call_glm_vision, VLM_PAGE_PROMPT, vlm_extract_page_image
+    from services.rag_service import extract_text_hybrid
+
+    try:
+        fsize = os.path.getsize(file_path)
+    except Exception:
+        fsize = -1
+    print(f"  [DOCX] Inspecting {filename} ({fsize} bytes, use_ocr={use_ocr})")
+
+    # If a PDF was renamed to .docx, route to hybrid PDF extractor
+    try:
+        with open(file_path, "rb") as fh:
+            magic = fh.read(5)
+        if magic == b"%PDF-":
+            print(f"  [DOCX] File {filename} has %PDF- header; routing to extract_text_hybrid")
+            return extract_text_hybrid(file_path, force_vlm=use_ocr)
+    except Exception:
+        pass
+
+    full_text = []
+    seen_snippets = set()
+
+    def _add_line(txt: str):
+        cleaned = txt.strip()
+        if cleaned:
+            full_text.append(cleaned)
+            seen_snippets.add(cleaned)
+
+    # 1. Standard paragraphs and tables in natural document body order
+    try:
+        doc = docx.Document(file_path)
+        for child in doc.element.body:
+            tag = child.tag.split('}')[-1]
+            if tag == 'p':
+                p = Paragraph(child, doc)
+                _add_line(p.text)
+            elif tag == 'tbl':
+                tbl = Table(child, doc)
+                for row in tbl.rows:
+                    row_data = [cell.text.strip().replace('\n', ' ') for cell in row.cells if cell.text.strip()]
+                    if row_data:
+                        _add_line(" | ".join(row_data))
+
+        # Walk any remaining w:p in body (captures w:sdt, w:txbxContent, v:textbox)
+        try:
+            for p_elem in doc.element.xpath('.//w:p'):
+                txt = "".join(p_elem.xpath('.//w:t/text()')).strip()
+                if txt and txt not in seen_snippets:
+                    _add_line(txt)
+        except Exception as xe:
+            print(f"  [DOCX] w:p xpath scan warning: {xe}")
+
+        # DrawingML shapes text (a:p / a:t)
+        try:
+            for p_elem in doc.element.xpath('.//a:p'):
+                txt = "".join(p_elem.xpath('.//a:t/text()')).strip()
+                if txt and txt not in seen_snippets:
+                    _add_line(txt)
+        except Exception:
+            pass
+
+        # Headers & footers
+        try:
+            for section in doc.sections:
+                for hf in (section.header, section.footer):
+                    if hf:
+                        for p in hf.paragraphs:
+                            if p.text.strip() and p.text.strip() not in seen_snippets:
+                                _add_line(p.text)
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"  [DOCX] Standard text parser error for {filename}: {e}")
+
+    extracted_text = "\n".join(full_text).strip()
+    print(f"  [DOCX] Native XML text extracted: {len(extracted_text)} chars")
+
+    # Native digital DOCX with substantial XML text is already lossless — return directly
+    if len(extracted_text) >= 100:
+        return extracted_text
+
+    # 2. Embedded image extraction (scanned DOCX fallback or forced OCR)
+    try:
+        if zipfile.is_zipfile(file_path):
+            with zipfile.ZipFile(file_path, 'r') as z:
+                rels_map = {}
+                if 'word/_rels/document.xml.rels' in z.namelist():
+                    rels_root = ET.fromstring(z.read('word/_rels/document.xml.rels'))
+                    for rel in rels_root:
+                        rid = rel.get('Id')
+                        target = rel.get('Target', '')
+                        if 'media/' in target:
+                            if not target.startswith('word/'):
+                                target = 'word/' + target.lstrip('/')
+                            rels_map[rid] = target
+
+                ordered_images = []
+                if 'word/document.xml' in z.namelist():
+                    doc_root = ET.fromstring(z.read('word/document.xml'))
+                    for elem in doc_root.iter():
+                        for attr_val in elem.attrib.values():
+                            if attr_val in rels_map:
+                                img_path = rels_map[attr_val]
+                                if img_path in z.namelist() and img_path not in ordered_images:
+                                    ordered_images.append(img_path)
+
+                all_media = [
+                    f for f in z.namelist()
+                    if f.startswith('word/media/')
+                ]
+                def natural_sort_key(s):
+                    return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', s)]
+                all_media.sort(key=natural_sort_key)
+
+                for img in all_media:
+                    if img not in ordered_images:
+                        ordered_images.append(img)
+
+                media_summary = [(m, z.getinfo(m).file_size) for m in ordered_images]
+                print(f"  [DOCX] Found {len(ordered_images)} media item(s) in archive: {media_summary[:15]}")
+
+                # Filter out tiny decorative icons (< 10KB)
+                candidate_images = [img for img in ordered_images if z.getinfo(img).file_size > 10000]
+
+                # Convert candidate images (including multi-frame TIFFs) into normalized PNG base64 pages
+                page_b64_list: list[str] = []
+                for img_name in candidate_images:
+                    if len(page_b64_list) >= 30:
+                        break
+                    try:
+                        raw_bytes = z.read(img_name)
+                        with Image.open(io.BytesIO(raw_bytes)) as pil_img:
+                            n_frames = getattr(pil_img, "n_frames", 1)
+                            for frame_idx in range(min(n_frames, 30 - len(page_b64_list))):
+                                if n_frames > 1:
+                                    pil_img.seek(frame_idx)
+                                rgb_img = pil_img.convert("RGB")
+                                # Skip tiny dimensions (e.g. banners/logos < 150px high)
+                                if rgb_img.width < 150 or rgb_img.height < 150:
+                                    continue
+                                rgb_img.thumbnail((2200, 2200), Image.Resampling.LANCZOS)
+                                out_buf = io.BytesIO()
+                                rgb_img.save(out_buf, format="PNG", optimize=True)
+                                page_b64_list.append(base64.b64encode(out_buf.getvalue()).decode("utf-8"))
+                    except Exception as img_err:
+                        print(f"  [DOCX] Pillow could not decode {img_name}: {img_err}")
+
+                if page_b64_list:
+                    print(f"  [DOCX->VLM] Submitting {len(page_b64_list)} normalized page image(s) to VLM...")
+                    def _ocr_page(args: tuple[int, str]) -> tuple[int, str]:
+                        idx, b64_data = args
+                        try:
+                            txt = call_glm_vision(b64_data, VLM_PAGE_PROMPT, timeout=75)
+                            if txt and txt.strip():
+                                print(f"    [DOCX->VLM] Page {idx}/{len(page_b64_list)} extracted ({len(txt.strip())} chars)")
+                                return idx, f"--- Halaman {idx} ---\n{txt.strip()}"
+                        except Exception as ve:
+                            print(f"    [DOCX->VLM] Page {idx} error: {ve}")
+                        return idx, ""
+
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                        results = list(pool.map(_ocr_page, enumerate(page_b64_list, start=1)))
+
+                    results.sort(key=lambda x: x[0])
+                    vlm_pages_text = [text for _, text in results if text]
+                    if vlm_pages_text:
+                        combined_vlm = "\n\n".join(vlm_pages_text)
+                        if extracted_text:
+                            return f"{extracted_text}\n\n{combined_vlm}"
+                        return combined_vlm
+    except Exception as ze:
+        print(f"  [DOCX] Embedded image extraction error for {filename}: {ze}")
+
+    # 3. Final fallback: PyMuPDF direct document page rendering (handles EMF/WMF or complex layouts)
+    try:
+        import fitz
+        fitz_doc = fitz.open(file_path)
+        if len(fitz_doc) > 0:
+            print(f"  [DOCX->PyMuPDF] Rendering {len(fitz_doc)} page(s) via PyMuPDF fallback...")
+            vlm_pages = []
+            for pno in range(min(len(fitz_doc), 25)):
+                page = fitz_doc.load_page(pno)
+                p_txt = page.get_text("text").strip()
+                if len(p_txt) >= 80 and not use_ocr:
+                    vlm_pages.append(p_txt)
+                else:
+                    b64_img = vlm_extract_page_image(page)
+                    ocr_txt = call_glm_vision(b64_img, VLM_PAGE_PROMPT, timeout=75)
+                    if ocr_txt and ocr_txt.strip():
+                        vlm_pages.append(f"--- Halaman {pno + 1} ---\n{ocr_txt.strip()}")
+            fitz_doc.close()
+            if vlm_pages:
+                return "\n\n".join(vlm_pages)
+    except Exception as fe:
+        print(f"  [DOCX->PyMuPDF] Fallback error: {fe}")
+
+    return extracted_text
+
 
 def extract_text_multi_format(file_path: str, filename: str, use_ocr: bool = False) -> str:
     from services.rag_service import extract_text_hybrid
@@ -570,26 +816,12 @@ def extract_text_multi_format(file_path: str, filename: str, use_ocr: bool = Fal
         print(f"  [VLM] Image extraction for {filename}")
         with open(file_path, "rb") as f:
             img_b64 = base64.b64encode(f.read()).decode('utf-8')
-        vlm_text = call_glm_vision(img_b64, VLM_PAGE_PROMPT, timeout=60)
+        mime = f"image/{'png' if ext == 'png' else 'jpeg'}"
+        vlm_text = call_glm_vision(img_b64, VLM_PAGE_PROMPT, timeout=60, mime_type=mime)
         return vlm_text.strip()
         
     elif ext == 'docx':
-        try:
-            import docx
-            doc = docx.Document(file_path)
-            full_text = []
-            for para in doc.paragraphs:
-                if para.text.strip():
-                    full_text.append(para.text.strip())
-            for table in doc.tables:
-                for row in table.rows:
-                    row_data = [cell.text.strip() for cell in row.cells if cell.text.strip()]
-                    if row_data:
-                        full_text.append(" | ".join(row_data))
-            return "\n".join(full_text)
-        except Exception as e:
-            print(f"Error parsing DOCX: {e}")
-            return ""
+        return extract_docx_content(file_path, filename, use_ocr=use_ocr)
             
     elif ext == 'pptx':
         try:
@@ -631,6 +863,8 @@ async def check_compliance(
     file: UploadFile = File(...),
     use_ocr: str = Form("false"),
     report_id: str | None = Form(None),   # B3: current workspace; None => no narrowing
+    pihak_kita: str = Form("pertama"),    # "pertama" | "kedua" — whose side we score
+    peran_kita: str | None = Form(None),  # Penyedia | Pelanggan | Pemberi Kerja | Penerima Kerja
     current_user: dict = Depends(auth.require_role("pengguna")),
     _rl: dict = Depends(rate_limit.llm_rate_limit("check_compliance")),
 ):
@@ -659,7 +893,10 @@ async def check_compliance(
         raise HTTPException(status_code=413, detail="File too large (max 50MB)")
 
     upload_id = str(uuid.uuid4())[:8]
-    temp_path = os.path.join(PDFS_DIR, f"temp_check_{upload_id}_{file.filename}")
+    clean_filename = os.path.basename(file.filename)
+    if not clean_filename or clean_filename in ('.', '..'):
+        raise HTTPException(status_code=400, detail="Nama file tidak valid.")
+    temp_path = os.path.join(PDFS_DIR, f"temp_check_{upload_id}_{clean_filename}")
 
     with open(temp_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
@@ -681,12 +918,12 @@ async def check_compliance(
         print(f"[Compliance] Starting extraction for: {file.filename}")
         is_ocr = use_ocr.lower() == "true"
         full_text = extract_text_multi_format(temp_path, file.filename, use_ocr=is_ocr)
-        text_snippet = full_text[:35000]
+        text_snippet = full_text[:250000]
 
         if len(text_snippet.strip()) < 100:
             raise HTTPException(
                 status_code=400,
-                detail="Dokumen tidak dapat dibaca. Coba unggah ulang atau pastikan PDF tidak terenkripsi."
+                detail="Dokumen tidak dapat dibaca atau teks kurang dari 100 karakter. Jika dokumen berupa pindaian (scan) atau gambar dalam DOCX/PDF, pastikan gambar terbaca jelas atau aktifkan opsi OCR."
             )
 
         # ── Pass 0A: Document Metadata Understanding ──────────────────────
@@ -697,6 +934,16 @@ async def check_compliance(
         pihak_2  = doc_ctx.get("pihak_kedua", "Pihak Kedua")
         sektor   = doc_ctx.get("sektor_bisnis", "umum")
         pokok    = doc_ctx.get("pokok_perjanjian", "")
+
+        # ── Whose side are we scoring? (2026-11-11) ───────────────────────
+        # The upload modal sends a POSITION ("pertama"/"kedua"), because the
+        # literal party names only exist after this metadata pass. Unknown
+        # values fall back to the first party so an old client never breaks.
+        posisi_raw = (pihak_kita or "pertama").strip().lower()
+        pihak_kita_key = "kedua" if posisi_raw == "kedua" else "pertama"
+        pihak_kita_nama = pihak_2 if pihak_kita_key == "kedua" else pihak_1
+        peran_kita_clean = favorability.normalize_peran(peran_kita)
+        print(f"[Compliance] Scoring position for: {pihak_kita_nama} ({peran_kita_clean or 'peran tidak ditentukan'})")
 
         # ── Pass 0B: Dedicated signing date extraction ────────────────────
         print("[Compliance] Pass 0B: Extracting signing date...")
@@ -723,13 +970,13 @@ async def check_compliance(
             tanggal_berakhir = extract_explicit_end_date(full_text)
 
         # ── Pass 1: Clause Extraction ─────────────────────────────────────
-        print("[Compliance] Pass 1: Extracting clauses...")
-        pasal_items = extract_pasal_items(text_snippet, max_items=20, max_chars_per_pasal=1200)
+        print("[Compliance] Pass 1: Extracting clauses & sections...")
+        pasal_items = extract_pasal_items(text_snippet, max_items=80, max_chars_per_pasal=4000)
 
         # Fallback to LLM extractor for non-standard contracts
         if len(pasal_items) < 2:
             print("[Compliance] Regex found <2 clauses, falling back to LLM extractor...")
-            pasal_items = llm_extract_pasal_items(full_text, max_items=20)
+            pasal_items = llm_extract_pasal_items(full_text, max_items=80)
 
         # Final fallback: treat whole document as one unit
         if not pasal_items:
@@ -746,13 +993,25 @@ async def check_compliance(
         rid = report_id if report_id else None   # B3: '' / None => no narrowing
 
         def worker(c):
-            return process_single_pasal(c, doc_type, pihak_1, pihak_2, sektor, pokok, COSINE_THRESHOLD, uid, excluded, rid)
+            return process_single_pasal(c, doc_type, pihak_1, pihak_2, sektor, pokok,
+                                        COSINE_THRESHOLD, uid, excluded, rid,
+                                        pihak_kita_nama, peran_kita_clean)
 
         results = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-            for res in executor.map(worker, pasal_items[:20]):
+            for res in executor.map(worker, pasal_items[:80]):
                 if res:
                     results.append(res)
+
+        # ── Pass 3: Commercial-position sweep ────────────────────────────
+        # TIDAK DIATUR clauses return before any LLM call, so they carry
+        # neutral placeholders. Fill them in batches; a failure here must never
+        # fail the analysis, so it is logged and swallowed.
+        try:
+            filled = favorability.sweep(results, doc_type, pihak_kita_nama, peran_kita_clean)
+            print(f"[Compliance] Position sweep filled {filled} clause(s)")
+        except Exception as e:
+            print(f"[Compliance] Position sweep skipped: {e}")
 
         # ── Pass 4: Document-Level Summary ───────────────────────────────
         fatal_count        = sum(1 for r in results if r["status"] == "FATAL")
@@ -763,6 +1022,13 @@ async def check_compliance(
         # Calculate score only against regulated clauses
         regulated_count = len(results) - tidak_diatur_count
         skor = round((sesuai_count / max(regulated_count, 1)) * 100) if regulated_count > 0 else 100
+
+        # Commercial position tally (independent of the compliance score; a
+        # lawful clause can still be one-sided).
+        menguntungkan_count = sum(1 for r in results if r.get("posisi_perusahaan") == "MENGUNTUNGKAN")
+        merugikan_count     = sum(1 for r in results if r.get("posisi_perusahaan") == "MERUGIKAN")
+        netral_count        = len(results) - menguntungkan_count - merugikan_count
+        skor_posisi = round(((menguntungkan_count - merugikan_count) / max(len(results), 1)) * 100)
 
         summary = {
             "jenis_dokumen": doc_type,
@@ -775,11 +1041,19 @@ async def check_compliance(
             "sesuai": sesuai_count,
             "beresiko": beresiko_count,
             "fatal": fatal_count,
+            "tidak_diatur": tidak_diatur_count,
             "skor_kepatuhan": skor,
+            "pihak_kita": pihak_kita_nama,
+            "peran_kita": peran_kita_clean,
+            "klausul_menguntungkan": menguntungkan_count,
+            "klausul_merugikan": merugikan_count,
+            "klausul_netral": netral_count,
+            "skor_posisi": skor_posisi,
         }
 
         print(f"[Compliance] Done. Score: {summary['skor_kepatuhan']}% | "
-              f"SESUAI={sesuai_count} BERESIKO={beresiko_count} FATAL={fatal_count}")
+              f"SESUAI={sesuai_count} BERESIKO={beresiko_count} FATAL={fatal_count} | "
+              f"posisi: +{menguntungkan_count} / -{merugikan_count} / ={netral_count}")
 
         return {"report": results, "summary": summary}
 

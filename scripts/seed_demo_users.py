@@ -37,6 +37,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from services import pg_service  # noqa: E402  (import path mirrors uvicorn api.main)
 
 ROSTER = [
+    ("pengguna", "pengguna"),
+    ("manajer", "manajer"),
+    ("direktur", "direktur"),
+    ("admin", "admin"),
+    ("sekretaris", "sekretaris perusahaan"),
+    ("insinyur", "insinyur ti"),
+    ("dewa", "dewa"),
     ("demoacc", "sekretaris perusahaan"),
     ("demoaccc", "sekretaris perusahaan"),
     ("smoke_kg", "manajer"),
@@ -50,8 +57,8 @@ def hash_pw(password: str) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--password", default=os.environ.get("SEED_PASSWORD", ""),
-                        help="password for every seeded account (or SEED_PASSWORD env)")
+    parser.add_argument("--password", default=os.environ.get("SEED_PASSWORD", "DemoAcc!2026"),
+                        help="password for every seeded account (default: DemoAcc!2026 or SEED_PASSWORD env)")
     parser.add_argument("--users", default="",
                         help="comma-separated subset of the roster to seed; "
                              "usernames outside the roster are created with --role")
@@ -88,8 +95,8 @@ def main() -> int:
             reset += 1
             continue
         pg_service.execute(
-            "INSERT INTO users (id, username, password_hash, email, role) "
-            "VALUES (%s, %s, %s, %s, %s)",
+            "INSERT INTO users (id, username, password_hash, email, role, is_active, email_verified) "
+            "VALUES (%s, %s, %s, %s, %s, TRUE, TRUE)",
             (str(uuid.uuid4()), username, hash_pw(args.password),
              f"{username}@{args.email_domain}", role),
         )

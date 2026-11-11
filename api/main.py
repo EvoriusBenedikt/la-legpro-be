@@ -37,7 +37,7 @@ import internal_docs
 import templates
 from routers import admin, admin_access_grants, engineer
 from routers import chat, chat_attachments, repository, knowledge_graph
-from routers import compliance, scraper, taxonomy, rag_sources
+from routers import compliance, scraper, taxonomy, rag_sources, editor
 from routers.notification import router as notification_router
 from services.app_config import docs_kwargs
 from services.app_state import API_STATS
@@ -57,14 +57,24 @@ app = FastAPI(title="Legal Analyzer API", **docs_kwargs())
 
 @app.middleware("http")
 async def track_api_stats(request, call_next):
-    route = request.url.path
-    if route not in API_STATS:
-        API_STATS[route] = {"total": 0, "errors": 0}
-    API_STATS[route]["total"] += 1
-    response = await call_next(request)
-    if response.status_code >= 400:
-        API_STATS[route]["errors"] += 1
-    return response
+    status_code = 200
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        return response
+    except Exception:
+        status_code = 500
+        raise
+    finally:
+        route_obj = request.scope.get("route")
+        route = route_obj.path if (route_obj and hasattr(route_obj, "path")) else ("(unmatched)" if status_code == 404 else request.url.path)
+        if route not in API_STATS:
+            if len(API_STATS) < 300:
+                API_STATS[route] = {"total": 0, "errors": 0}
+        if route in API_STATS:
+            API_STATS[route]["total"] += 1
+            if status_code >= 400:
+                API_STATS[route]["errors"] += 1
 
 
 # ── Liveness probe for container healthchecks ───────────────────────────────
@@ -130,7 +140,8 @@ def sweep_stale_chat_attachments():
         print(f"[Startup] Chat-attachment sweep failed: {e}")
 
 # ── Init DB for metadata ────────────────────────────────────────────────────
-init_main_db()
+if not os.environ.get("PYTEST_CURRENT_TEST"):
+    init_main_db()
 
 app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
 app.include_router(history.router, prefix="/api", tags=["history"])
@@ -148,6 +159,7 @@ app.include_router(compliance.router)
 # rag_sources.router carries prefix="/api" on the router object (like
 # repository/compliance), so it is included with NO prefix= kwarg.
 app.include_router(rag_sources.router)
+app.include_router(editor.router)
 app.include_router(taxonomy.router, prefix="/api", tags=["taxonomy"])
 app.include_router(scraper.router, prefix="/api", tags=["scraper"])
 app.include_router(notification_router, prefix="/api", tags=["notification"])

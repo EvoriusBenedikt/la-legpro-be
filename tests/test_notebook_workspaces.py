@@ -93,6 +93,8 @@ def test_create_empty_workspace_appears_as_zero_doc_card(hist_client, mint_token
     assert len(mine) == 1
     assert mine[0]["document_count"] == 0
     assert mine[0]["company_name"] == "Proyek Alpha"
+    assert "recent_documents" in mine[0]
+    assert isinstance(mine[0]["recent_documents"], list)
 
 
 def test_create_default_and_blank_names(hist_client, mint_token, make_user):
@@ -211,5 +213,47 @@ def test_legacy_document_rooted_notebook_untouched(hist_client, mint_token, make
     assert hist_client.delete(f"/api/compliance-history/{root_id}", headers=headers).status_code == 200
     assert pg_service.query_one("SELECT id FROM compliance_history WHERE id = %s", (child_id,)) is None
     assert pg_service.query_one("SELECT id FROM compliance_history WHERE id = %s", (root_id,)) is None
+
+    _clean_reports(uid)
+
+
+def test_rename_workspace_empty_and_populated(hist_client, mint_token, make_user, save_report):
+    uid = make_user("ws_renamer")
+    headers = bearer(mint_token(uid))
+
+    # 1. Rename empty workspace
+    nb_id = hist_client.post("/api/compliance-history/notebooks",
+                             json={"name": "Nama Awal"}, headers=headers).json()["notebook_id"]
+    r = hist_client.put(f"/api/compliance-history/notebooks/{nb_id}",
+                        json={"name": "Nama Baru"}, headers=headers)
+    assert r.status_code == 200
+    assert r.json()["name"] == "Nama Baru"
+
+    row = pg_service.query_one("SELECT name FROM notebooks WHERE id = %s", (nb_id,))
+    assert row["name"] == "Nama Baru"
+
+    # 2. Blank name fails 400
+    r_bad = hist_client.put(f"/api/compliance-history/notebooks/{nb_id}",
+                            json={"name": "   "}, headers=headers)
+    assert r_bad.status_code == 400
+
+    # 3. Foreign user cannot rename -> 404
+    intruder = make_user("ws_intruder_rename")
+    intruder_h = bearer(mint_token(intruder))
+    assert hist_client.put(f"/api/compliance-history/notebooks/{nb_id}",
+                           json={"name": "Hacked"}, headers=intruder_h).status_code == 404
+
+    # 4. Rename populated workspace
+    body = save_report()
+    body["notebook_id"] = nb_id
+    hist_client.post("/api/compliance-history", json=body, headers=headers)
+
+    r_pop = hist_client.put(f"/api/compliance-history/notebooks/{nb_id}",
+                            json={"name": "Workspace Final"}, headers=headers)
+    assert r_pop.status_code == 200
+    cards = hist_client.get("/api/compliance-history/notebooks", headers=headers).json()["notebooks"]
+    mine = [c for c in cards if c["id"] == nb_id]
+    assert len(mine) == 1
+    assert mine[0]["company_name"] == "Workspace Final"
 
     _clean_reports(uid)

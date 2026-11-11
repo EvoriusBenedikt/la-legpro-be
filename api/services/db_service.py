@@ -55,6 +55,13 @@ def init_main_db():
                 (name,),
             )
 
+    # Ensure review_status column on compliance_history exists (Migration 022)
+    try:
+        pg_service.execute("ALTER TABLE compliance_history ADD COLUMN IF NOT EXISTS review_status VARCHAR(32) NOT NULL DEFAULT 'draft'")
+        pg_service.execute("CREATE INDEX IF NOT EXISTS idx_compliance_history_review_status ON compliance_history (review_status)")
+    except Exception as e:
+        print(f"Warning: review_status schema ensure: {e}")
+
 
 def log_audit(user_id: str, action_type: str, resource_id: str = "", details: str = ""):
     try:

@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
-import os, re
+import os, re, json
 from typing import List
 from pydantic import BaseModel
 import auth
@@ -21,6 +21,7 @@ class ChatMessage(BaseModel):
 class ChatRequest(BaseModel):
     messages: List[ChatMessage] = []
     report_id: str | None = None   # B3: current workspace; None => no narrowing
+    editor_context: dict | None = None  # Live editor status from client
 
 class ChatResponse(BaseModel):
     answer: str
@@ -32,6 +33,167 @@ class ChatResponse(BaseModel):
 
 class SessionRequest(BaseModel):
     title: str
+
+def _build_document_context(
+    report_row: dict | None,
+    draft_row: dict | None,
+    comments_rows: list | None,
+    editor_context: dict | None = None,
+) -> tuple[str, dict | None]:
+    """Assembles a comprehensive, structured briefing of the active document
+    (Identity, compliance score & risk breakdown, problematic clauses, and editor situation)."""
+    if not report_row:
+        return "", None
+
+    filename = report_row.get("filename") or "Dokumen"
+    company = report_row.get("company_name") or ""
+    exp_date = report_row.get("expiration_date") or ""
+    results_data = {}
+    if report_row.get("results_json"):
+        try:
+            results_data = (
+                json.loads(report_row["results_json"])
+                if isinstance(report_row["results_json"], str)
+                else report_row["results_json"]
+            )
+        except Exception:
+            results_data = {}
+
+    summary = results_data.get("summary") or {}
+    clauses = results_data.get("results") or []
+
+    # 1. Document Identity & Summary
+    doc_info_parts = [
+        f"- Nama Dokumen / File: {filename}",
+    ]
+    if company:
+        doc_info_parts.append(f"- Entitas / Mitra / Label: {company}")
+    if summary.get("jenis_dokumen"):
+        doc_info_parts.append(f"- Jenis Dokumen: {summary['jenis_dokumen']}")
+    if summary.get("pokok_perjanjian"):
+        doc_info_parts.append(f"- Pokok Perjanjian / Inti Kerjasama: {summary['pokok_perjanjian']}")
+    if summary.get("pihak_pertama"):
+        doc_info_parts.append(f"- Pihak Pertama: {summary['pihak_pertama']}")
+    if summary.get("pihak_kedua"):
+        doc_info_parts.append(f"- Pihak Kedua: {summary['pihak_kedua']}")
+    if summary.get("sektor_bisnis"):
+        doc_info_parts.append(f"- Sektor Bisnis: {summary['sektor_bisnis']}")
+    if exp_date or summary.get("tanggal_berakhir"):
+        doc_info_parts.append(f"- Tanggal Berakhir: {exp_date or summary.get('tanggal_berakhir')}")
+
+    # 2. Compliance Score & Risk Breakdown
+    score = summary.get("skor_kepatuhan")
+    sesuai_count = summary.get("sesuai", 0)
+    beresiko_count = summary.get("beresiko", 0)
+    fatal_count = summary.get("fatal", 0)
+    total_klausul = summary.get("total_klausul", len(clauses))
+
+    if not sesuai_count and not beresiko_count and not fatal_count and clauses:
+        sesuai_count = sum(1 for c in clauses if (c.get("status") or "").upper() == "SESUAI")
+        beresiko_count = sum(1 for c in clauses if (c.get("status") or "").upper() == "BERESIKO")
+        fatal_count = sum(1 for c in clauses if (c.get("status") or "").upper() == "FATAL")
+        total_klausul = len(clauses)
+
+    score_parts = [
+        f"- Skor Kepatuhan Keseluruhan: {score if score is not None else 'N/A'}%",
+        f"- Total Klausul Dianalisis: {total_klausul}",
+        f"- Klausul Sesuai (Aman): {sesuai_count}",
+        f"- Klausul Beresiko: {beresiko_count}",
+        f"- Klausul Fatal / Pelanggaran Berat: {fatal_count}",
+    ]
+
+    # 3. Specific Problematic Clauses (Beresiko & Fatal)
+    problem_clauses = [
+        c for c in clauses
+        if (c.get("status") or "").upper() in ("BERESIKO", "FATAL")
+    ]
+    problem_parts = []
+    if problem_clauses:
+        for pc in problem_clauses[:15]:
+            p_title = pc.get("pasal", "Klausul")
+            p_status = (pc.get("status") or "").upper()
+            p_text = (pc.get("isi_pasal") or "").strip()
+            if len(p_text) > 300:
+                p_text = p_text[:297] + "..."
+            p_exp = (pc.get("penjelasan") or "").strip()
+            p_rec = (pc.get("rekomendasi") or "").strip()
+            p_reg = (pc.get("pasal_regulasi_terkait") or "").strip()
+
+            entry = f"• [{p_status}] {p_title}:\n  - Isi Klausul: \"{p_text}\""
+            if p_exp:
+                entry += f"\n  - Analisis Masalah: {p_exp}"
+            if p_rec:
+                entry += f"\n  - Rekomendasi Perbaikan: {p_rec}"
+            if p_reg:
+                entry += f"\n  - Dasar Regulasi Terkait: {p_reg}"
+            problem_parts.append(entry)
+    else:
+        problem_parts.append("Tidak ada klausul yang berstatus Beresiko atau Fatal (Semua klausul dianalisis sebagai Sesuai).")
+
+    # 4. Current Editor Situations (Draft revisions, tracked changes, reviewer comments)
+    editor_parts = []
+    if draft_row and draft_row.get("version"):
+        v = draft_row["version"]
+        u_time = draft_row.get("updated_at") or "Baru saja"
+        editor_parts.append(f"- Status Draf Editor: Tersedia Draf Revisi Aktif (Versi {v}, Terakhir Disimpan: {u_time})")
+        html_body = draft_row.get("content_html") or ""
+        ins_matches = re.findall(r'<ins\b[^>]*>(.*?)</ins>', html_body, re.DOTALL | re.IGNORECASE)
+        del_matches = re.findall(r'<del\b[^>]*>(.*?)</del>', html_body, re.DOTALL | re.IGNORECASE)
+        if ins_matches or del_matches:
+            clean_ins = [re.sub(r'<[^>]+>', '', m).strip() for m in ins_matches if m.strip()][:5]
+            clean_del = [re.sub(r'<[^>]+>', '', m).strip() for m in del_matches if m.strip()][:5]
+            if clean_ins:
+                editor_parts.append(f"- Saran Penambahan Teks (Tracked Insertions): {'; '.join(clean_ins[:3])}")
+            if clean_del:
+                editor_parts.append(f"- Saran Penghapusan Teks (Tracked Deletions): {'; '.join(clean_del[:3])}")
+        else:
+            editor_parts.append("- Perubahan Konten: Teks naskah telah disunting langsung melalui Document Editor.")
+    else:
+        editor_parts.append("- Status Draf Editor: Belum ada draf revisi baru tersimpan (dokumen masih dalam versi asli yang diunggah).")
+
+    if comments_rows:
+        open_cmts = [c for c in comments_rows if c.get("status") == "open"]
+        resolved_cmts = [c for c in comments_rows if c.get("status") == "resolved"]
+        editor_parts.append(f"- Catatan/Komentar Editor: {len(open_cmts)} catatan terbuka (open), {len(resolved_cmts)} telah diselesaikan (resolved).")
+        if open_cmts:
+            top_notes = [f'"{c["selected_text"]}": {c["comment_text"]}' for c in open_cmts[:3] if c.get("comment_text")]
+            if top_notes:
+                editor_parts.append(f"- Catatan Review Utama: {'; '.join(top_notes)}")
+
+    if editor_context:
+        if editor_context.get("has_local_draft"):
+            editor_parts.append("- Catatan Sesi Browser: Terdapat draf revisi aktif di sesi browser pengguna.")
+        if editor_context.get("has_local_comments"):
+            editor_parts.append("- Catatan Sesi Browser: Terdapat catatan review aktif di sesi browser pengguna.")
+
+    doc_context_str = (
+        "\n"
+        "═══════════════════════════════════════════════════════════════════════\n"
+        "INFORMASI DOKUMEN YANG SEDANG DIBUKA OLEH PENGGUNA (CURRENT OPEN DOCUMENT):\n"
+        "═══════════════════════════════════════════════════════════════════════\n"
+        "1. IDENTITAS & RINGKASAN DOKUMEN:\n"
+        + "\n".join(doc_info_parts) + "\n\n"
+        "2. SKOR KEPATUHAN & STATISTIK RISIKO (COMPLIANCE AUDIT):\n"
+        + "\n".join(score_parts) + "\n\n"
+        "3. KLAUSUL BERMASALAH (BERESIKO / FATAL) & REKOMENDASI:\n"
+        + "\n".join(problem_parts) + "\n\n"
+        "4. SITUASI / PERUBAHAN DI EDITOR DOKUMEN (DOCUMENT EDITOR SITUATION):\n"
+        + "\n".join(editor_parts) + "\n"
+        "═══════════════════════════════════════════════════════════════════════\n"
+        "INSTRUKSI KHUSUS UNTUK DOKUMEN INI:\n"
+        "- Anda memiliki pengetahuan LENGKAP dan LANGSUNG mengenai dokumen yang sedang dibuka di atas.\n"
+        "- Saat pengguna bertanya tentang skor kepatuhan, klausul yang berisiko/fatal/sesuai, identitas kontrak, atau revisi di editor, jawablah secara SPESIFIK dan AKURAT berdasarkan data resmi di atas.\n"
+        "- Jika pengguna meminta saran perbaikan atau revisi klausul tertentu, gunakan klausul bermasalah dan rekomendasi di atas sebagai dasar acuan.\n"
+        "- Selalu bersikap responsif dan siap membantu pengguna memperbaiki dokumen ini.\n\n"
+    )
+
+    meta_summary = {
+        "filename": filename,
+        "score": score,
+        "beresiko_count": beresiko_count,
+        "fatal_count": fatal_count,
+    }
+    return doc_context_str, meta_summary
 
 # Migration M3: the module-level ChromaDB client for data/chromadb was
 # vestigial -- that store held only an empty "regulations" collection which
@@ -204,6 +366,38 @@ async def chat_endpoint(
     except Exception as e:
         print(f"Failed to fetch user stats for chatbot: {e}")
 
+    # ── Document Context (when chatbot is opened inside an active document workspace) ──
+    doc_context_str = ""
+    doc_meta = None
+    target_report_id = (req.report_id or "").strip()
+    if target_report_id:
+        try:
+            report_row = pg_service.query_one(
+                "SELECT id, filename, company_name, "
+                "to_char(expiration_date, 'YYYY-MM-DD') AS expiration_date, "
+                "results_json "
+                "FROM compliance_history WHERE id = %s AND user_id = %s",
+                (target_report_id, current_user["id"]),
+            )
+            draft_row = pg_service.query_one(
+                "SELECT version, "
+                "to_char(updated_at, 'YYYY-MM-DD HH24:MI:SS') AS updated_at, "
+                "content_html "
+                "FROM document_editor_drafts WHERE report_id = %s",
+                (target_report_id,),
+            )
+            comments_rows = pg_service.query(
+                "SELECT author_name, selected_text, comment_text, status "
+                "FROM document_editor_comments WHERE report_id = %s "
+                "ORDER BY created_at DESC LIMIT 10",
+                (target_report_id,),
+            )
+            doc_context_str, doc_meta = _build_document_context(
+                report_row, draft_row, comments_rows, req.editor_context
+            )
+        except Exception as e:
+            print(f"Failed to load document context for report_id={target_report_id}: {e}")
+
     # --- Language Detection ---
     # Simple heuristic: count common English function words. If they dominate, the query is English.
     ENGLISH_WORDS = {"the","is","are","what","which","how","does","do","should","i","we","you","in","a","an","of","and","to","for","be","my","can","will","when","where","who","why","if","that","this","it","at","on","with","as","by","from","or","was","has","have","about","pay","creating","making","please","tell","me"}
@@ -283,8 +477,36 @@ async def chat_endpoint(
                 )
                 greeting_title = "Tentang Asisten Legal"
         else:
-            # Regular greeting
-            if user_lang == "english":
+            # Regular greeting (personalized with document context if opened in workspace)
+            if doc_meta:
+                score_val = doc_meta.get("score")
+                score_txt = f"{score_val}%" if score_val is not None else "sedang diproses"
+                beresiko_n = doc_meta.get("beresiko_count", 0)
+                fatal_n = doc_meta.get("fatal_count", 0)
+                risk_txt_parts = []
+                if fatal_n:
+                    risk_txt_parts.append(f"{fatal_n} fatal")
+                if beresiko_n:
+                    risk_txt_parts.append(f"{beresiko_n} beresiko")
+                risk_summary = f" ({', '.join(risk_txt_parts)})" if risk_txt_parts else " (semua klausul sesuai)"
+
+                if user_lang == "english":
+                    greeting_reply = (
+                        f"Hello! 👋 I'm your Legal Assistant for **{doc_meta['filename']}** "
+                        f"(Compliance Score: {score_txt}{risk_summary}).\n\n"
+                        "I have loaded full context of this contract, including its compliance audit, problematic clauses, and editor situation. "
+                        "Feel free to ask about any clause, risk analysis, recommended revisions, or editor draft status!"
+                    )
+                    greeting_title = f"Doc: {doc_meta['filename'][:28]}"
+                else:
+                    greeting_reply = (
+                        f"Halo! 👋 Saya adalah Asisten Legal untuk dokumen **{doc_meta['filename']}** "
+                        f"(Skor Kepatuhan: {score_txt}{risk_summary}).\n\n"
+                        "Saya telah memuat data lengkap dokumen ini: identitas perjanjian, hasil audit kepatuhan, rincian pasal bermasalah, dan situasi draf editor. "
+                        "Silakan tanyakan tentang pasal tertentu, risiko hukum, rekomendasi perbaikan, atau perubahan di editor!"
+                    )
+                    greeting_title = f"Dok: {doc_meta['filename'][:28]}"
+            elif user_lang == "english":
                 greeting_reply = (
                     "Hello! 👋 I'm here to help with your Indonesian legal questions — "
                     "feel free to ask about contracts, regulations, compliance, or anything else "
@@ -311,6 +533,7 @@ async def chat_endpoint(
         "Anda adalah pakar hukum teknologi dan penasihat kontrak di Indonesia.\n\n"
         f"{lang_rule}\n\n"
         f"{user_stats_str}"
+        f"{doc_context_str}"
         "STRICT GUIDELINES (WAJIB DIIKUTI):\n"
         "1. ZERO META-LANGUAGE: Never use phrases like 'Based on the provided context'. Treat legal facts as innate knowledge. Answer confidently like a real legal advisor. (Jangan gunakan frasa seperti 'Berdasarkan konteks').\n"
         "2. CONVERSATIONAL FORMAT: Do not use rigid titles like 'Legal Analysis'. Use a natural, empathetic, and professional flow. Start answers directly with 'Yes', 'No', or 'It depends' (Ya/Tidak/Tergantung). Use short paragraphs, bold text for key terms, and bullet points.\n"

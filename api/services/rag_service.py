@@ -91,30 +91,206 @@ def get_reranker():
                 _cross_encoder = CrossEncoder(model_name, max_length=512)
     return _cross_encoder
 
-def extract_pasal_items(text: str, max_items: int = 20, max_chars_per_pasal: int = 900) -> List[dict]:
+def _normalize_clause_label(raw_label: str) -> str:
+    cleaned = raw_label.strip()
+
+    # If first_line has a clean title with separator like "Lampiran 1: Service Level Agreement" or "Pasal 1: Definisi"
+    if any(sep in cleaned for sep in [":", " - ", " – "]) and len(cleaned) <= 80:
+        return cleaned
+
+    # Normalize OCR-corrupted Pasal numbers: e.g. 2I -> 21, T3 -> 13, IO -> 10, PASAI,6 -> Pasal 6
+    m = re.match(r'^(?:pasal|pasa[il1]|article)[,\s]+([0-9a-z]+)', cleaned, re.I)
+    if m:
+        num = m.group(1).upper()
+        if re.match(r'^[IVXLCDM]+$', num):
+            return f"Pasal {num}"
+        num_clean = (
+            num.replace('O', '0')
+               .replace('I', '1')
+               .replace('L', '1')
+               .replace('T', '1')
+               .replace('S', '5')
+               .replace('B', '8')
+        )
+        if num_clean.isdigit():
+            return f"Pasal {num_clean}"
+        return f"Pasal {num}"
+
+    # Normalize OCR-corrupted Lampiran headers: e.g. I.AM?IRAN I -> Lampiran I, I/TMPIRAN tr -> Lampiran II
+    m_lamp = re.match(
+        r'^(?:lampiran|l[a\.\/\?]+m[p\?]+iran|i[\.\/]?[a\.\/\?]*t?m[p\?]+iran|annex|appendix)(?:\s+([0-9a-z]+))?',
+        cleaned,
+        re.I
+    )
+    if m_lamp:
+        suffix = (m_lamp.group(1) or "").upper()
+        if suffix in ["TR"]:
+            suffix = "II"
+        if suffix:
+            return f"Lampiran {suffix}"
+        return "Lampiran"
+
+    # Procedural flowchart / problem reporting
+    if re.search(r'problem\s+reportin[gq]|prosedur|procedure', cleaned, re.I):
+        return "Prosedur: Pelaporan & Eskalasi"
+
+    # Tables & Matrices
+    if re.match(r'^tabel\b', cleaned, re.I):
+        return cleaned[:50].strip().title()
+    if re.match(r'^matri[kx]s?\b', cleaned, re.I):
+        return cleaned[:50].strip().title()
+    if re.search(r'service\s+(?:level|lrvel|ievel)\s+agreement', cleaned, re.I):
+        return "Lampiran: Service Level Agreement (SLA)"
+    if re.match(r'^(?:formulir|form)\b', cleaned, re.I):
+        return cleaned[:50].strip().title()
+
+    return cleaned[:60].strip().title()
+
+
+_PROSE_WORDS_RE = re.compile(
+    r'\b(?:yang\s+ditandatangani|sebagaimana|merupakan|adalah|tersebut|dimaksud|berdasarkan|apabila|dalam\s+hal|ayat\s*\(\d+\)|ayat\s+\d+|tidak\s+terpisahkan)\b',
+    re.I
+)
+_PREV_PREPOSITION_RE = re.compile(
+    r'\b(?:dalam|pada|pads|sesuai|menurut|berdasarkan|antara|dengan|dari|terhadap|lihat|sebagaimana|oleh)\s*$',
+    re.I
+)
+
+
+def _is_valid_pasal_num(tok: str) -> bool:
+    if not tok or len(tok) > 4:
+        return False
+    if re.match(r'^\d+[A-Za-z]?$', tok):
+        return True
+    if re.match(r'^[IVXLCDM]+$', tok, re.I):
+        return True
+    if len(tok) <= 3 and all(c in '0123456789OIlLTSB' for c in tok.upper()):
+        return True
+    return False
+
+
+def extract_pasal_items(text: str, max_items: int = 80, max_chars_per_pasal: int = 4000) -> List[dict]:
     """
-    Primary: regex-based Pasal extractor (fast, zero API cost).
-    Used as the first attempt. LLM-based extractor is used as fallback in check_compliance.
+    Primary: regex-based Pasal & Lampiran extractor (fast, zero API cost).
+    Extracts Pasal, Lampiran, Ketentuan Tambahan/Penutup, Tables, Matrices, and Procedures.
+    Handles scanned OCR character substitutions robustly across all document pages while
+    preventing mid-sentence splits on inline clause/annex references.
     """
     normalized = text.replace("\r\n", "\n").replace("\r", "\n")
     normalized = re.sub(r'[ \t]+\n', '\n', normalized)
     normalized = re.sub(r'\n{3,}', '\n\n', normalized)
 
-    pasal_matches = list(re.finditer(r'(?im)^\s*pasal\s+((?:\d+|[ivxlcdm]+))\b', normalized))
-    if not pasal_matches:
-        pasal_matches = list(re.finditer(r'(?i)\bpasal\s+((?:\d+|[ivxlcdm]+))\b', normalized))
+    SECTION_START_RE = re.compile(
+        r'(?im)^[ \t]*(?:'
+        r'(?:pasal|pasa[il1]|article)[,\s]+([0-9a-z]{1,4})\b|'
+        r'(?:lampiran|l[a\.\/\?]+m[p\?]+iran|i[\.\/]?[a\.\/\?]*t?m[p\?]+iran|annex|appendix)(?:[ \t]+([0-9a-z]{1,4}))?\b|'
+        r'(ketentuan[ \t]+(?:tambahan|penutup|lain[-\s]?lain|peralihan))\b|'
+        r'(tabel[ \t]+[^\n]{3,50})|'
+        r'(matri[kx]s?[\!\s]+[^\n]{3,50})|'
+        r'((?:production[ \t]+)?problem[ \t]+reportin[gq][^\n]{0,50})|'
+        r'((?:service|s[ce]nice)[ \t]+(?:level|lrvel|ievel)[ \t]+agreement[^\n]{0,50})|'
+        r'(formulir[ \t]+[^\n]{3,50})|'
+        r'(addendum|adendum(?:[ \t]+(?:\d+|[ivxlcdm]+|[a-z]))?)\b|'
+        r'(skedul|schedule(?:[ \t]+(?:\d+|[ivxlcdm]+|[a-z]))?)\b'
+        r')'
+    )
+
+    raw_matches = list(SECTION_START_RE.finditer(normalized))
+    matches = []
+    for m in raw_matches:
+        line_start = normalized.rfind('\n', 0, m.start()) + 1
+        line_end = normalized.find('\n', m.start())
+        if line_end == -1:
+            line_end = len(normalized)
+        full_line = normalized[line_start:line_end].strip()
+
+        if len(full_line) > 95:
+            continue
+        if _PROSE_WORDS_RE.search(full_line):
+            continue
+
+        prev_text = normalized[max(0, line_start - 45):line_start].strip()
+        if prev_text and _PREV_PREPOSITION_RE.search(prev_text):
+            continue
+
+        pasal_tok = m.group(1)
+        lamp_tok = m.group(2)
+
+        if pasal_tok is not None:
+            if not _is_valid_pasal_num(pasal_tok):
+                continue
+            after_pasal = full_line[m.end() - line_start:].strip()
+            if after_pasal and not after_pasal.startswith((':', '-', '–', '.')):
+                alpha_after = [c for c in after_pasal if c.isalpha()]
+                upper_ratio = sum(1 for c in alpha_after if c.isupper()) / max(len(alpha_after), 1)
+                if upper_ratio < 0.6:
+                    continue
+        elif m.group(0).strip().lower().startswith(('lampiran', 'l.', 'l/', 'i.', 'i/', 'annex', 'appendix')):
+            if lamp_tok is not None and not (_is_valid_pasal_num(lamp_tok) or lamp_tok.upper() in ('TR', 'A', 'B', 'C')):
+                continue
+            after_lamp = full_line[m.end() - line_start:].strip()
+            if after_lamp and not after_lamp.startswith((':', '-', '–', '.')):
+                alpha_line = [c for c in full_line if c.isalpha()]
+                upper_ratio = sum(1 for c in alpha_line if c.isupper()) / max(len(alpha_line), 1)
+                if upper_ratio < 0.65:
+                    continue
+
+        matches.append(m)
+
+    if not matches:
+        SECTION_FALLBACK_RE = re.compile(
+            r'(?i)\b(?:'
+            r'(?:pasal|pasa[il1]|article)[,\s]+(\d+|[ivxlcdm]+)\b|'
+            r'(?:lampiran|annex|appendix)(?:\s+(\d+|[ivxlcdm]+))?\b'
+            r')'
+        )
+        matches = list(SECTION_FALLBACK_RE.finditer(normalized))
+
+    if len(matches) < 2:
+        UPPER_HEADING_RE = re.compile(
+            r'(?m)^[ \t]*(?:'
+            r'(?:BAGIAN|BAB)\s+(?:[IVXLCDM]+|\d+)\b[^\n]{0,65}|'
+            r'(?:[A-Z0-9]{1,3}[\.\)]\s+)?(?:'
+            r'RINGKASAN\s+EKSEKUTIF|IDENTITAS\s+PARA\s+PIHAK|PARA\s+PIHAK|'
+            r'RUANG\s+LINGKUP|LINGKUP\s+PEKERJAAN|OBJEK\s+KERJA\s+SAMA|'
+            r'SPESIFIKASI\s+(?:ARMADA|TEKNIS|LAYANAN)|ALOKASI\s+ANGGARAN|'
+            r'NILAI\s+(?:KONTRAK|PERJANJIAN|PEKERJAAN)|STRUKTUR\s+(?:BIAYA|PEMBIAYAAN)|'
+            r'METODE\s+PEMBAYARAN|TATA\s+CARA\s+PEMBAYARAN|HAK\s+DAN\s+KEWAJIBAN|'
+            r'JANGKA\s+WAKTU|MASA\s+BERLAKU|TINGKAT\s+LAYANAN|KOMITMEN\s+LEVEL\s+LAYANAN|'
+            r'SANKSI\s+DAN\s+DENDA|DENDA\s+KETERLAMBATAN|KERAHASIAAN|'
+            r'KEADAAN\s+KAHAR|FORCE\s+MAJEURE|KEKAYAAN\s+INTELEKTUAL|'
+            r'KETENTUAN\s+(?:HUKUM|LAIN|PENUTUP)|PENYELESAIAN\s+SENGKETA|'
+            r'PENGAKHIRAN\s+PERJANJIAN|HASIL\s+INSPEKSI|REKOMENDASI\s+TINDAK\s+LANJUT'
+            r')[^\n]{0,65}'
+            r')[ \t]*$'
+        )
+        upper_matches = [
+            m for m in UPPER_HEADING_RE.finditer(normalized)
+            if len(m.group(0).strip()) <= 90 and not _PROSE_WORDS_RE.search(m.group(0))
+        ]
+        if len(upper_matches) >= 2:
+            matches = upper_matches
 
     pasal_items = []
-    for idx, match in enumerate(pasal_matches):
-        pasal_no_raw = match.group(1).upper()
-        pasal_label = f"Pasal {pasal_no_raw}"
+    seen_labels = set()
+    for idx, match in enumerate(matches):
+        raw_matched = match.group(0).strip()
+        lines = [l.strip() for l in normalized[match.start():match.start() + 140].splitlines() if l.strip()]
+        first_line = lines[0] if lines else raw_matched
+        clean_heading = first_line if len(first_line) <= 85 else raw_matched
+        pasal_label = _normalize_clause_label(clean_heading)
+
+        if pasal_label in seen_labels and "form" in pasal_label.lower():
+            continue
+
         start_idx = match.start()
-        end_idx = pasal_matches[idx + 1].start() if idx + 1 < len(pasal_matches) else len(normalized)
-        pasal_text = normalized[start_idx:end_idx].strip()
-        if len(pasal_text) >= 20:
+        end_idx = matches[idx + 1].start() if idx + 1 < len(matches) else len(normalized)
+        section_text = normalized[start_idx:end_idx].strip()
+        if len(section_text) >= 15:
+            seen_labels.add(pasal_label)
             pasal_items.append({
                 "pasal": pasal_label,
-                "deskripsi": pasal_text[:max_chars_per_pasal]
+                "deskripsi": section_text[:max_chars_per_pasal]
             })
         if len(pasal_items) >= max_items:
             break
@@ -122,17 +298,18 @@ def extract_pasal_items(text: str, max_items: int = 20, max_chars_per_pasal: int
     return pasal_items
 
 
-def llm_extract_pasal_items(full_text: str, max_items: int = 20) -> List[dict]:
+def llm_extract_pasal_items(full_text: str, max_items: int = 80) -> List[dict]:
     """
     Fallback LLM-based clause extractor for documents where regex fails
     (bilingual contracts, non-standard headings, Article X format, etc.).
     """
-    snippet = full_text[:8000]
+    snippet = full_text[:40000]
     prompt = (
-        "Dokumen hukum berikut adalah perjanjian/kontrak. "
-        "Ekstrak SETIAP klausul atau pasal sebagai daftar JSON. "
-        "Format: [{\"pasal\": \"Pasal 1\", \"deskripsi\": \"teks lengkap klausul...\"}]. "
-        "Jika tidak ada heading Pasal, gunakan nomor urut klausul. "
+        "Dokumen hukum berikut adalah perjanjian/kontrak atau lampiran. "
+        "Ekstrak SETIAP klausul, pasal, atau bagian sebagai daftar JSON. "
+        "PENTING: Salin teks lengkap setiap klausul/bagian secara utuh sesuai aslinya tanpa dipotong atau diringkas. "
+        "Format: [{\"pasal\": \"Pasal 1\" (atau judul bagian), \"deskripsi\": \"teks lengkap klausul/bagian secara utuh...\"}]. "
+        "Jika tidak ada heading Pasal, gunakan judul bagian atau nomor urut klausul. "
         "Kembalikan HANYA JSON array, tanpa teks lain.\n\n"
         f"DOKUMEN:\n{snippet}"
     )
@@ -141,7 +318,7 @@ def llm_extract_pasal_items(full_text: str, max_items: int = 20) -> List[dict]:
         items = extract_json(raw)
         if isinstance(items, list):
             return [{"pasal": str(i.get("pasal", f"Klausul {n+1}")),
-                     "deskripsi": str(i.get("deskripsi", ""))[:900]}
+                     "deskripsi": str(i.get("deskripsi", ""))[:4000]}
                     for n, i in enumerate(items[:max_items])
                     if i.get("deskripsi")]
     except Exception as e:
@@ -597,62 +774,84 @@ def is_regulation_relevant(pasal_text: str, reg_text: str, reg_name: str) -> boo
         return True  # default: assume relevant if check fails
 
 
+_ROMAN_NUM_RE = re.compile(r'^[IVXLCDM]+$', re.I)
+_COMMON_ABBR_SET = {
+    'dll', 'dst', 'dkk', 'hlm', 'tgl', 'bln', 'thn', 'sdr', 'bpk', 'ny',
+    'sh', 'mh', 'kn', 'spn', 'se', 'mm', 'msc', 'phd', 'drs', 'dra', 'ir',
+    'rp', 'no', 'pasal', 'ayat', 'bab', 'pt', 'cv', 'ud', 'tbk', 'persero',
+}
+_DIGRAPH_RE = re.compile(r'(?:ng|ny|sy|kh)', re.I)
+_MID_WORD_NOISE_RE = re.compile(r'[A-Za-z][*";:,\'?!{}~^\\`€&<>]+[A-Za-z]|^[?*~^€]+|[{}~^\\€]')
+_WEIRD_CASE_RE = re.compile(r'^[a-z]+[A-Z]+[a-z]+')
+
+
 def is_text_garbled(text: str) -> bool:
     """
-    Detect font-encoding corruption in PyMuPDF-extracted text.
-    Returns True if the text looks garbled/unreadable.
-
-    Three independent signals — triggering ANY ONE marks the page as corrupted:
-    1. Words with ZERO vowels (length >= 3): e.g. 'KBWJBN', 'PHRBN'
-       These are statistically impossible in Indonesian/English legal text.
-    2. Consonant clusters of 3+ in >= 8% of words: e.g. 'KBWAJIBAN' (K-B-W = 3)
-       Previous threshold was 4, which missed these.
-    3. Global vowel ratio < 20%: whole-page signal for systematic encoding failure.
+    Detect font-encoding or scanner OCR corruption in extracted text.
+    Calibrated for Indonesian & English legal text (collapsing digraphs ng/ny/sy/kh
+    and ignoring short uppercase acronyms and Roman numerals so clean contracts
+    are never falsely flagged).
     """
-    if len(text) < 30:
+    if not text or len(text) < 30:
         return False
 
     words = text.split()
     if not words:
         return False
 
-    VOWELS    = set("aeiouAEIOU")
+    VOWELS     = set("aeiouAEIOU")
     CONSONANTS = set("bcdfghjklmnpqrstvwxyzBCDFGHJKLMNPQRSTVWXYZ")
 
-    cluster_words  = 0   # words with 3+ consecutive consonants
-    no_vowel_words = 0   # words with NO vowels at all (len >= 3)
+    cluster_words      = 0
+    no_vowel_words     = 0
+    glued_words        = 0
+    symbol_heavy_words = 0
 
     for w in words:
-        alpha = [c for c in w if c.isalpha()]
-        if not alpha:
+        alpha_str = "".join(c for c in w if c.isalpha())
+        if len(alpha_str) >= 35:
+            glued_words += 1
+
+        if _MID_WORD_NOISE_RE.search(w) or _WEIRD_CASE_RE.search(w):
+            symbol_heavy_words += 1
+
+        if len(alpha_str) < 3:
             continue
 
-        # Signal 1: zero-vowel words (strong indicator of garbling)
-        if len(alpha) >= 3 and not any(c in VOWELS for c in alpha):
+        if (
+            (alpha_str.isupper() and len(alpha_str) <= 5)
+            or _ROMAN_NUM_RE.match(alpha_str)
+            or alpha_str.lower() in _COMMON_ABBR_SET
+        ):
+            continue
+
+        if not any(c in VOWELS for c in alpha_str):
             no_vowel_words += 1
 
-        # Signal 2: consonant cluster (3+ threshold, down from 4)
-        if len(alpha) >= 3:
-            run = max_run = 0
-            for c in alpha:
-                run = run + 1 if c in CONSONANTS else 0
-                max_run = max(max_run, run)
-            if max_run >= 3:
-                cluster_words += 1
+        collapsed = _DIGRAPH_RE.sub('n', alpha_str)
+        run = max_run = 0
+        for c in collapsed:
+            run = run + 1 if c in CONSONANTS else 0
+            if run > max_run:
+                max_run = run
+        if max_run >= 4:
+            cluster_words += 1
 
     total_words    = max(len(words), 1)
     cluster_ratio  = cluster_words  / total_words
     no_vowel_ratio = no_vowel_words / total_words
+    symbol_ratio   = symbol_heavy_words / total_words
 
-    # Signal 3: global vowel ratio
     alpha_chars = [c for c in text if c.isalpha()]
     vowel_ratio = (sum(1 for c in alpha_chars if c in VOWELS) / len(alpha_chars)
                    if alpha_chars else 0.0)
 
     reasons = []
     if no_vowel_ratio > 0.05:  reasons.append(f"no-vowel-words={no_vowel_ratio:.2f}")
-    if cluster_ratio  > 0.08:  reasons.append(f"cluster_ratio={cluster_ratio:.2f}")
-    if vowel_ratio    < 0.20:  reasons.append(f"vowel_ratio={vowel_ratio:.2f}")
+    if cluster_ratio  > 0.06:  reasons.append(f"cluster_ratio={cluster_ratio:.2f}")
+    if vowel_ratio    < 0.22:  reasons.append(f"vowel_ratio={vowel_ratio:.2f}")
+    if glued_words    >= 2:     reasons.append(f"glued_words={glued_words}")
+    if symbol_ratio   > 0.015: reasons.append(f"symbol_ratio={symbol_ratio:.2f}")
 
     garbled = bool(reasons)
     if garbled:
@@ -708,6 +907,9 @@ def extract_text_hybrid(pdf_path: str, digital_threshold: int = 80,
         if global_garbled:
             print("  [QC] Global font corruption detected. Routing entire document to VLM.")
 
+    import concurrent.futures
+
+    page_tasks = []
     for page_num in range(len(doc)):
         page = doc.load_page(page_num)
         digital_text = page.get_text("text").strip()
@@ -728,26 +930,46 @@ def extract_text_hybrid(pdf_path: str, digital_threshold: int = 80,
             use_vlm = True
             reason = "font encoding corruption detected"
 
-        if not use_vlm:
-            cleaned = re.sub(r'([^\n])\n([^\n])', r'\1 \2', digital_text)
-            full_text_parts.append(cleaned)
-            digital_pages += 1
-        else:
-            print(f"  [VLM] Page {page_num + 1} -> {reason}")
-            try:
-                img_b64 = vlm_extract_page_image(page)
-                vlm_text = call_glm_vision(img_b64, VLM_PAGE_PROMPT, timeout=60)
-                if vlm_text.strip():
-                    full_text_parts.append(vlm_text.strip())
-                    vlm_pages += 1
-                else:
-                    print(f"  [VLM] Page {page_num + 1} returned empty — keeping original.")
-                    full_text_parts.append(digital_text)
-            except Exception as e:
-                print(f"  [VLM] Page {page_num + 1} vision error: {e} — keeping original.")
-                full_text_parts.append(digital_text)
+        img_b64 = vlm_extract_page_image(page) if use_vlm else None
+        page_tasks.append((page_num, img_b64, digital_text, reason, use_vlm))
 
     doc.close()
+
+    def _process_page_task(task):
+        page_num, img_b64, digital_text, reason, use_vlm = task
+        if not use_vlm:
+            cleaned = re.sub(r'([^\n])\n([^\n])', r'\1 \2', digital_text)
+            return page_num, cleaned, False
+
+        print(f"  [VLM] Page {page_num + 1} -> {reason}")
+        try:
+            vlm_text = call_glm_vision(img_b64, VLM_PAGE_PROMPT, timeout=90)
+            if vlm_text and vlm_text.strip():
+                return page_num, f"--- Halaman {page_num + 1} ---\n{vlm_text.strip()}", True
+            else:
+                print(f"  [VLM] Page {page_num + 1} returned empty — keeping original.")
+                return page_num, digital_text, False
+        except Exception as e:
+            print(f"  [VLM] Page {page_num + 1} vision error: {e} — keeping original.")
+            return page_num, digital_text, False
+
+    has_vlm = any(t[4] for t in page_tasks)
+    max_workers = min(4, len(page_tasks)) if has_vlm else 1
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        results = list(pool.map(_process_page_task, page_tasks))
+
+    results.sort(key=lambda r: r[0])
+    full_text_parts = []
+    vlm_pages = 0
+    digital_pages = 0
+    for _, text, was_vlm in results:
+        if text.strip():
+            full_text_parts.append(text.strip())
+        if was_vlm:
+            vlm_pages += 1
+        else:
+            digital_pages += 1
+
     print(f"  [Hybrid] Done: {digital_pages} direct + {vlm_pages} VLM pages")
     return "\n\n".join(full_text_parts)
 
