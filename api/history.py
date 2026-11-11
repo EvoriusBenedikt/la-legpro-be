@@ -9,6 +9,7 @@ import uuid
 
 from auth import get_current_user
 from services import pg_service
+from services import draft_compare
 from services.embed_service import embed_documents
 
 try:
@@ -371,8 +372,9 @@ def get_compliance_notebooks(current_user: dict = Depends(get_current_user)):
         "(SELECT COALESCE(json_agg(sub.filename), '[]'::json) FROM (SELECT d.filename FROM compliance_history d WHERE d.notebook_id = h.notebook_id ORDER BY d.created_at DESC LIMIT 3) sub) AS recent_documents "
         "FROM compliance_history h "
         "LEFT JOIN notebooks n ON n.id = h.notebook_id "
-        "WHERE h.user_id = %s AND h.notebook_id = h.id ORDER BY h.created_at DESC",
-        (current_user["id"],))
+        "WHERE (h.user_id = %s OR EXISTS (SELECT 1 FROM workspace_collaborators wc WHERE wc.notebook_id = h.notebook_id AND wc.user_id = %s)) "
+        "AND h.notebook_id = h.id ORDER BY h.created_at DESC",
+        (current_user["id"], current_user["id"]))
     emptied = pg_service.query(
         "SELECT n.id, '' AS filename, n.name AS company_name, "
         "NULL::text AS expiration_date, "
@@ -385,8 +387,8 @@ def get_compliance_notebooks(current_user: dict = Depends(get_current_user)):
         "COALESCE(n.description, '') AS description, "
         "COALESCE(n.icon, 'folder') AS icon, "
         "(SELECT COALESCE(json_agg(sub.filename), '[]'::json) FROM (SELECT d.filename FROM compliance_history d WHERE d.notebook_id = n.id ORDER BY d.created_at DESC LIMIT 3) sub) AS recent_documents "
-        "FROM notebooks n WHERE n.user_id = %s",
-        (current_user["id"],))
+        "FROM notebooks n WHERE n.user_id = %s OR EXISTS (SELECT 1 FROM workspace_collaborators wc WHERE wc.notebook_id = n.id AND wc.user_id = %s)",
+        (current_user["id"], current_user["id"]))
     seen_ids = set()
     all_notebooks = []
     for nb in list(reports) + list(emptied):
@@ -410,8 +412,10 @@ def get_notebook_documents(report_id: str, current_user: dict = Depends(get_curr
     for the page's header/crumb and empty panel. Accessing this endpoint touches
     last_accessed_at."""
     own = pg_service.query_one(
-        "SELECT notebook_id FROM compliance_history WHERE id = %s AND user_id = %s",
-        (report_id, current_user["id"]))
+        "SELECT notebook_id FROM compliance_history WHERE id = %s AND (user_id = %s OR EXISTS ("
+        "  SELECT 1 FROM workspace_collaborators wc WHERE wc.notebook_id = COALESCE(compliance_history.notebook_id, compliance_history.id) AND wc.user_id = %s"
+        "))",
+        (report_id, current_user["id"], current_user["id"]))
     notebook_name = None
     notebook_description = ""
     notebook_icon = "folder"
@@ -425,8 +429,8 @@ def get_notebook_documents(report_id: str, current_user: dict = Depends(get_curr
             notebook_description = nb_meta.get("description") or ""
             notebook_icon = nb_meta.get("icon") or "folder"
             pg_service.execute(
-                "UPDATE notebooks SET last_accessed_at = now() WHERE id = %s AND user_id = %s",
-                (notebook_id, current_user["id"]))
+                "UPDATE notebooks SET last_accessed_at = now() WHERE id = %s",
+                (notebook_id,))
         else:
             root_doc = pg_service.query_one(
                 "SELECT company_name, filename FROM compliance_history WHERE id = %s",
@@ -440,8 +444,9 @@ def get_notebook_documents(report_id: str, current_user: dict = Depends(get_curr
                 (notebook_id, current_user["id"], name_val, notebook_icon))
     else:
         nb = pg_service.query_one(
-            "SELECT name, description, icon FROM notebooks WHERE id = %s AND user_id = %s",
-            (report_id, current_user["id"]))
+            "SELECT name, description, icon FROM notebooks "
+            "WHERE id = %s AND (user_id = %s OR EXISTS (SELECT 1 FROM workspace_collaborators wc WHERE wc.notebook_id = %s AND wc.user_id = %s))",
+            (report_id, current_user["id"], report_id, current_user["id"]))
         if not nb:
             raise HTTPException(status_code=404, detail="Report not found")
         notebook_id = report_id
@@ -449,8 +454,8 @@ def get_notebook_documents(report_id: str, current_user: dict = Depends(get_curr
         notebook_description = nb.get("description") or ""
         notebook_icon = nb.get("icon") or "folder"
         pg_service.execute(
-            "UPDATE notebooks SET last_accessed_at = now() WHERE id = %s AND user_id = %s",
-            (notebook_id, current_user["id"]))
+            "UPDATE notebooks SET last_accessed_at = now() WHERE id = %s",
+            (notebook_id,))
 
     docs = pg_service.query(
         "SELECT id, filename, company_name, "
@@ -458,14 +463,63 @@ def get_notebook_documents(report_id: str, current_user: dict = Depends(get_curr
         "to_char(expiration_date, 'YYYY-MM-DD') AS expiration_date, "
         "to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at "
         "FROM compliance_history "
-        "WHERE user_id = %s AND notebook_id = %s ORDER BY created_at ASC",
-        (current_user["id"], notebook_id))
+        "WHERE notebook_id = %s ORDER BY created_at ASC",
+        (notebook_id,))
     result: dict = {"documents": docs, "notebook_icon": notebook_icon}
     if notebook_name:
         result["notebook_name"] = notebook_name
     if notebook_description:
         result["notebook_description"] = notebook_description
     return result
+
+@router.get("/compliance-history/{report_id}/draft-comparison")
+def get_draft_comparison(report_id: str, current_user: dict = Depends(get_current_user)):
+    """Compare the analyzed clauses of every draft in this document's workspace.
+
+    A draft is an uploaded file (2026-11-11 decision): rounds of the same
+    contract are sibling rows sharing notebook_id, oldest first. Only the
+    compact fields the comparison view needs are returned — supporting
+    regulation bodies are dropped, since they are the bulk of results_json.
+
+    Matching lives in services.draft_compare (pure, unit-tested).
+    """
+    own = pg_service.query_one(
+        "SELECT notebook_id FROM compliance_history WHERE id = %s AND (user_id = %s OR EXISTS ("
+        "  SELECT 1 FROM workspace_collaborators wc WHERE wc.notebook_id = COALESCE(compliance_history.notebook_id, compliance_history.id) AND wc.user_id = %s"
+        "))",
+        (report_id, current_user["id"], current_user["id"]))
+    if not own:
+        raise HTTPException(status_code=404, detail="Report not found")
+    notebook_id = own.get("notebook_id") or report_id
+
+    rows = pg_service.query(
+        "SELECT id, filename, results_json, "
+        "to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at "
+        "FROM compliance_history "
+        "WHERE notebook_id = %s ORDER BY created_at ASC",
+        (notebook_id,))
+
+    drafts = []
+    for row in rows:
+        raw = row.get("results_json")
+        if not raw:
+            continue
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError):
+            # A legacy or hand-edited row must not break the whole comparison.
+            continue
+        drafts.append({
+            "report_id": row["id"],
+            "filename": row.get("filename") or "",
+            "created_at": row.get("created_at") or "",
+            "summary": payload.get("summary") or {},
+            "clauses": payload.get("results") or [],
+        })
+
+    comparison = draft_compare.build_comparison(drafts)
+    comparison["notebook_id"] = notebook_id
+    return comparison
 
 @router.get("/compliance-history/{report_id}")
 def get_compliance_report_detail(report_id: str, current_user: dict = Depends(get_current_user)):
@@ -475,8 +529,10 @@ def get_compliance_report_detail(report_id: str, current_user: dict = Depends(ge
         "to_char(expiration_date, 'YYYY-MM-DD') AS expiration_date, results_json, "
         "notebook_id, "
         "to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at "
-        "FROM compliance_history WHERE id = %s AND user_id = %s",
-        (report_id, current_user["id"]))
+        "FROM compliance_history WHERE id = %s AND (user_id = %s OR EXISTS ("
+        "  SELECT 1 FROM workspace_collaborators wc WHERE wc.notebook_id = COALESCE(compliance_history.notebook_id, compliance_history.id) AND wc.user_id = %s"
+        "))",
+        (report_id, current_user["id"], current_user["id"]))
 
     if not row:
         raise HTTPException(status_code=404, detail="Report not found")
@@ -536,8 +592,10 @@ async def save_compliance_report_file(
     analyze endpoint deleted its temp copy). Failure is non-fatal for the
     upload flow — the preview falls back to the summary card."""
     row = pg_service.query_one(
-        "SELECT id, filename FROM compliance_history WHERE id = %s AND user_id = %s",
-        (report_id, current_user["id"]))
+        "SELECT id, filename FROM compliance_history WHERE id = %s AND (user_id = %s OR EXISTS ("
+        "  SELECT 1 FROM workspace_collaborators wc WHERE wc.notebook_id = COALESCE(compliance_history.notebook_id, compliance_history.id) AND wc.user_id = %s"
+        "))",
+        (report_id, current_user["id"], current_user["id"]))
     if not row:
         raise HTTPException(status_code=404, detail="Report not found")
 
@@ -573,8 +631,10 @@ def get_compliance_report_file(report_id: str, current_user: dict = Depends(get_
     from fastapi.responses import StreamingResponse
 
     row = pg_service.query_one(
-        "SELECT id, filename FROM compliance_history WHERE id = %s AND user_id = %s",
-        (report_id, current_user["id"]))
+        "SELECT id, filename FROM compliance_history WHERE id = %s AND (user_id = %s OR EXISTS ("
+        "  SELECT 1 FROM workspace_collaborators wc WHERE wc.notebook_id = COALESCE(compliance_history.notebook_id, compliance_history.id) AND wc.user_id = %s"
+        "))",
+        (report_id, current_user["id"], current_user["id"]))
     if not row:
         raise HTTPException(status_code=404, detail="Report not found")
 
