@@ -13,8 +13,8 @@ from fastapi import HTTPException
 from lxml import html as lhtml
 
 from services import pg_service
-from services.llm_client import call_glm
-from services.rag_service import extract_json, retrieve_contexts
+from services.llm_client import call_glm, extract_json
+from services.rag_service import retrieve_contexts
 from services.kg_service import retrieve_graph_contexts
 
 _PATCH_INTENT_RE = re.compile(

@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.concurrency import run_in_threadpool
 import os, re, json
 from typing import List
 from pydantic import BaseModel
@@ -33,10 +34,82 @@ class ChatResponse(BaseModel):
     suggested_title: str | None = None
     action_proposal: dict | None = None
     tool_steps: List[dict] = []
+    suggested_actions: List[str] = []
 
 
 class ExecuteAgentActionRequest(BaseModel):
     approved_patch_ids: List[str] | None = None
+
+def _extract_suggestions_and_clean_answer(raw_answer: str) -> tuple[str, List[str]]:
+    """Strip the trailing ---SUGGESTIONS--- block and return (clean_answer, suggestions)."""
+    match = re.search(r"\n*---SUGGESTIONS---\s*(.*)$", raw_answer, re.DOTALL | re.IGNORECASE)
+    if not match:
+        return raw_answer.strip(), []
+    clean_answer = raw_answer[:match.start()].rstrip()
+    suggestions: List[str] = []
+    for line in match.group(1).splitlines():
+        item = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", line).strip()
+        item = item.strip('"\'`*').strip()
+        if item and len(item) >= 4:
+            suggestions.append(item[:90])
+        if len(suggestions) >= 3:
+            break
+    return clean_answer, suggestions
+
+
+def _filter_cited_sources(answer_text: str, sources: List[dict]) -> tuple[str, List[dict]]:
+    """Keep only sources actually cited as [n] in answer_text and renumber sequentially."""
+    if not sources:
+        return answer_text, []
+    cited_order: List[int] = []
+    for m in re.finditer(r"\[(\d{1,2})\]", answer_text):
+        idx = int(m.group(1))
+        if 1 <= idx <= len(sources) and idx not in cited_order:
+            cited_order.append(idx)
+    if not cited_order:
+        return answer_text, []
+    remap = {old_idx: new_idx for new_idx, old_idx in enumerate(cited_order, start=1)}
+    renumbered = re.sub(
+        r"\[(\d{1,2})\]",
+        lambda m: f"[{remap[int(m.group(1))]}]" if int(m.group(1)) in remap else m.group(0),
+        answer_text,
+    )
+    return renumbered, [sources[idx - 1] for idx in cited_order]
+
+
+def _fallback_suggestions(user_lang: str, has_report: bool, has_proposal: bool) -> List[str]:
+    if user_lang == "english":
+        if has_proposal:
+            return [
+                "Explain why these clause revisions reduce risk",
+                "Check if any other clauses still need updates",
+            ]
+        if has_report:
+            return [
+                "Revise the remaining risky clauses",
+                "Compare risky clauses against internal procedures",
+                "Summarize the key obligations in this contract",
+            ]
+        return [
+            "Check compliance requirements for this topic",
+            "Draft a sample clause for this agreement",
+        ]
+    if has_proposal:
+        return [
+            "Jelaskan mengapa revisi klausul ini mengurangi risiko",
+            "Periksa apakah masih ada klausul lain yang perlu diubah",
+        ]
+    if has_report:
+        return [
+            "Perbaiki klausul berisiko yang tersisa",
+            "Bandingkan klausul berisiko dengan prosedur internal",
+            "Ringkas kewajiban utama dalam kontrak ini",
+        ]
+    return [
+        "Cek persyaratan regulasi untuk topik ini",
+        "Buatkan contoh klausul yang sesuai",
+    ]
+
 
 class SessionRequest(BaseModel):
     title: str
@@ -600,10 +673,13 @@ async def chat_endpoint(
         "   - Electronic vs Stamped paper contracts: Emphasize that a stamp duty (meterai) is just a document tax, NOT a requirement for a valid contract. Contract validity is based purely on Article 1320 of the Civil Code and Article 5 of the ITE Law.\n"
         "   - Prison threats for debts: You MUST cite 'Article 19 paragraph (2) of Law No. 39 of 1999 concerning Human Rights (UU HAM)' which strictly prohibits criminal punishment/prison for civil debt issues. Clearly distinguish between civil default (wanprestasi) and malicious intent (fraud, Article 378 of the Criminal Code).\n"
         "5. CITATION MARKERS (verifiability is the product promise):\n"
-        "   - LEGAL CONTEXT supplies numbered sources (SUMBER [1], SUMBER [2], ...). When a claim rests on one of them, end that claim with its marker in square brackets, immediately before the closing punctuation, e.g. '... wajib dimuat dalam laporan tahunan [2].'\n"
+        "   - LEGAL CONTEXT supplies numbered sources (SUMBER [1], SUMBER [2], ...). Only cite [n] when a specific legal or regulatory claim genuinely relies on that source. Do NOT cite or force sources for greetings, meta-questions, general summaries, or when the answer does not need external citations.\n"
+        "   - When you do cite, end the claim with its marker in square brackets immediately before the closing punctuation, e.g. '... wajib dimuat dalam laporan tahunan [2].'\n"
         "   - Use ONLY markers of sources actually supplied; never invent or renumber a marker.\n"
         "   - When quoting a regulation's number, year, or article that appears in a source, reproduce it EXACTLY as written there — never alter digits, years, or abbreviations.\n\n"
-        "Always provide actionable solutions and naturally cite relevant legal bases/articles."
+        "6. NEXT-STEP SUGGESTIONS:\n"
+        "   - At the very end of your response, after your main answer, append a section starting with the exact line `---SUGGESTIONS---` followed by 2 to 3 short, actionable next-step prompts the user can ask you to do next (written in the same language as your answer, one per line starting with `- `, max 10 words each, no bold/quotes).\n\n"
+        "Always provide actionable solutions and naturally cite relevant legal bases/articles when needed."
     )
     if target_report_id:
         if workspace_ref_names:
@@ -779,12 +855,22 @@ async def chat_endpoint(
         except Exception as e:
             print(f"[Agent] Proposal generation skipped: {e}")
 
+    answer, suggested_actions = _extract_suggestions_and_clean_answer(answer)
+    if not suggested_actions:
+        suggested_actions = _fallback_suggestions(
+            user_lang,
+            has_report=bool(target_report_id),
+            has_proposal=bool(action_proposal),
+        )
+    answer, sources_to_return = _filter_cited_sources(answer, sources_to_return)
+
     return ChatResponse(
         answer=answer,
         sources=sources_to_return,
         suggested_title=suggested_title,
         action_proposal=action_proposal,
         tool_steps=tool_steps,
+        suggested_actions=suggested_actions,
     )
 
 
