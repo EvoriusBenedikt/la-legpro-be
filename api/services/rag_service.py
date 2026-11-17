@@ -1003,6 +1003,118 @@ def _attach_filenames(contexts: List[dict]) -> None:
         print(f"Filename lookup for chat sources failed: {e}")
 
 
+def _resolve_workspace_report_ids(report_id: str | None) -> list[str]:
+    """Return [report_id] plus its parent notebook_id (if any) so internal
+    reference docs uploaded at the notebook level are visible in every
+    document workspace belonging to that notebook."""
+    if not report_id:
+        return []
+    ids = [report_id]
+    try:
+        row = pg_service.query_one(
+            "SELECT notebook_id FROM compliance_history WHERE id = %s",
+            (report_id,),
+        )
+        nb_id = row.get("notebook_id") if row else None
+        if nb_id and nb_id not in ids:
+            ids.append(nb_id)
+    except Exception as e:
+        print(f"Workspace notebook lookup failed: {e}")
+    return ids
+
+
+def list_workspace_references(
+    user_id, report_id: str | None, excluded: set | None = None
+) -> list[str]:
+    """Return active (non-excluded) internal reference filenames for this workspace."""
+    workspace_ids = _resolve_workspace_report_ids(report_id)
+    if not workspace_ids:
+        return []
+    if excluded is None:
+        excluded = get_user_exclusions(user_id)
+    try:
+        rows = pg_service.query(
+            "SELECT id, doc_id, min(judul) AS judul, min(nomor) AS nomor "
+            "FROM chunks "
+            "WHERE visibility = 'private' AND user_id = %s::text "
+            "AND report_id = ANY(%s) "
+            "GROUP BY id, doc_id",
+            (str(user_id), workspace_ids),
+        )
+    except Exception as e:
+        print(f"Workspace reference list failed: {e}")
+        return []
+
+    seen: set[str] = set()
+    names: list[str] = []
+    for row in rows:
+        if chunk_source_ref(row.get("doc_id"), row["id"]) in excluded:
+            continue
+        name = (row.get("judul") or row.get("nomor") or "Dokumen Internal").strip()
+        if name and name not in seen:
+            seen.add(name)
+            names.append(name)
+    return names
+
+
+def _retrieve_workspace_references(
+    query_vec, user_id, workspace_ids: list[str], excluded: set, limit: int = 6
+) -> List[dict]:
+    """Fetch top-matching active private reference chunks scoped to this workspace.
+
+    Ensures workspace-uploaded reference documents (visibility='private',
+    report_id IN workspace_ids) are always surfaced alongside public regulations,
+    even when hybrid_cag short-circuits on a public law or public chunks
+    outnumber private ones in the global RRF pool.
+    """
+    if not workspace_ids:
+        return []
+    try:
+        rows = pg_service.query(
+            "SELECT id, doc_id, text, window_context, jenis, nomor, sektor, judul "
+            "FROM chunks "
+            "WHERE visibility = 'private' AND user_id = %s::text "
+            "AND report_id = ANY(%s) AND embedding IS NOT NULL "
+            "ORDER BY embedding <=> %s::vector "
+            "LIMIT %s",
+            (user_id, workspace_ids, query_vec, 20),
+        )
+    except Exception as e:
+        print(f"Workspace reference retrieval failed: {e}")
+        return []
+
+    refs: List[dict] = []
+    for row in rows:
+        if chunk_source_ref(row.get("doc_id"), row["id"]) in excluded:
+            continue
+        refs.append({
+            "id": row["id"],
+            "doc_id": row.get("doc_id"),
+            "text": _cap_context_text(row.get("window_context") or row.get("text") or ""),
+            "jenis": row.get("jenis") or "Dokumen Internal",
+            "nomor": row.get("nomor") or "",
+            "sektor": row.get("sektor") or "Internal",
+            "judul": row.get("judul") or "",
+            "is_workspace_ref": True,
+        })
+        if len(refs) >= limit:
+            break
+    return refs
+
+
+def _merge_workspace_refs(ws_refs: List[dict], contexts: List[dict]) -> List[dict]:
+    """Prepend workspace reference contexts and deduplicate by chunk/doc id."""
+    if not ws_refs:
+        return contexts
+    merged = list(ws_refs)
+    seen_ids = {c["id"] for c in merged}
+    for c in contexts:
+        if c["id"] not in seen_ids:
+            merged.append(c)
+            seen_ids.add(c["id"])
+    return merged
+
+
 def retrieve_contexts(query: str, current_user: dict, n_results=5, doc_category=None, hybrid_cag=True, report_id=None) -> List[dict]:
     """Searches Vector DB and returns structured raw dictionaries.
        If hybrid_cag=True, uses RAG to find the best document, then CAG to inject the full text.
@@ -1071,20 +1183,27 @@ def retrieve_contexts(query: str, current_user: dict, n_results=5, doc_category=
     # unscoped-legacy (pre-B3) and stays visible to its owner everywhere; a
     # non-NULL report_id is narrowed to the current workspace. report_id=None
     # (no workspace) => only public + the user's NULL-report_id legacy private rows.
-    where_sql = ("(visibility = 'public' OR (user_id = %s::text "
-                 "AND (report_id IS NULL OR report_id = %s)))")
-    where_params = [user_id, report_id]
+    workspace_ids = _resolve_workspace_report_ids(report_id)
+    if workspace_ids:
+        where_sql = ("(visibility = 'public' OR (user_id = %s::text "
+                     "AND (report_id IS NULL OR report_id = ANY(%s))))")
+        where_params = [user_id, workspace_ids]
+    else:
+        where_sql = ("(visibility = 'public' OR (user_id = %s::text "
+                     "AND report_id IS NULL))")
+        where_params = [user_id]
     if doc_category:
         where_sql += " AND doc_category = ANY(%s)"
         where_params.append([doc_category, "UMUM"])
         
     contexts = []
-    
+    query_vec = embed_query(query)
+    ws_refs = _retrieve_workspace_references(query_vec, user_id, workspace_ids, excluded)
+
     if hybrid_cag:
         # 1. RAG Discovery: Find the single most relevant chunk
         # (Migration M3: pgvector cosine `<=>` with the M2-verified HNSW
         # search width.)
-        query_vec = embed_query(query)
         with pg_service.get_conn() as conn:
             conn.execute("SET LOCAL hnsw.ef_search = 100")
             # (2026-09-29 RAG audit: with the global hnsw.iterative_scan=off,
@@ -1151,6 +1270,7 @@ def retrieve_contexts(query: str, current_user: dict, n_results=5, doc_category=
                             "sektor": best_top_meta["sektor"] or '',
                             "judul": best_top_meta["judul"] or ''
                         })
+                        contexts = _merge_workspace_refs(ws_refs, contexts)
                         _attach_filenames(contexts)
                         _touch_grant_only(contexts)
                         return contexts
@@ -1162,10 +1282,6 @@ def retrieve_contexts(query: str, current_user: dict, n_results=5, doc_category=
     sparse_ranks = {}
     
     # --- 1. Dense Retrieval (pgvector HNSW, cosine `<=>`) ---
-    # (query_vec was computed for the CAG discovery pass above; recompute
-    # only when hybrid_cag is disabled.)
-    if not hybrid_cag:
-        query_vec = embed_query(query)
     with pg_service.get_conn() as conn:
         conn.execute("SET LOCAL hnsw.ef_search = 100")
         conn.execute("SET LOCAL hnsw.iterative_scan = strict_order")  # see discovery pass above
@@ -1305,6 +1421,7 @@ def retrieve_contexts(query: str, current_user: dict, n_results=5, doc_category=
     for cand in candidates[:n_results]:
         contexts.append(cand)
 
+    contexts = _merge_workspace_refs(ws_refs, contexts)
     _attach_filenames(contexts)
     _touch_grant_only(contexts)
     return contexts

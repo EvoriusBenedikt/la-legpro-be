@@ -30,27 +30,81 @@ _REPORT_ID_RE = re.compile(r"^[0-9a-fA-F-]{1,64}$")   # UUID-ish; bounded length
 # map 1:1 to columns; doc_id stays NULL (legacy rows carried no reg_id).
 # These chunks were never part of the legacy FTS index -> sparse_legacy=FALSE.
 
+_ALLOWED_REF_EXTS = {".pdf", ".docx", ".pptx"}
+
+
+def _extract_docx_text(file_path: str) -> str:
+    import docx
+
+    doc = docx.Document(file_path)
+    parts: list[str] = []
+    for p in doc.paragraphs:
+        txt = (p.text or "").strip()
+        if txt:
+            parts.append(txt)
+    for table in doc.tables:
+        for row in table.rows:
+            row_cells = [c.text.strip() for c in row.cells if c.text and c.text.strip()]
+            if row_cells:
+                parts.append(" | ".join(row_cells))
+    return "\n".join(parts)
+
+
+def _extract_pptx_text(file_path: str) -> str:
+    from pptx import Presentation
+
+    prs = Presentation(file_path)
+    slides_text: list[str] = []
+    for idx, slide in enumerate(prs.slides, start=1):
+        slide_parts: list[str] = []
+        for shape in slide.shapes:
+            if shape.has_text_frame:
+                txt = "\n".join(
+                    p.text.strip() for p in shape.text_frame.paragraphs if p.text and p.text.strip()
+                )
+                if txt:
+                    slide_parts.append(txt)
+            if shape.has_table:
+                for row in shape.table.rows:
+                    row_cells = [c.text.strip() for c in row.cells if c.text and c.text.strip()]
+                    if row_cells:
+                        slide_parts.append(" | ".join(row_cells))
+        if slide_parts:
+            slides_text.append(f"[Slide {idx}]\n" + "\n".join(slide_parts))
+    return "\n\n".join(slides_text)
+
+
+def _extract_reference_text(file_path: str, ext: str) -> str:
+    if ext == ".pdf":
+        return extract_text_hybrid(file_path)
+    if ext == ".docx":
+        return _extract_docx_text(file_path)
+    if ext == ".pptx":
+        return _extract_pptx_text(file_path)
+    raise HTTPException(status_code=400, detail="Only PDF, DOCX, and PPTX files are supported.")
+
+
 @router.post("/upload-internal")
 async def upload_internal_doc(
     file: UploadFile = File(...),
     report_id: str | None = Form(None),
     current_user: dict = Depends(get_current_user),
 ):
-    if not file.filename.endswith('.pdf'):
-        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+    safe_name = os.path.basename(file.filename or "")
+    ext = os.path.splitext(safe_name)[1].lower()
+    if ext not in _ALLOWED_REF_EXTS:
+        raise HTTPException(status_code=400, detail="Only PDF, DOCX, and PPTX files are supported.")
     if report_id is not None and not _REPORT_ID_RE.match(report_id):
         raise HTTPException(status_code=400, detail="Invalid report_id.")
 
     upload_id = str(uuid.uuid4())[:8]
-    temp_path = os.path.join(PDFS_DIR, f"internal_{upload_id}_{file.filename}")
+    temp_path = os.path.join(PDFS_DIR, f"internal_{upload_id}_{safe_name}")
     
     with open(temp_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
         
     try:
-        # (R1 bugfix: hybrid PyMuPDF+VLM extraction replaces the dead
-        # PaddleOCR chain; see la-legpro-doc/bug_reports.md.)
-        full_text = extract_text_hybrid(temp_path)
+        full_text = _extract_reference_text(temp_path, ext)
         
         # (Bugfix M3: legacy called LegalChunker(chunk_size=1000, overlap=200)
         # but the class takes no constructor args -- the endpoint 500'd on

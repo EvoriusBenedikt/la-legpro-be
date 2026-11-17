@@ -18,13 +18,37 @@ consumer must use a fetch-based reader (see JobStatusContext.tsx).
 """
 
 import asyncio
-from typing import Dict
+from typing import Dict, Literal
 
 import auth
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+from services import doc_notifications
 
 router = APIRouter()
+
+
+class MuteToggleRequest(BaseModel):
+    target_type: Literal["notebook", "document"]
+    target_id: str
+    muted: bool
+
+
+@router.get("/notifications/unread-documents")
+def get_unread_documents(current_user: dict = Depends(auth.get_current_user)):
+    """Return unread edit/comment notifications grouped by document and notebook."""
+    return doc_notifications.get_unread_summary(current_user["id"])
+
+
+@router.put("/notifications/mute")
+def toggle_notification_mute(
+    req: MuteToggleRequest,
+    current_user: dict = Depends(auth.get_current_user),
+):
+    """Mute or unmute notifications for a workspace ('notebook') or 'document'."""
+    doc_notifications.set_mute(current_user["id"], req.target_type, req.target_id, req.muted)
+    return {"status": "ok", "target_type": req.target_type, "target_id": req.target_id, "muted": req.muted}
 
 MAX_STREAMS_PER_USER = 3
 KEEPALIVE_SECONDS = 15

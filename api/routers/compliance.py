@@ -917,7 +917,27 @@ async def check_compliance(
         # 🔍 Pass 0: Multi-Format Extraction ──────────────────────────────────
         print(f"[Compliance] Starting extraction for: {file.filename}")
         is_ocr = use_ocr.lower() == "true"
-        full_text = extract_text_multi_format(temp_path, file.filename, use_ocr=is_ocr)
+        bilingual_meta = None
+        if not is_ocr:
+            try:
+                from services import bilingual_extractor
+                fname_lower = (file.filename or "").lower()
+                if fname_lower.endswith(".pdf"):
+                    bilingual_meta = bilingual_extractor.extract_bilingual_from_pdf(temp_path)
+                elif fname_lower.endswith(".docx"):
+                    bilingual_meta = bilingual_extractor.extract_bilingual_from_docx(temp_path)
+            except Exception as be:
+                print(f"[Compliance] Bilingual pre-scan skipped: {be}")
+                bilingual_meta = None
+
+        if bilingual_meta and bilingual_meta.get("is_bilingual") and bilingual_meta.get("segments"):
+            from services import bilingual_extractor
+            gov_lang = bilingual_meta.get("governing_language") or "id"
+            full_text = bilingual_extractor.build_governing_text(bilingual_meta["segments"], gov_lang)
+            if len(full_text.strip()) < 100:
+                full_text = extract_text_multi_format(temp_path, file.filename, use_ocr=is_ocr)
+        else:
+            full_text = extract_text_multi_format(temp_path, file.filename, use_ocr=is_ocr)
         text_snippet = full_text[:250000]
 
         if len(text_snippet.strip()) < 100:
@@ -1055,7 +1075,17 @@ async def check_compliance(
               f"SESUAI={sesuai_count} BERESIKO={beresiko_count} FATAL={fatal_count} | "
               f"posisi: +{menguntungkan_count} / -{merugikan_count} / ={netral_count}")
 
-        return {"report": results, "summary": summary}
+        out_payload = {"report": results, "summary": summary}
+        if bilingual_meta and bilingual_meta.get("is_bilingual"):
+            from services import bilingual_extractor
+            out_payload["layout_mode"] = bilingual_meta.get("layout_mode", "bilingual_parallel")
+            out_payload["column_order"] = bilingual_meta.get("column_order")
+            out_payload["governing_language"] = bilingual_meta.get("governing_language", "id")
+            out_payload["segments"] = bilingual_meta.get("segments", [])
+            out_payload["translation_discrepancies"] = bilingual_extractor.find_translation_discrepancies(
+                bilingual_meta.get("segments", [])
+            )
+        return out_payload
 
     try:
         return await run_in_threadpool(_run_pipeline)

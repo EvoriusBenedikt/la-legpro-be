@@ -14,6 +14,8 @@ import docx
 from services import docx_html
 from auth import get_current_user
 from services import pg_service
+from services import doc_notifications
+from services import bilingual_extractor
 
 router = APIRouter(prefix="/api", tags=["editor"])
 
@@ -276,6 +278,7 @@ class CommentResolveRequest(BaseModel):
 
 class ExportDocxRequest(BaseModel):
     content_html: str
+    bilingual_view: Optional[str] = "both"
 
 
 class AiAssistRequest(BaseModel):
@@ -407,8 +410,15 @@ _IMG_MAX_COUNT = 12          # images kept per document
 _IMG_MAX_B64_CHARS = 3_000_000  # total base64 budget per document (draft is a TEXT column, PUT body)
 
 
-def _pdf_table_html(rows: list) -> str:
+def _pdf_table_html(rows: list, borderless: bool = False) -> str:
     """Editor table markup (same classes as the DOCX extractor / insert-table)."""
+    is_bi, col_order = bilingual_extractor.detect_bilingual_columns(rows)
+    if is_bi and col_order:
+        table_html, _ = bilingual_extractor.render_bilingual_table_html(
+            rows, col_order, borderless=borderless
+        )
+        return table_html
+
     def cell(c):
         return html.escape(str(c or "").strip()).replace("\n", "<br/>")
     out = ['<table class="ed-doc-table"><thead><tr>']
@@ -485,6 +495,10 @@ def _extract_pdf_to_html(pdf_path: str) -> str:
             tabs = page.find_tables()
             if tabs and tabs.tables:
                 tables = tabs.tables
+            else:
+                tabs_fb = page.find_tables(vertical_strategy="text", horizontal_strategy="text")
+                if tabs_fb and tabs_fb.tables:
+                    tables = tabs_fb.tables
         except Exception:
             tables = []
 
@@ -495,7 +509,14 @@ def _extract_pdf_to_html(pdf_path: str) -> str:
             except Exception:
                 rows = None
             # 1-row/1-col "tables" are usually boxed paragraphs, keep them as text
-            if rows and len(rows) >= 2 and len(rows[0]) >= 2:
+            # unless it's a 1-row 2-column bilingual clause table.
+            is_1row_bilingual = (
+                rows
+                and len(rows) == 1
+                and len(rows[0]) == 2
+                and bilingual_extractor.detect_bilingual_columns(rows)[0]
+            )
+            if rows and len(rows[0]) >= 2 and (len(rows) >= 2 or is_1row_bilingual):
                 table_rows.append((t.bbox, rows))
         table_bboxes = [tb for tb, _ in table_rows]
         for tb, rows in table_rows:
@@ -763,7 +784,18 @@ def _extract_docx_to_html(docx_path: str) -> str:
                 output_parts.append(f'<p class="ed-doc-p">{html.escape(tl)}</p>')
 
         elif tag_name == 'tbl':
-            tbl_out = docx_html.table_to_html(Table(child, doc))
+            tbl_obj = Table(child, doc)
+            raw_rows = [[c.text or "" for c in row.cells] for row in tbl_obj.rows]
+            is_bi, col_order = bilingual_extractor.detect_bilingual_columns(raw_rows)
+            is_borderless = bilingual_extractor.is_docx_table_borderless(tbl_obj)
+            tbl_out = docx_html.table_to_html(
+                tbl_obj,
+                bilingual_order=col_order if (is_bi and col_order) else None,
+                borderless=is_borderless,
+                page_char_budget=(4500 if (is_bi and col_order) else 2500) if not has_explicit_breaks else 0,
+            )
+            if tbl_out and 'data-page-break="true"' in tbl_out:
+                has_explicit_breaks = True
             if tbl_out:
                 empty_run = 0
                 output_parts.append(tbl_out)
@@ -778,7 +810,7 @@ def _extract_docx_to_html(docx_path: str) -> str:
             is_break_candidate = part.startswith('<h2 ') or part.startswith('<table ')
             if running_chars >= 2500 and is_break_candidate and i < len(output_parts) - 1:
                 paginated_parts.append(
-                    '<div class="ed-page-break" contenteditable="false" role="separator" aria-label="Page Break" data-page-break="true"></div>'
+                    '<div class="ed-page-break" contenteditable="false" role="separator" aria-label="Page Break" data-page-break="true" data-auto-break="true"></div>'
                 )
                 running_chars = 0
             paginated_parts.append(part)
@@ -1242,26 +1274,17 @@ def get_editor_draft(
     if not force_reextract:
         draft = pg_service.query_one(
             "SELECT content_html, content_json, version, "
-            "to_char(updated_at, 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS updated_at "
+            "to_char(updated_at, 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at "
             "FROM document_editor_drafts WHERE report_id = %s",
             (report_id,),
         )
     draft_html = (draft.get("content_html") or "") if draft else ""
     draft_plain = html.unescape(re.sub(r'<[^>]+>', ' ', draft_html)).replace('\u200b', '').strip()
     is_blank = len(draft_plain) < 40
-    is_garbled = bool(draft and _is_text_garbled(draft_plain))
-    is_pdf = str(access.get("filename") or "").lower().endswith(".pdf")
-    has_no_breaks = bool(
-        draft
-        and "ed-page-break" not in draft_html
-        and len(draft_plain) >= (2200 if is_pdf else 4000)
-    )
     is_old_dummy = bool(
         draft
         and (
             is_blank
-            or is_garbled
-            or has_no_breaks
             or "ed-parties-block" in draft_html
             or "Perjanjian ini dibuat dan disepakati oleh dan antara" in draft_html
             or "Perjanjian ini mengatur kerjasama penyediaan layanan integrasi sistem" in draft_html
@@ -1282,22 +1305,23 @@ def get_editor_draft(
     if not draft or not draft.get("content_html") or is_old_dummy or force_reextract:
         # Extract authentic document layout from source uploaded file or compliance clauses
         extracted_html = _extract_document_html(report_id, access["filename"])
-        now_iso = datetime.now(timezone.utc).isoformat()
         draft_id = f"draft-{uuid.uuid4().hex[:12]}"
-        pg_service.execute(
+        inserted_rows = pg_service.execute_returning(
             """
             INSERT INTO document_editor_drafts (id, report_id, user_id, content_html, version, updated_at)
             VALUES (%s, %s, %s, %s, 1, now())
             ON CONFLICT (report_id) DO UPDATE SET
+                user_id = EXCLUDED.user_id,
                 content_html = EXCLUDED.content_html,
                 version = 1,
-                updated_at = now();
+                updated_at = now()
+            RETURNING to_char(updated_at, 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at;
             """,
             (draft_id, report_id, current_user["id"], extracted_html),
         )
         final_html = extracted_html
         final_version = 1
-        final_updated_at = now_iso
+        final_updated_at = inserted_rows[0]["updated_at"] if inserted_rows else datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000000Z")
     elif draft.get("content_json"):
         try:
             parsed_json = json.loads(draft["content_json"])
@@ -1321,6 +1345,21 @@ def get_editor_draft(
             (ver_id, report_id, final_html, access["owner_id"]),
         )
 
+    ch_meta = pg_service.query_one(
+        "SELECT results_json FROM compliance_history WHERE id = %s",
+        (report_id,),
+    )
+    ch_results = {}
+    if ch_meta and ch_meta.get("results_json"):
+        try:
+            ch_results = json.loads(ch_meta["results_json"])
+        except Exception:
+            ch_results = {}
+
+    is_bilingual = "bilingual-contract-table" in final_html or ch_results.get("layout_mode") == "bilingual_parallel"
+    governing_language = ch_results.get("governing_language") or ("id" if is_bilingual else None)
+    discrepancies = ch_results.get("translation_discrepancies") or []
+
     return {
         "report_id": report_id,
         "filename": access["filename"],
@@ -1331,6 +1370,9 @@ def get_editor_draft(
         "is_owner": access["is_owner"],
         "my_color_index": access["color_index"],
         "is_extracted": bool(not draft or is_old_dummy or force_reextract),
+        "is_bilingual": is_bilingual,
+        "governing_language": governing_language,
+        "translation_discrepancies": discrepancies,
     }
 
 
@@ -1360,7 +1402,7 @@ def re_extract_editor_source(
     )
 
     updated_draft = pg_service.query_one(
-        "SELECT version, to_char(updated_at, 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS updated_at "
+        "SELECT version, to_char(updated_at, 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at "
         "FROM document_editor_drafts WHERE report_id = %s",
         (report_id,),
     )
@@ -1371,6 +1413,7 @@ def re_extract_editor_source(
         "content_html": extracted_html,
         "version": updated_draft["version"] if updated_draft else 1,
         "updated_at": updated_draft["updated_at"] if updated_draft else now_iso,
+        "is_bilingual": "bilingual-contract-table" in extracted_html,
     }
 
 
@@ -1389,14 +1432,16 @@ def save_editor_draft(
         INSERT INTO document_editor_drafts (id, report_id, user_id, content_html, content_json, version, updated_at)
         VALUES (%s, %s, %s, %s, %s, 1, now())
         ON CONFLICT (report_id) DO UPDATE
-        SET content_html = EXCLUDED.content_html,
+        SET user_id = EXCLUDED.user_id,
+            content_html = EXCLUDED.content_html,
             content_json = EXCLUDED.content_json,
             version = document_editor_drafts.version + 1,
             updated_at = now()
-        RETURNING version, to_char(updated_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS updated_at
+        RETURNING version, to_char(updated_at, 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at
         """,
         (draft_id, report_id, current_user["id"], req.content_html, json_str),
     )
+    doc_notifications.notify_collaborators(report_id, current_user["id"], event_type="document_edited")
     saved = rows[0] if rows else {"version": 1, "updated_at": None}
     return {
         "status": "saved",
@@ -1444,6 +1489,12 @@ def create_editor_comment(
         """,
         (comment_id, report_id, current_user["id"], author, req.selected_text, req.comment_text),
     )
+    doc_notifications.notify_collaborators(
+        report_id,
+        current_user["id"],
+        event_type="comment_added",
+        reference_id=comment_id,
+    )
     return {"comment": _serialize_comment(rows[0])}
 
 
@@ -1457,7 +1508,7 @@ def reply_editor_comment(
     _ensure_editor_tables()
     verify_report_access(report_id, current_user["id"])
     existing = pg_service.query_one(
-        "SELECT replies_json FROM document_editor_comments WHERE id = %s AND report_id = %s",
+        "SELECT user_id, replies_json FROM document_editor_comments WHERE id = %s AND report_id = %s",
         (comment_id, report_id),
     )
     if not existing:
@@ -1471,6 +1522,7 @@ def reply_editor_comment(
     replies.append(
         {
             "id": f"rpl-{uuid.uuid4().hex[:8]}",
+            "user_id": current_user["id"],
             "author_name": current_user.get("username") or "Reviewer",
             "text": req.reply_text,
             "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -1487,6 +1539,17 @@ def reply_editor_comment(
                   to_char(updated_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS updated_at
         """,
         (json.dumps(replies), comment_id, report_id),
+    )
+
+    participant_ids = [existing.get("user_id")] + [
+        r.get("user_id") for r in replies if isinstance(r, dict) and r.get("user_id")
+    ]
+    doc_notifications.notify_collaborators(
+        report_id,
+        current_user["id"],
+        event_type="comment_reply",
+        target_user_ids=participant_ids,
+        reference_id=comment_id,
     )
     return {"comment": _serialize_comment(rows[0])}
 
@@ -1505,7 +1568,7 @@ def resolve_editor_comment(
         UPDATE document_editor_comments
         SET resolved = %s, updated_at = now()
         WHERE id = %s AND report_id = %s
-        RETURNING id, report_id, author_name, selected_text, comment_text, replies_json, resolved,
+        RETURNING id, report_id, user_id, author_name, selected_text, comment_text, replies_json, resolved,
                   to_char(created_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at,
                   to_char(updated_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS updated_at
         """,
@@ -1513,6 +1576,14 @@ def resolve_editor_comment(
     )
     if not rows:
         raise HTTPException(status_code=404, detail="Comment not found")
+    if rows[0].get("user_id"):
+        doc_notifications.notify_collaborators(
+            report_id,
+            current_user["id"],
+            event_type="comment_resolved",
+            target_user_ids=[rows[0]["user_id"]],
+            reference_id=comment_id,
+        )
     return {"comment": _serialize_comment(rows[0])}
 
 
@@ -1554,7 +1625,7 @@ def export_editor_docx(
 
     report = verify_report_access(report_id, current_user["id"])
     from services.html_docx import build_docx
-    doc = build_docx(req.content_html)
+    doc = build_docx(req.content_html, bilingual_view=req.bilingual_view or "both")
 
     buf = io.BytesIO()
     doc.save(buf)
@@ -1852,14 +1923,24 @@ def editor_heartbeat(
     latest_draft = None
     if req.known_updated_at is not None:
         draft = pg_service.query_one(
-            "SELECT content_html, version, to_char(updated_at, 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at "
-            "FROM document_editor_drafts WHERE report_id = %s",
+            "SELECT d.content_html, d.version, d.user_id, u.username AS editor_name, "
+            "to_char(d.updated_at, 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at "
+            "FROM document_editor_drafts d "
+            "LEFT JOIN users u ON u.id = d.user_id "
+            "WHERE d.report_id = %s",
             (report_id,),
         )
-        if draft and draft.get("updated_at") and draft["updated_at"] != req.known_updated_at:
+        if (
+            draft
+            and draft.get("updated_at")
+            and draft["updated_at"] != req.known_updated_at
+            and draft.get("user_id") != current_user["id"]
+        ):
             latest_draft = {
                 "content_html": draft["content_html"],
                 "version": draft["version"],
+                "editor_name": draft.get("editor_name"),
+                "editor_id": draft.get("user_id"),
                 "updated_at": draft["updated_at"],
             }
 
@@ -2017,12 +2098,14 @@ def restore_editor_version(
         INSERT INTO document_editor_drafts (id, report_id, user_id, content_html, version, updated_at)
         VALUES (%s, %s, %s, %s, 1, now())
         ON CONFLICT (report_id) DO UPDATE SET
+            user_id = EXCLUDED.user_id,
             content_html = EXCLUDED.content_html,
             version = document_editor_drafts.version + 1,
             updated_at = now()
         """,
         (draft_id, report_id, current_user["id"], ver["snapshot_html"]),
     )
+    doc_notifications.notify_collaborators(report_id, current_user["id"], event_type="document_edited")
 
     updated_draft = pg_service.query_one(
         "SELECT version, to_char(updated_at, 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS updated_at FROM document_editor_drafts WHERE report_id = %s",
@@ -2037,6 +2120,16 @@ def restore_editor_version(
         "draft_version": updated_draft["version"] if updated_draft else 1,
         "updated_at": updated_draft["updated_at"] if updated_draft else None,
     }
+
+
+@router.post("/contracts/{report_id}/mark-read", status_code=204)
+def mark_contract_read(
+    report_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    verify_report_access(report_id, current_user["id"])
+    doc_notifications.mark_document_as_read(report_id, current_user["id"])
+    return None
     if not row:
         raise HTTPException(status_code=404, detail="Document report not found")
 

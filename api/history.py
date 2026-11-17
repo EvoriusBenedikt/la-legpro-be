@@ -465,7 +465,19 @@ def get_notebook_documents(report_id: str, current_user: dict = Depends(get_curr
         "FROM compliance_history "
         "WHERE notebook_id = %s ORDER BY created_at ASC",
         (notebook_id,))
-    result: dict = {"documents": docs, "notebook_icon": notebook_icon}
+    from services import doc_notifications
+    doc_ids = [d["id"] for d in (docs or [])]
+    notif_map, muted_docs, is_nb_muted = doc_notifications.get_notebook_docs_notification_map(
+        current_user["id"], doc_ids, notebook_id
+    )
+    for d in (docs or []):
+        d["notification_state"] = notif_map.get(d["id"])
+        d["is_muted"] = d["id"] in muted_docs
+    result: dict = {
+        "documents": docs,
+        "notebook_icon": notebook_icon,
+        "is_muted": is_nb_muted,
+    }
     if notebook_name:
         result["notebook_name"] = notebook_name
     if notebook_description:

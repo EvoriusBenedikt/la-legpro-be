@@ -14,7 +14,7 @@ from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import Inches, Pt, RGBColor
+from docx.shared import Cm, Inches, Pt, RGBColor
 from lxml import html as lhtml
 
 _NAMED = {"white": "FFFFFF", "black": "000000", "red": "FF0000", "blue": "0000FF", "green": "008000",
@@ -273,14 +273,16 @@ def _has_run_size(el) -> bool:
 
 def _make_paragraph(el, container, doc, first_par=None):
     tag = el.tag
+    cls = el.get("class") or ""
     par = first_par if first_par is not None else container.add_paragraph()
     css = _css(el)
-    if tag in ("h1", "h2", "h3") and not _has_run_size(el) and not (el.get("style") and "margin" in el.get("style")):
-        level = {"h1": "Title", "h2": "Heading 1", "h3": "Heading 2"}[tag]
+    if (tag in ("h1", "h2", "h3") or "ed-paper-title" in cls or "ed-clause-" in cls) and not _has_run_size(el) and not (el.get("style") and "margin" in el.get("style")):
+        level = "Title" if (tag == "h1" or "ed-paper-title" in cls) else ("Heading 1" if (tag == "h2" or "ed-clause-heading" in cls) else "Heading 2")
         try:
             par.style = doc.styles[level]
         except KeyError:
             pass
+        par.paragraph_format.keep_with_next = True
     _style_paragraph(par, css)
     _add_inline(el, par, {})
     return par
@@ -364,9 +366,27 @@ def _add_table(tbl_el, container, doc):
     table = container.add_table(rows=nrows, cols=ncols)
     table.autofit = False
     tcss = _css(tbl_el)
+    is_borderless = (
+        tbl_el.get("data-borderless") == "true"
+        or "is-borderless" in (tbl_el.get("class") or "").split()
+    )
     has_borders = any("border-" in (td.get("style") or "") or "border:" in (td.get("style") or "")
                       for _, _, _, _, td in placements)
-    if not has_borders:
+    if is_borderless:
+        tbl_pr = table._tbl.tblPr
+        existing_borders = tbl_pr.find(qn("w:tblBorders"))
+        if existing_borders is not None:
+            tbl_pr.remove(existing_borders)
+        tbl_borders = OxmlElement("w:tblBorders")
+        for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+            el = OxmlElement(f"w:{edge}")
+            el.set(qn("w:val"), "none")
+            el.set(qn("w:sz"), "0")
+            el.set(qn("w:space"), "0")
+            el.set(qn("w:color"), "auto")
+            tbl_borders.append(el)
+        tbl_pr.append(tbl_borders)
+    elif not has_borders:
         try:
             table.style = doc.styles["Table Grid"]
         except KeyError:
@@ -381,12 +401,32 @@ def _add_table(tbl_el, container, doc):
     page_w = _PAGE_W_IN
     if len(pcts) == ncols and all(p is not None for p in pcts):
         widths = [Inches(page_w * p / 100) for p in pcts]
+    elif ncols > 0 and ("bilingual-contract-table" in (tbl_el.get("class") or "") or ncols == 2):
+        widths = [Inches(page_w / ncols) for _ in range(ncols)]
+    else:
+        widths = []
+
+    if widths:
         grid_cols = table._tbl.tblGrid.findall(qn("w:gridCol"))
         for gc, w in zip(grid_cols, widths):
             gc.set(qn("w:w"), str(int(w / 635)))
         for r in table.rows:
             for ci, c in enumerate(r.cells):
                 c.width = widths[ci]
+
+    # Default cell padding & prevent mid-row page splits in Word
+    tblPr = table._tbl.tblPr
+    tblCellMar = OxmlElement("w:tblCellMar")
+    for side, val in (("top", "100"), ("bottom", "100"), ("left", "140"), ("right", "140")):
+        node = OxmlElement(f"w:{side}")
+        node.set(qn("w:w"), val)
+        node.set(qn("w:type"), "dxa")
+        tblCellMar.append(node)
+    tblPr.append(tblCellMar)
+
+    for r in table.rows:
+        trPr = r._tr.get_or_add_trPr()
+        trPr.append(OxmlElement("w:cantSplit"))
 
     # merges first, then content
     for ri, ci, cs, rs, td in placements:
@@ -397,7 +437,16 @@ def _add_table(tbl_el, container, doc):
                 pass
     for ri, ci, cs, rs, td in placements:
         cell = table.cell(ri, ci)
-        _set_cell_xml(cell, _css(td))
+        td_css = _css(td)
+        tr_el = td.getparent()
+        if (
+            tr_el is not None
+            and "bilingual-section-row" in (tr_el.get("class") or "")
+            and "background-color" not in td_css
+            and "background" not in td_css
+        ):
+            td_css["background-color"] = "#f1f5f9"
+        _set_cell_xml(cell, td_css)
         _fill_container(td, cell, doc, first_par=cell.paragraphs[0])
         if td.tag == "th" and not _css(td).get("font-weight"):
             for p in cell.paragraphs:
@@ -445,7 +494,7 @@ def _fill_container(el, container, doc, first_par=None):
             state["par"] = None
         elif tag in ("div", "ul", "ol"):
             if _is_pagebreak(ch):
-                if container is doc:
+                if container is doc and ch.get("data-auto-break") != "true":
                     doc.add_page_break()
                 state["par"] = None
             elif any(isinstance(c.tag, str) and c.tag in _BLOCK_TAGS for c in ch):
@@ -467,11 +516,39 @@ def _is_pagebreak(el) -> bool:
     return "ed-page-break" in (el.get("class") or "") or el.get("data-page-break") == "true"
 
 
-def build_docx(content_html: str):
+def build_docx(content_html: str, bilingual_view: str = "both"):
     """Return a python-docx Document built from editor HTML (suggestion <del> blocks dropped)."""
     cleaned = re.sub(r"<del\b[^>]*>.*?</del>", "", content_html or "", flags=re.DOTALL | re.IGNORECASE)
     root = lhtml.fragment_fromstring(f"<div>{cleaned}</div>")
+
+    if bilingual_view in ("id", "en"):
+        drop_cls = "col-en" if bilingual_view == "id" else "col-id"
+        for tbl in root.xpath(".//table[contains(@class, 'bilingual-contract-table')]"):
+            for td in tbl.xpath(f".//td[contains(@class, '{drop_cls}')]"):
+                parent = td.getparent()
+                if parent is not None:
+                    parent.remove(td)
+            for td in tbl.xpath(".//td[@colspan='2']"):
+                td.attrib.pop("colspan", None)
+
     doc = docx.Document()
+    for sec in doc.sections:
+        sec.page_width = Cm(21.0)
+        sec.page_height = Cm(29.7)
+        sec.top_margin = Cm(2.2)
+        sec.bottom_margin = Cm(2.2)
+        sec.left_margin = Cm(2.2)
+        sec.right_margin = Cm(2.2)
+
+    try:
+        normal = doc.styles["Normal"]
+        normal.font.name = "Arial"
+        normal.font.size = Pt(10.5)
+        normal.paragraph_format.line_spacing = 1.15
+        normal.paragraph_format.space_after = Pt(4)
+    except Exception:
+        pass
+
     # the default template ships one empty paragraph in some versions; keep body clean
     for p in list(doc.paragraphs):
         if not p.text.strip():

@@ -48,7 +48,16 @@ router = APIRouter()
 # migration tooling on existing installs). Only the idempotent dummy
 # template seed remains, still run at import time exactly as before.
 def init_db():
-    """Seed the dummy document templates on a fresh database (idempotent)."""
+    """Seed the dummy document templates and ensure account preference columns exist (idempotent)."""
+    try:
+        pg_service.execute(
+            "ALTER TABLE users "
+            "ADD COLUMN IF NOT EXISTS display_name TEXT, "
+            "ADD COLUMN IF NOT EXISTS avatar_color_index INT NOT NULL DEFAULT 0, "
+            "ADD COLUMN IF NOT EXISTS preferred_governing_lang VARCHAR(8) NOT NULL DEFAULT 'id'"
+        )
+    except Exception:
+        pass
     try:
         if pg_service.query_one("SELECT 1 FROM document_templates LIMIT 1") is not None:
             return
@@ -583,3 +592,196 @@ def get_users(current_user: dict = Depends(get_current_user)):
                 "role": row["role"]
             })
     return {"users": users}
+
+
+class ProfileUpdate(BaseModel):
+    display_name: Optional[str] = None
+    email: Optional[str] = None
+    avatar_color_index: Optional[int] = None
+    preferred_governing_lang: Optional[str] = None
+
+
+@router.get("/account-summary")
+def get_account_summary(current_user: dict = Depends(get_current_user)):
+    uid = current_user["id"]
+    user_row = pg_service.query_one(
+        "SELECT id, username, display_name, email, role, email_verified, "
+        "avatar_color_index, preferred_governing_lang, created_at "
+        "FROM users WHERE id = %s",
+        (uid,),
+    )
+    if not user_row:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    ws_row = pg_service.query_one(
+        "SELECT COUNT(DISTINCT COALESCE(notebook_id, id)) AS c "
+        "FROM compliance_history WHERE user_id = %s",
+        (uid,),
+    )
+    analyzed_row = pg_service.query_one(
+        "SELECT COUNT(*) AS c FROM compliance_history WHERE user_id = %s",
+        (uid,),
+    )
+    collab_row = pg_service.query_one(
+        "SELECT COUNT(*) AS c FROM workspace_collaborators WHERE user_id = %s",
+        (uid,),
+    )
+
+    grant_rows = pg_service.query(
+        "SELECT ag.id, ag.doc_id, ag.expires_at, r.judul, r.nomor, r.jenis "
+        "FROM access_grants ag "
+        "LEFT JOIN regulations r ON r.id = ag.doc_id "
+        "WHERE ag.granted_to = %s AND (ag.expires_at IS NULL OR ag.expires_at > NOW()) "
+        "ORDER BY ag.created_at DESC",
+        (uid,),
+    )
+
+    mute_rows = pg_service.query(
+        "SELECT nm.target_type, nm.target_id, nm.created_at, ch.filename, ch.company_name "
+        "FROM notification_mutes nm "
+        "LEFT JOIN compliance_history ch ON ch.id = nm.target_id "
+        "WHERE nm.user_id = %s "
+        "ORDER BY nm.created_at DESC",
+        (uid,),
+    )
+
+    created_at = user_row.get("created_at")
+    return {
+        "user": {
+            "id": user_row["id"],
+            "username": user_row["username"],
+            "display_name": user_row.get("display_name"),
+            "email": user_row.get("email") or "",
+            "role": user_row.get("role") or "pengguna",
+            "email_verified": bool(user_row.get("email_verified")),
+            "avatar_color_index": int(user_row.get("avatar_color_index") or 0),
+            "preferred_governing_lang": user_row.get("preferred_governing_lang") or "id",
+            "created_at": created_at.isoformat() if hasattr(created_at, "isoformat") else created_at,
+        },
+        "stats": {
+            "workspaces_count": int((ws_row or {}).get("c") or 0),
+            "contracts_analyzed_count": int((analyzed_row or {}).get("c") or 0),
+            "collaborations_count": int((collab_row or {}).get("c") or 0),
+        },
+        "access_grants": [
+            {
+                "id": r["id"],
+                "doc_id": r["doc_id"],
+                "title": r.get("judul") or r["doc_id"],
+                "nomor": r.get("nomor"),
+                "jenis": r.get("jenis"),
+                "expires_at": r["expires_at"].isoformat() if hasattr(r.get("expires_at"), "isoformat") else r.get("expires_at"),
+            }
+            for r in grant_rows
+        ],
+        "muted_items": [
+            {
+                "target_type": r["target_type"],
+                "target_id": r["target_id"],
+                "title": r.get("filename") or r.get("company_name") or r["target_id"],
+                "muted_at": r["created_at"].isoformat() if hasattr(r.get("created_at"), "isoformat") else r.get("created_at"),
+            }
+            for r in mute_rows
+        ],
+    }
+
+
+@router.patch("/profile")
+def update_profile(data: ProfileUpdate, request: Request, current_user: dict = Depends(get_current_user)):
+    uid = current_user["id"]
+    existing = pg_service.query_one(
+        "SELECT username, display_name, email, email_verified, avatar_color_index, preferred_governing_lang "
+        "FROM users WHERE id = %s",
+        (uid,),
+    )
+    if not existing:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    sets = []
+    params = []
+
+    if data.display_name is not None:
+        cleaned_name = data.display_name.strip()[:120]
+        sets.append("display_name = %s")
+        params.append(cleaned_name or None)
+
+    if data.email is not None:
+        cleaned_email = data.email.strip()
+        if not cleaned_email or not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", cleaned_email):
+            raise HTTPException(status_code=400, detail="Invalid email address")
+        if cleaned_email.lower() != (existing.get("email") or "").lower():
+            dup = pg_service.query_one(
+                "SELECT id FROM users WHERE LOWER(email) = LOWER(%s) AND id <> %s",
+                (cleaned_email, uid),
+            )
+            if dup:
+                raise HTTPException(status_code=409, detail="Email is already in use")
+            sets.append("email = %s")
+            params.append(cleaned_email)
+            sets.append("email_verified = FALSE")
+
+    if data.avatar_color_index is not None:
+        if not (0 <= data.avatar_color_index <= 7):
+            raise HTTPException(status_code=400, detail="avatar_color_index must be between 0 and 7")
+        sets.append("avatar_color_index = %s")
+        params.append(data.avatar_color_index)
+
+    if data.preferred_governing_lang is not None:
+        lang = data.preferred_governing_lang.strip().lower()
+        if lang not in ("id", "en"):
+            raise HTTPException(status_code=400, detail="preferred_governing_lang must be 'id' or 'en'")
+        sets.append("preferred_governing_lang = %s")
+        params.append(lang)
+
+    if sets:
+        params.append(uid)
+        updated = pg_service.execute_returning(
+            f"UPDATE users SET {', '.join(sets)} WHERE id = %s "
+            "RETURNING id, username, display_name, email, role, email_verified, "
+            "avatar_color_index, preferred_governing_lang, created_at",
+            tuple(params),
+        )[0]
+    else:
+        updated = pg_service.query_one(
+            "SELECT id, username, display_name, email, role, email_verified, "
+            "avatar_color_index, preferred_governing_lang, created_at "
+            "FROM users WHERE id = %s",
+            (uid,),
+        )
+
+    if data.avatar_color_index is not None:
+        pg_service.execute(
+            "UPDATE workspace_collaborators SET color_index = %s WHERE user_id = %s",
+            (data.avatar_color_index, uid),
+        )
+
+    log_audit(uid, "PROFILE_UPDATE", existing["username"],
+              f'ip={get_client_ip(request)} ua="{get_user_agent(request)}"')
+
+    created_at = updated.get("created_at")
+    return {
+        "user": {
+            "id": updated["id"],
+            "username": updated["username"],
+            "display_name": updated.get("display_name"),
+            "email": updated.get("email") or "",
+            "role": updated.get("role") or "pengguna",
+            "email_verified": bool(updated.get("email_verified")),
+            "avatar_color_index": int(updated.get("avatar_color_index") or 0),
+            "preferred_governing_lang": updated.get("preferred_governing_lang") or "id",
+            "created_at": created_at.isoformat() if hasattr(created_at, "isoformat") else created_at,
+        }
+    }
+
+
+@router.post("/logout-all-devices")
+def logout_all_devices(request: Request, current_user: dict = Depends(get_current_user)):
+    uid = current_user["id"]
+    row = pg_service.execute_returning(
+        "UPDATE users SET token_version = token_version + 1 WHERE id = %s RETURNING username",
+        (uid,),
+    )
+    username = row[0]["username"] if row else uid
+    log_audit(uid, "LOGOUT_ALL_DEVICES", username,
+              f'ip={get_client_ip(request)} ua="{get_user_agent(request)}"')
+    return {"status": "ok"}

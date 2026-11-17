@@ -22,6 +22,7 @@ class ChatRequest(BaseModel):
     messages: List[ChatMessage] = []
     report_id: str | None = None   # B3: current workspace; None => no narrowing
     editor_context: dict | None = None  # Live editor status from client
+    rag_scope: str = "all"  # "all" | "document_only"
 
 class ChatResponse(BaseModel):
     answer: str
@@ -30,6 +31,12 @@ class ChatResponse(BaseModel):
     # user message before this turn). The FE uses it to replace the default
     # "Percakapan N" title with something descriptive. None = no change.
     suggested_title: str | None = None
+    action_proposal: dict | None = None
+    tool_steps: List[dict] = []
+
+
+class ExecuteAgentActionRequest(BaseModel):
+    approved_patch_ids: List[str] | None = None
 
 class SessionRequest(BaseModel):
     title: str
@@ -152,8 +159,8 @@ def _build_document_context(
         editor_parts.append("- Status Draf Editor: Belum ada draf revisi baru tersimpan (dokumen masih dalam versi asli yang diunggah).")
 
     if comments_rows:
-        open_cmts = [c for c in comments_rows if c.get("status") == "open"]
-        resolved_cmts = [c for c in comments_rows if c.get("status") == "resolved"]
+        open_cmts = [c for c in comments_rows if not c.get("resolved")]
+        resolved_cmts = [c for c in comments_rows if c.get("resolved")]
         editor_parts.append(f"- Catatan/Komentar Editor: {len(open_cmts)} catatan terbuka (open), {len(resolved_cmts)} telah diselesaikan (resolved).")
         if open_cmts:
             top_notes = [f'"{c["selected_text"]}": {c["comment_text"]}' for c in open_cmts[:3] if c.get("comment_text")]
@@ -165,6 +172,41 @@ def _build_document_context(
             editor_parts.append("- Catatan Sesi Browser: Terdapat draf revisi aktif di sesi browser pengguna.")
         if editor_context.get("has_local_comments"):
             editor_parts.append("- Catatan Sesi Browser: Terdapat catatan review aktif di sesi browser pengguna.")
+
+    # 5. Bilingual (ID <-> EN) Translation Discrepancies & Layout
+    bilingual_section = ""
+    is_bilingual = bool(
+        results_data.get("is_bilingual")
+        or results_data.get("layout_mode") == "bilingual_parallel"
+    )
+    discrepancies = results_data.get("translation_discrepancies") or []
+    segments = results_data.get("segments") or []
+    if is_bilingual or discrepancies:
+        gov_lang = (results_data.get("governing_language") or "id").upper()
+        bi_parts = [
+            f"- Mode Dokumen: Kontrak Dwibahasa (ID ↔ EN), Bahasa Utama/Mengatur: {gov_lang}",
+            f"- Total Segmen Terpasang: {len(segments)}",
+            f"- Total Ketidaksesuaian Terjemahan Terdeteksi: {len(discrepancies)}",
+        ]
+        if discrepancies:
+            for d in discrepancies[:15]:
+                sid = d.get("segment_id") or "-"
+                cat = d.get("category") or "discrepancy"
+                sev = d.get("severity") or "medium"
+                exp = d.get("explanation") or ""
+                id_ex = (d.get("id_excerpt") or "").strip()[:160]
+                en_ex = (d.get("en_excerpt") or "").strip()[:160]
+                bi_parts.append(
+                    f"• [{sid}] ({sev} · {cat}): {exp}"
+                    + (f"\n  - ID: \"{id_ex}\"" if id_ex else "")
+                    + (f"\n  - EN: \"{en_ex}\"" if en_ex else "")
+                )
+        else:
+            bi_parts.append("- Tidak ditemukan perbedaan kewajiban (obligation shift) atau angka yang mencurigakan antara kolom ID dan EN.")
+        bilingual_section = (
+            "\n5. ANALISIS TERJEMAHAN DWIBAHASA (ID ↔ EN TRANSLATION DISCREPANCIES):\n"
+            + "\n".join(bi_parts) + "\n"
+        )
 
     doc_context_str = (
         "\n"
@@ -179,10 +221,11 @@ def _build_document_context(
         + "\n".join(problem_parts) + "\n\n"
         "4. SITUASI / PERUBAHAN DI EDITOR DOKUMEN (DOCUMENT EDITOR SITUATION):\n"
         + "\n".join(editor_parts) + "\n"
+        + bilingual_section +
         "═══════════════════════════════════════════════════════════════════════\n"
         "INSTRUKSI KHUSUS UNTUK DOKUMEN INI:\n"
         "- Anda memiliki pengetahuan LENGKAP dan LANGSUNG mengenai dokumen yang sedang dibuka di atas.\n"
-        "- Saat pengguna bertanya tentang skor kepatuhan, klausul yang berisiko/fatal/sesuai, identitas kontrak, atau revisi di editor, jawablah secara SPESIFIK dan AKURAT berdasarkan data resmi di atas.\n"
+        "- Saat pengguna bertanya tentang skor kepatuhan, klausul yang berisiko/fatal/sesuai, identitas kontrak, revisi di editor, atau perbedaan terjemahan ID ↔ EN, jawablah secara SPESIFIK dan AKURAT berdasarkan data resmi di atas.\n"
         "- Jika pengguna meminta saran perbaikan atau revisi klausul tertentu, gunakan klausul bermasalah dan rekomendasi di atas sebagai dasar acuan.\n"
         "- Selalu bersikap responsif dan siap membantu pengguna memperbaiki dokumen ini.\n\n"
     )
@@ -242,7 +285,7 @@ async def chat_endpoint(
     )
     
     # 1. Retrieve Semantic Context (skip if question is clearly about uploaded attachment)
-    from services.rag_service import retrieve_contexts
+    from services.rag_service import retrieve_contexts, list_workspace_references
     from services.kg_service import retrieve_graph_contexts
     from services.db_service import log_audit
     # 2026-10-03: retrieval is best-effort. A missing embedder/reranker (a
@@ -253,8 +296,8 @@ async def chat_endpoint(
     # is appended to the answer, so the degradation is loud, never silent.
     retrieval_degraded = False
     
-    if is_attachment_focused:
-        # Skip knowledge base retrieval when the question is about the uploaded document
+    if is_attachment_focused or (req.rag_scope == "document_only" and req.report_id):
+        # Skip external knowledge base retrieval when attachment-focused or scoped to this document only
         contexts = []
         graph_context = ""
     else:
@@ -269,12 +312,10 @@ async def chat_endpoint(
         # FR-16: 1.5 Retrieve Graph Context
         graph_context = retrieve_graph_contexts(last_user_message, current_user=current_user)
     
-    # FR-16: 1.5 Retrieve Graph Context
-    graph_context = retrieve_graph_contexts(last_user_message, current_user=current_user)
-    
     # Format context for the prompt
     context_str = ""
     sources_to_return = []
+    has_workspace_refs = False
     for i, c in enumerate(contexts):
         sources_to_return.append({
             "id": c['id'],
@@ -286,7 +327,12 @@ async def chat_endpoint(
             "rerank_score": c.get('rerank_score'),
             "filename": c.get('filename')
         })
-        context_str += f"SUMBER [{i+1}]: {c['jenis']} Nomor {c['nomor']}\nTEKS:\n{c['text']}\n\n"
+        if c.get("is_workspace_ref"):
+            has_workspace_refs = True
+            ref_title = c.get("judul") or c.get("nomor") or "Dokumen Referensi"
+            context_str += f"SUMBER [{i+1}] (DOKUMEN REFERENSI INTERNAL WORKSPACE): {c['jenis']} — {ref_title}\nTEKS:\n{c['text']}\n\n"
+        else:
+            context_str += f"SUMBER [{i+1}] (REGULASI PUBLIK — BUKAN DOKUMEN INTERNAL): {c['jenis']} Nomor {c['nomor']}\nTEKS:\n{c['text']}\n\n"
 
     if graph_context:
         context_str += f"\n{graph_context}\n\n"
@@ -369,15 +415,24 @@ async def chat_endpoint(
     # ── Document Context (when chatbot is opened inside an active document workspace) ──
     doc_context_str = ""
     doc_meta = None
+    workspace_ref_names: list[str] = []
     target_report_id = (req.report_id or "").strip()
     if target_report_id:
+        try:
+            workspace_ref_names = list_workspace_references(current_user["id"], target_report_id)
+        except Exception as e:
+            print(f"Failed to list workspace references for report_id={target_report_id}: {e}")
         try:
             report_row = pg_service.query_one(
                 "SELECT id, filename, company_name, "
                 "to_char(expiration_date, 'YYYY-MM-DD') AS expiration_date, "
                 "results_json "
-                "FROM compliance_history WHERE id = %s AND user_id = %s",
-                (target_report_id, current_user["id"]),
+                "FROM compliance_history WHERE id = %s AND (user_id = %s OR EXISTS ("
+                "  SELECT 1 FROM workspace_collaborators wc "
+                "  WHERE wc.notebook_id = COALESCE(compliance_history.notebook_id, compliance_history.id) "
+                "  AND wc.user_id = %s"
+                "))",
+                (target_report_id, current_user["id"], current_user["id"]),
             )
             draft_row = pg_service.query_one(
                 "SELECT version, "
@@ -387,7 +442,7 @@ async def chat_endpoint(
                 (target_report_id,),
             )
             comments_rows = pg_service.query(
-                "SELECT author_name, selected_text, comment_text, status "
+                "SELECT author_name, selected_text, comment_text, resolved "
                 "FROM document_editor_comments WHERE report_id = %s "
                 "ORDER BY created_at DESC LIMIT 10",
                 (target_report_id,),
@@ -550,6 +605,29 @@ async def chat_endpoint(
         "   - When quoting a regulation's number, year, or article that appears in a source, reproduce it EXACTLY as written there — never alter digits, years, or abbreviations.\n\n"
         "Always provide actionable solutions and naturally cite relevant legal bases/articles."
     )
+    if target_report_id:
+        if workspace_ref_names:
+            ref_list_str = ", ".join(workspace_ref_names)
+            system_prompt += (
+                f"\nDAFTAR DOKUMEN REFERENSI INTERNAL WORKSPACE: {ref_list_str}. "
+                "Sumber yang ditandai '(DOKUMEN REFERENSI INTERNAL WORKSPACE)' adalah dokumen referensi khusus "
+                "yang diunggah untuk ruang kerja dokumen ini. Saat meninjau, membandingkan, atau menyarankan revisi "
+                "terhadap dokumen yang sedang dibuka, gunakan dan rujuk dokumen referensi internal tersebut secara aktif "
+                "bersama regulasi yang berlaku, dan sertakan penanda [n]-nya. "
+                "JANGAN pernah menyebut sumber bertanda '(REGULASI PUBLIK — BUKAN DOKUMEN INTERNAL)' sebagai dokumen referensi internal."
+            )
+        else:
+            system_prompt += (
+                "\nSTATUS DOKUMEN REFERENSI INTERNAL WORKSPACE: Belum ada dokumen referensi internal yang diunggah/aktif "
+                "untuk workspace ini. Jika pengguna menanyakan dokumen referensi internal, sampaikan secara jujur bahwa "
+                "belum ada dokumen referensi internal di workspace ini — JANGAN pernah menyebut '(REGULASI PUBLIK — BUKAN DOKUMEN INTERNAL)' "
+                "sebagai dokumen referensi internal."
+            )
+    elif has_workspace_refs:
+        system_prompt += (
+            "\nDOKUMEN REFERENSI WORKSPACE: Sumber yang ditandai '(DOKUMEN REFERENSI INTERNAL WORKSPACE)' "
+            "adalah dokumen referensi khusus yang diunggah untuk ruang kerja dokumen ini."
+        )
     if retrieval_degraded:
         system_prompt += (
             "\nRETRIEVAL UNAVAILABLE: the regulation database could not be searched for this question. "
@@ -592,10 +670,16 @@ async def chat_endpoint(
     user_content = enriched_user_prompt
     if vision_parts:
         user_content = vision_parts + [{"type": "text", "text": enriched_user_prompt}]
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user",   "content": user_content}
+    prior_turns = [
+        {"role": m.role, "content": m.content}
+        for m in req.messages[:-1][-6:]
+        if m.role in ("user", "assistant") and m.content
     ]
+    messages = (
+        [{"role": "system", "content": system_prompt}]
+        + prior_turns
+        + [{"role": "user", "content": user_content}]
+    )
     # FR-25: Audit log the search query -- moved BEFORE the LLM call so a
     # failed generation is still auditable (critique remediation, 2026-10-08).
     log_audit(current_user.get("id", ""), "SEARCH", "", f"Query: {last_user_message[:200]}")
@@ -677,7 +761,62 @@ async def chat_endpoint(
             print(f"Title generation failed (non-fatal): {e}")
     # ── End title generation ────────────────────────────────────────────────
 
-    return ChatResponse(answer=answer, sources=sources_to_return, suggested_title=suggested_title)
+    action_proposal: dict | None = None
+    tool_steps: list[dict] = []
+    if target_report_id:
+        try:
+            from services import agent_service
+            if agent_service.is_patch_intent(last_user_message):
+                proposal = await run_in_threadpool(
+                    agent_service.propose_clause_patches,
+                    target_report_id,
+                    current_user["id"],
+                    last_user_message,
+                )
+                if proposal:
+                    tool_steps = proposal.pop("tool_steps", [])
+                    action_proposal = proposal
+        except Exception as e:
+            print(f"[Agent] Proposal generation skipped: {e}")
+
+    return ChatResponse(
+        answer=answer,
+        sources=sources_to_return,
+        suggested_title=suggested_title,
+        action_proposal=action_proposal,
+        tool_steps=tool_steps,
+    )
+
+
+@router.post("/chat/actions/{action_id}/execute")
+async def execute_chat_action(
+    action_id: str,
+    req: ExecuteAgentActionRequest | None = None,
+    current_user: dict = Depends(auth.get_current_user),
+):
+    from services import agent_service
+    approved_ids = req.approved_patch_ids if req else None
+    author_name = current_user.get("username") or "Legal Advisor"
+    return await run_in_threadpool(
+        agent_service.execute_agent_action,
+        action_id,
+        current_user["id"],
+        author_name,
+        approved_ids,
+    )
+
+
+@router.post("/chat/actions/{action_id}/reject")
+async def reject_chat_action(
+    action_id: str,
+    current_user: dict = Depends(auth.get_current_user),
+):
+    from services import agent_service
+    return await run_in_threadpool(
+        agent_service.reject_agent_action,
+        action_id,
+        current_user["id"],
+    )
 
 @router.post("/chat-session")
 async def save_chat_session(req: ChatRequest, current_user: dict = Depends(auth.get_current_user)):

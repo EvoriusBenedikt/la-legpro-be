@@ -391,7 +391,12 @@ def _cell_html(tc, parent, nested_ctx=None) -> str:
     return "".join(parts)
 
 
-def table_to_html(tbl) -> str:
+def table_to_html(
+    tbl,
+    bilingual_order: list[str] | None = None,
+    borderless: bool = False,
+    page_char_budget: int = 0,
+) -> str:
     tblEl = tbl._tbl
     grid = []
     for g in tblEl.xpath("./w:tblGrid/w:gridCol"):
@@ -471,15 +476,59 @@ def table_to_html(tbl) -> str:
         widths = grid
     total = sum(widths) if widths else 0
 
-    out = ['<table class="ed-doc-table">']
+    classes = ["ed-doc-table"]
+    extra_attrs = []
+    if bilingual_order and bilingual_order in (["en", "id"], ["id", "en"]):
+        classes.append("bilingual-contract-table")
+        extra_attrs.append(f'data-column-order="{bilingual_order[0]},{bilingual_order[1]}"')
+    else:
+        bilingual_order = None
+    if borderless:
+        if bilingual_order:
+            classes.append("is-borderless")
+        extra_attrs.append('data-borderless="true"')
+    attr_str = f' {" ".join(extra_attrs)}' if extra_attrs else ""
+    table_open_parts = [f'<table class="{" ".join(classes)}"{attr_str}>']
     if total:
-        out.append("<colgroup>" + "".join(
+        table_open_parts.append("<colgroup>" + "".join(
             f'<col style="width:{w / total * 100:.2f}%"/>' for w in widths) + "</colgroup>")
-    out.append("<tbody>")
+    table_open_parts.append("<tbody>")
+    table_open = "".join(table_open_parts)
+    out = [table_open]
     nrows = len(rows)
+    running_chars = 0
+    open_rowspan_until = 0
     for ri, r in enumerate(rows):
-        out.append("<tr>")
-        for c in r:
+        row_has_break = any(
+            c["tc"].xpath(".//w:br[@w:type='page'] | .//w:pPr/w:pageBreakBefore")
+            for c in r
+        )
+        if (
+            page_char_budget > 0
+            and ri > 0
+            and ri >= open_rowspan_until
+            and (row_has_break or running_chars >= page_char_budget)
+        ):
+            out.append("</tbody></table>")
+            auto_attr = "" if row_has_break else ' data-auto-break="true"'
+            out.append(
+                f'<div class="ed-page-break" contenteditable="false" role="separator" '
+                f'aria-label="Page Break" data-page-break="true"{auto_attr}></div>'
+            )
+            out.append(table_open)
+            running_chars = 0
+
+        if bilingual_order and len(r) == 1 and r[0]["span"] >= 2:
+            out.append('<tr class="bilingual-section-row">')
+        elif bilingual_order and len(r) == 2:
+            out.append('<tr class="bilingual-clause-row">')
+        else:
+            out.append("<tr>")
+        row_chars = 0
+        for cell_idx, c in enumerate(r):
+            if c["rowspan"] > 1:
+                open_rowspan_until = max(open_rowspan_until, ri + c["rowspan"])
+            row_chars = max(row_chars, len("".join(c["tc"].itertext()).strip()))
             tc = c["tc"]
             css = []
             shd = tc.xpath("./w:tcPr/w:shd/@w:fill")
@@ -507,12 +556,16 @@ def table_to_html(tbl) -> str:
             va = (tc.xpath("./w:tcPr/w:vAlign/@w:val") or [None])[0]
             css.append(f"vertical-align:{ {'center': 'middle', 'bottom': 'bottom'}.get(va, 'top') }")
             attrs = ""
+            if bilingual_order and len(r) == 2 and c["span"] == 1:
+                lang = bilingual_order[cell_idx]
+                attrs += f' class="col-{lang}" lang="{lang}"'
             if c["span"] > 1:
                 attrs += f' colspan="{c["span"]}"'
             if c["rowspan"] > 1:
                 attrs += f' rowspan="{c["rowspan"]}"'
             out.append(f'<td{attrs} style="{";".join(css)}">{_cell_html(tc, tbl)}</td>')
         out.append("</tr>")
+        running_chars += row_chars
     out.append("</tbody></table>")
     return "".join(out)
 
