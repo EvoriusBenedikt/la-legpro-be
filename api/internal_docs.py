@@ -161,7 +161,11 @@ def upload_internal_doc(
         ids = [f"internal_{upload_id}_{i}" for i in range(len(chunks))]
         texts = [c["text"] for c in chunks]
         windows = [(c.get("metadata") or {}).get("window_context") for c in chunks]
-        embeddings = embed_documents(texts)
+        try:
+            embeddings = embed_documents(texts)
+        except ModuleNotFoundError as emb_err:
+            print(f"[InternalDocs] Embedding model unavailable locally ({emb_err}); storing chunks without vector embeddings.")
+            embeddings = [None] * len(texts)
 
         with pg_service.get_conn() as conn:
             if replace:
@@ -194,6 +198,18 @@ def upload_internal_doc(
                      "Internal", file.filename, "private", str(current_user["id"]),
                      report_id, emb))
         
+        if report_id:
+            import threading
+            from services import kb_sync
+            kb_sync.mark_report_stale(report_id, "workspace_reference_updated")
+            uid_str = str(current_user["id"])
+            def _bg_recheck():
+                try:
+                    kb_sync.recheck_report_compliance(report_id, None, uid_str)
+                except Exception as bg_err:
+                    print(f"[KBSync] Background recheck failed for {report_id}: {bg_err}")
+            threading.Thread(target=_bg_recheck, daemon=True).start()
+
         return {"status": "success", "message": f"Successfully ingested {len(chunks)} chunks.", "filename": file.filename}
         
     except HTTPException:
@@ -220,6 +236,12 @@ def delete_internal_doc(
 
     with pg_service.get_conn() as conn:
         with conn.transaction():
+            affected_rows = conn.execute(
+                "SELECT DISTINCT report_id FROM chunks "
+                "WHERE visibility = 'private' AND user_id = %s::text "
+                "AND doc_id IS NULL AND id LIKE %s AND report_id IS NOT NULL",
+                (uid, like_pattern),
+            ).fetchall()
             cur = conn.execute(
                 "DELETE FROM chunks "
                 "WHERE visibility = 'private' AND user_id = %s::text "
@@ -232,6 +254,13 @@ def delete_internal_doc(
                 "WHERE user_id = %s AND source_ref = %s",
                 (uid, source_ref),
             )
+
+    if affected_rows:
+        from services import kb_sync
+        for r in affected_rows:
+            rid = r.get("report_id") if isinstance(r, dict) else r[0]
+            if rid:
+                kb_sync.mark_report_stale(rid, "workspace_reference_removed")
 
     if deleted_chunks == 0:
         raise HTTPException(status_code=404, detail="Internal reference not found.")

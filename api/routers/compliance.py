@@ -394,17 +394,57 @@ async def analyze_pasals(
         return {"pasals": [], "error": str(e)}
 
 
-def process_single_pasal(c, doc_type, pihak_1, pihak_2, sektor, pokok, COSINE_THRESHOLD, uid, excluded, report_id,
-                         pihak_kita_nama="", peran_kita=None, contract_categories=None, precomputed_vec=None):
+def _rerank_candidate_regulations(
+    desc: str,
+    candidates: list[dict],
+    min_score: Optional[float] = None,
+    max_keep: int = 5,
+) -> list[dict]:
+    """Filter/rank borderline regulation candidates (0.28 <= dist < COSINE_THRESHOLD)
+    using the local CrossEncoder reranker instead of a per-clause LLM call.
+
+    Falls back to distance-sorted top-3 candidates if the reranker is unavailable.
+    """
+    if not candidates:
+        return []
+    if min_score is None:
+        min_score = float(os.environ.get("RERANKER_MIN_SCORE", "-2.0"))
+    try:
+        from services.rag_service import get_reranker
+        reranker = get_reranker()
+        pairs = [[desc[:500], c["text"][:500]] for c in candidates]
+        scores = reranker.predict(pairs)
+        scored = sorted(
+            zip(candidates, scores),
+            key=lambda item: float(item[1]),
+            reverse=True,
+        )
+        kept = [c for c, score in scored if float(score) >= min_score][:max_keep]
+        return kept
+    except Exception as e:
+        print(f"  [Reranker] Falling back to cosine order: {e}")
+        return sorted(candidates, key=lambda c: float(c["row"]["dist"]))[:3]
+
+
+def _retrieve_clause_context(
+    c: dict,
+    doc_type: str,
+    sektor: str,
+    COSINE_THRESHOLD: float,
+    uid: str,
+    excluded: set,
+    report_id: Optional[str],
+    contract_categories=None,
+    precomputed_vec=None,
+) -> Optional[dict]:
+    """Retrieve and cross-encoder-rerank supporting regulations for one clause."""
     pasal_label = c.get("pasal", "Pasal")
     desc = c.get("deskripsi", "")
     if not desc or len(desc) < 10:
         return None
 
-    # Map doc_type to doc_category
     doc_cat = "NDA" if "NDA" in str(doc_type).upper() or "NON-DISCLOSURE" in str(doc_type).upper() else "PKS"
 
-    # Reuse precomputed batch embedding if provided
     if precomputed_vec is not None:
         query_vec = precomputed_vec
     else:
@@ -416,7 +456,7 @@ def process_single_pasal(c, doc_type, pihak_1, pihak_2, sektor, pokok, COSINE_TH
         conn.execute("SET LOCAL hnsw.ef_search = 100")
         conn.execute("SET LOCAL hnsw.iterative_scan = strict_order")
         if cat_filter:
-            cur = conn.execute(
+            pub_cur = conn.execute(
                 "SELECT c.id, c.doc_id, c.text, c.jenis, c.nomor, c.sektor, "
                 "c.embedding <=> %s::vector AS dist, "
                 "r.id AS regulation_id, r.legal_status, r.status_note, r.last_verified_at, r.detail_url "
@@ -425,14 +465,11 @@ def process_single_pasal(c, doc_type, pihak_1, pihak_2, sektor, pokok, COSINE_TH
                 "WHERE c.embedding IS NOT NULL "
                 "AND COALESCE(c.is_active_law, TRUE) = TRUE "
                 "AND (c.doc_id IS NULL OR COALESCE(r.legal_status, 'berlaku') IN ('berlaku', 'diubah', 'dicabut_sebagian')) "
-                "AND ( (c.doc_category = ANY(%s) AND c.category_code = ANY(%s)) "
-                "      OR (c.visibility = 'private' AND c.user_id = %s::text "
-                "          AND c.doc_id IS NULL AND c.id LIKE 'internal\\_%%' "
-                "          AND (c.report_id IS NULL OR c.report_id = %s)) ) "
-                "ORDER BY c.embedding <=> %s::vector LIMIT 3",
-                (query_vec, [doc_cat, "UMUM", "regulations"], cat_filter, uid, report_id, query_vec))
+                "AND c.doc_category = ANY(%s) AND c.category_code = ANY(%s) "
+                "ORDER BY c.embedding <=> %s::vector LIMIT 8",
+                (query_vec, [doc_cat, "UMUM", "regulations"], cat_filter, query_vec))
         else:
-            cur = conn.execute(
+            pub_cur = conn.execute(
                 "SELECT c.id, c.doc_id, c.text, c.jenis, c.nomor, c.sektor, "
                 "c.embedding <=> %s::vector AS dist, "
                 "r.id AS regulation_id, r.legal_status, r.status_note, r.last_verified_at, r.detail_url "
@@ -441,15 +478,32 @@ def process_single_pasal(c, doc_type, pihak_1, pihak_2, sektor, pokok, COSINE_TH
                 "WHERE c.embedding IS NOT NULL "
                 "AND COALESCE(c.is_active_law, TRUE) = TRUE "
                 "AND (c.doc_id IS NULL OR COALESCE(r.legal_status, 'berlaku') IN ('berlaku', 'diubah', 'dicabut_sebagian')) "
-                "AND ( c.doc_category = ANY(%s) "
-                "      OR (c.visibility = 'private' AND c.user_id = %s::text "
-                "          AND c.doc_id IS NULL AND c.id LIKE 'internal\\_%%' "
-                "          AND (c.report_id IS NULL OR c.report_id = %s)) ) "
-                "ORDER BY c.embedding <=> %s::vector LIMIT 3",
-                (query_vec, [doc_cat, "UMUM", "regulations"], uid, report_id, query_vec))
-        sr_rows = cur.fetchall()
+                "AND c.doc_category = ANY(%s) "
+                "ORDER BY c.embedding <=> %s::vector LIMIT 8",
+                (query_vec, [doc_cat, "UMUM", "regulations"], query_vec))
+        pub_rows = pub_cur.fetchall()
 
-    # B2: drop deselected sources before the distance/relevance loop.
+        int_cur = conn.execute(
+            "SELECT c.id, c.doc_id, c.text, c.jenis, c.nomor, c.sektor, "
+            "c.embedding <=> %s::vector AS dist, "
+            "NULL::integer AS regulation_id, 'berlaku' AS legal_status, "
+            "NULL::text AS status_note, NULL::timestamptz AS last_verified_at, NULL::text AS detail_url "
+            "FROM chunks c "
+            "WHERE c.embedding IS NOT NULL "
+            "AND c.visibility = 'private' AND c.user_id = %s::text "
+            "AND c.doc_id IS NULL AND c.id LIKE 'internal\\_%%' "
+            "AND (c.report_id IS NULL OR c.report_id = %s) "
+            "ORDER BY c.embedding <=> %s::vector LIMIT 5",
+            (query_vec, uid, report_id, query_vec))
+        int_rows = int_cur.fetchall()
+
+        seen_ids = set()
+        sr_rows = []
+        for r in int_rows + pub_rows:
+            if r["id"] not in seen_ids:
+                seen_ids.add(r["id"])
+                sr_rows.append(r)
+
     from services.rag_service import chunk_source_ref
     sr_rows = [r for r in sr_rows
                if chunk_source_ref(r["doc_id"], r["id"]) not in excluded]
@@ -458,7 +512,6 @@ def process_single_pasal(c, doc_type, pihak_1, pihak_2, sektor, pokok, COSINE_TH
     relevant_refs = []
 
     if sr_rows:
-        from services.rag_service import filter_relevant_regulations_batch
         within_thresh = []
         for row in sr_rows:
             if float(row["dist"]) < COSINE_THRESHOLD:
@@ -468,20 +521,15 @@ def process_single_pasal(c, doc_type, pihak_1, pihak_2, sektor, pokok, COSINE_TH
                     "reg_name": f"{row['jenis'] or 'Aturan'} Nomor {row['nomor'] or 'N/A'}",
                 })
         if within_thresh:
-            # High-confidence matches (< 0.28) are kept directly; others verified in 1 batched call
-            need_check = [c for c in within_thresh if float(c["row"]["dist"]) >= 0.28]
-            auto_keep = [c for c in within_thresh if float(c["row"]["dist"]) < 0.28]
-            kept_checked = []
-            if need_check:
-                valid_idxs = set(filter_relevant_regulations_batch(desc, need_check))
-                for idx, c in enumerate(need_check):
-                    if idx in valid_idxs:
-                        kept_checked.append(c)
-                    else:
-                        print(f"  [Relevance] {c['reg_name']} rejected for {pasal_label}")
+            # High-confidence matches (< 0.28) are kept directly; borderline
+            # matches (0.28..0.45) are scored by the CrossEncoder reranker.
+            need_check = [cand for cand in within_thresh if float(cand["row"]["dist"]) >= 0.28]
+            auto_keep = [cand for cand in within_thresh if float(cand["row"]["dist"]) < 0.28]
+            kept_checked = _rerank_candidate_regulations(desc, need_check) if need_check else []
+
             matched_reg_ids = [
-                c["row"]["regulation_id"] for c in (auto_keep + kept_checked)
-                if c["row"].get("regulation_id") is not None
+                cand["row"]["regulation_id"] for cand in (auto_keep + kept_checked)
+                if cand["row"].get("regulation_id") is not None
             ]
             amendment_map = {}
             if matched_reg_ids:
@@ -489,8 +537,8 @@ def process_single_pasal(c, doc_type, pihak_1, pihak_2, sektor, pokok, COSINE_TH
                 with pg_service.get_conn() as conn:
                     amendment_map = get_amendment_chain(conn, matched_reg_ids)
 
-            for c in auto_keep + kept_checked:
-                row = c["row"]
+            for cand in auto_keep + kept_checked:
+                row = cand["row"]
                 reg_id = row.get("regulation_id")
                 legal_status = row.get("legal_status") or "berlaku"
                 amended_by = amendment_map.get(reg_id, []) if reg_id is not None else []
@@ -500,7 +548,7 @@ def process_single_pasal(c, doc_type, pihak_1, pihak_2, sektor, pokok, COSINE_TH
                     "jenis": row['jenis'] or 'Aturan',
                     "nomor": row['nomor'] or 'N/A',
                     "sektor": row['sektor'] or 'Umum',
-                    "teks": c["text"],
+                    "teks": cand["text"],
                     "legal_status": legal_status,
                     "status_note": row.get("status_note"),
                     "last_verified_at": lv_at.isoformat() if hasattr(lv_at, "isoformat") else lv_at,
@@ -511,23 +559,72 @@ def process_single_pasal(c, doc_type, pihak_1, pihak_2, sektor, pokok, COSINE_TH
                 if amended_by:
                     labels = ", ".join(a.get("canonical_key") or "" for a in amended_by if a.get("canonical_key"))
                     amend_note = f"\n[Catatan Perubahan: {legal_status.upper()} oleh {labels}]"
-                relevant_refs.append(f"--- {c['reg_name']} ({legal_status}) ---{amend_note}\n{c['text'][:700]}")
+                relevant_refs.append(f"--- {cand['reg_name']} ({legal_status}) ---{amend_note}\n{cand['text'][:700]}")
+
+    return {
+        "pasal_label": pasal_label,
+        "desc": desc,
+        "supporting_regulations": supporting_regulations,
+        "relevant_refs": relevant_refs,
+    }
+
+
+def _unregulated_clause_result(ctx: dict) -> dict:
+    """Return the standard result when no supporting regulation matched a clause."""
+    return {
+        "pasal": ctx["pasal_label"],
+        "isi_pasal": ctx["desc"],
+        "status": "TIDAK DIATUR",
+        "penjelasan": "Tidak ditemukan regulasi yang secara langsung relevan dengan klausul ini dalam database saat ini.",
+        "rekomendasi": "Pastikan klausul ini wajar secara keperdataan dan tidak bertentangan dengan KUH Perdata.",
+        "ai_analysis": "",
+        "supporting_regulations": ctx["supporting_regulations"],
+        **favorability.empty_position(),
+    }
+
+
+def _build_clause_result(ctx: dict, ans: dict) -> dict:
+    """Normalize a parsed LLM compliance verdict dict into the report row shape."""
+    status_raw = str(ans.get("status", "BERESIKO")).upper()
+    if "SESUAI" in status_raw:
+        status_final = "SESUAI"
+    elif "FATAL" in status_raw:
+        status_final = "FATAL"
+    elif "TIDAK DIATUR" in status_raw:
+        status_final = "TIDAK DIATUR"
+    else:
+        status_final = "BERESIKO"
+
+    return favorability.apply_position({
+        "pasal": ctx["pasal_label"],
+        "isi_pasal": ctx["desc"],
+        "status": status_final,
+        "pasal_regulasi_terkait": ans.get("pasal_regulasi_terkait", ""),
+        "penjelasan": ans.get("penjelasan", "Gagal diverifikasi"),
+        "rekomendasi": ans.get("rekomendasi", ""),
+        "ai_analysis": ans.get("ai_analysis", ""),
+        "supporting_regulations": ctx["supporting_regulations"],
+    }, ans)
+
+
+def _verify_single_clause(
+    ctx: dict,
+    doc_type: str,
+    pihak_1: str,
+    pihak_2: str,
+    sektor: str,
+    pokok: str,
+    pihak_kita_nama: str = "",
+    peran_kita: Optional[str] = None,
+) -> dict:
+    """Run single-clause LLM compliance verification given retrieved context."""
+    pasal_label = ctx["pasal_label"]
+    desc = ctx["desc"]
+    supporting_regulations = ctx["supporting_regulations"]
+    relevant_refs = ctx["relevant_refs"]
 
     if not relevant_refs:
-        # No regulation matched: no LLM call here, so the commercial-position
-        # fields start neutral and are filled later by the batched sweep
-        # (favorability.sweep) — otherwise price/term/liability clauses, the
-        # ones where "is this good for us?" matters most, would stay blank.
-        return {
-            "pasal": pasal_label,
-            "isi_pasal": desc,
-            "status": "TIDAK DIATUR",
-            "penjelasan": "Tidak ditemukan regulasi yang secara langsung relevan dengan klausul ini dalam database saat ini.",
-            "rekomendasi": "Pastikan klausul ini wajar secara keperdataan dan tidak bertentangan dengan KUH Perdata.",
-            "ai_analysis": "",
-            "supporting_regulations": supporting_regulations,
-            **favorability.empty_position(),
-        }
+        return _unregulated_clause_result(ctx)
 
     combined_regs = "\n\n".join(relevant_refs)
     prompt_verify = (
@@ -547,17 +644,14 @@ def process_single_pasal(c, doc_type, pihak_1, pihak_2, sektor, pokok, COSINE_TH
 
         "INSTRUKSI ANALISIS (ikuti urutan ini):\n"
         "1. Identifikasi: Apa topik hukum utama klausul ini? (pembayaran, kerahasiaan, PHK, dll)\n"
-        "2. Kesesuaian: Apakah klausul ini SECARA EKSPLISIT diatur, dilarang, atau diwajibkan oleh regulasi di atas?\n"
-        "   Kutip pasal/ayat spesifik dari regulasi jika ada.\n"
-        "3. Risiko: Identifikasi risiko hukum konkret bagi pihak yang lebih lemah.\n"
+        "2. Kesesuaian: Apakah klausul ini SECARA EKSPLISIT diatur, dilarang, atau diwajibkan oleh satu atau lebih regulasi / dokumen internal di atas?\n"
+        "   Jika melanggar atau terkait dengan LEBIH DARI SATU regulasi atau dokumen internal, sebutkan SEMUANYA secara eksplisit (pisahkan dengan '; ').\n"
+        "3. Risiko: Identifikasi seluruh risiko hukum & ketidaksesuaian prosedur internal secara konkret.\n"
         "4. Verdict: Berikan satu dari tiga status:\n"
         "   - SESUAI: klausul patuh dan tidak berisiko\n"
         "   - BERESIKO: klausul perlu perbaikan atau klarifikasi\n"
         "   - FATAL: klausul melanggar ketentuan wajib regulasi\n\n"
 
-        # Commercial position is a SECOND axis (2026-11-11): instruction 3 stays
-        # untouched so `penjelasan` remains comparable with reports analyzed
-        # before this feature; the plus/minus verdict is additive.
         + favorability.position_prompt_block(pihak_kita_nama or pihak_1, peran_kita) +
 
         "Kembalikan HANYA JSON berikut (tanpa markdown, tanpa teks lain):\n"
@@ -581,23 +675,7 @@ def process_single_pasal(c, doc_type, pihak_1, pihak_2, sektor, pokok, COSINE_TH
             timeout=90
         )
         ans = extract_json(raw_v)
-
-        status_raw = str(ans.get("status", "BERESIKO")).upper()
-        if "SESUAI" in status_raw:       status_final = "SESUAI"
-        elif "FATAL" in status_raw:       status_final = "FATAL"
-        elif "TIDAK DIATUR" in status_raw: status_final = "TIDAK DIATUR"
-        else:                              status_final = "BERESIKO"
-
-        return favorability.apply_position({
-            "pasal": pasal_label,
-            "isi_pasal": desc,
-            "status": status_final,
-            "pasal_regulasi_terkait": ans.get("pasal_regulasi_terkait", ""),
-            "penjelasan": ans.get("penjelasan", "Gagal diverifikasi"),
-            "rekomendasi": ans.get("rekomendasi", ""),
-            "ai_analysis": ans.get("ai_analysis", ""),
-            "supporting_regulations": supporting_regulations
-        }, ans)
+        return _build_clause_result(ctx, ans)
 
     except HTTPException as e:
         print(f"[Compliance] Verification HTTP error: {e.detail}")
@@ -619,6 +697,133 @@ def process_single_pasal(c, doc_type, pihak_1, pihak_2, sektor, pokok, COSINE_TH
             "ai_analysis": "", "supporting_regulations": supporting_regulations,
             **favorability.empty_position(),
         }
+
+
+def verify_clauses_batch(
+    batch_contexts: list[dict],
+    doc_type: str,
+    pihak_1: str,
+    pihak_2: str,
+    sektor: str,
+    pokok: str,
+    pihak_kita_nama: str = "",
+    peran_kita: Optional[str] = None,
+) -> list[dict]:
+    """Verify a small batch of clauses (e.g. 3-5) in one LLM call, falling back
+    to single-clause verification for any missing or unparseable item."""
+    if not batch_contexts:
+        return []
+    if len(batch_contexts) == 1:
+        return [
+            _verify_single_clause(
+                batch_contexts[0], doc_type, pihak_1, pihak_2, sektor, pokok,
+                pihak_kita_nama, peran_kita,
+            )
+        ]
+
+    clause_blocks = []
+    for idx, ctx in enumerate(batch_contexts):
+        combined_regs = "\n\n".join(ctx["relevant_refs"])
+        clause_blocks.append(
+            f"=== ITEM {idx} ({ctx['pasal_label']}) ===\n"
+            f"KLAUSUL:\n{ctx['desc']}\n\n"
+            f"REGULASI TERKAIT ITEM {idx}:\n{combined_regs}"
+        )
+
+    items_text = "\n\n".join(clause_blocks)
+    prompt_batch = (
+        "Anda adalah auditor kepatuhan hukum senior Indonesia yang sangat teliti. "
+        "Analisis setiap item klausul kontrak di bawah ini secara terpisah dan mendalam menggunakan regulasi yang menyertainya.\n\n"
+
+        f"KONTEKS DOKUMEN:\n"
+        f"- Jenis: {doc_type}\n"
+        f"- Pihak Pertama: {pihak_1}\n"
+        f"- Pihak Kedua: {pihak_2}\n"
+        f"- Sektor: {sektor}\n"
+        f"- Pokok Perjanjian: {pokok}\n\n"
+
+        f"{items_text}\n\n"
+
+        "INSTRUKSI ANALISIS UNTUK SETIAP ITEM (ikuti urutan ini):\n"
+        "1. Identifikasi: Apa topik hukum utama klausul item tersebut? (pembayaran, kerahasiaan, PHK, dll)\n"
+        "2. Kesesuaian: Apakah klausul item tersebut SECARA EKSPLISIT diatur, dilarang, atau diwajibkan oleh satu atau lebih regulasi / dokumen internal pada item tersebut?\n"
+        "   Jika melanggar atau terkait dengan LEBIH DARI SATU regulasi atau dokumen internal, sebutkan SEMUANYA secara eksplisit (pisahkan dengan '; ').\n"
+        "3. Risiko: Identifikasi seluruh risiko hukum & ketidaksesuaian prosedur internal secara konkret.\n"
+        "4. Verdict: Berikan satu dari tiga status:\n"
+        "   - SESUAI: klausul patuh dan tidak berisiko\n"
+        "   - BERESIKO: klausul perlu perbaikan atau klarifikasi\n"
+        "   - FATAL: klausul melanggar ketentuan wajib regulasi\n\n"
+
+        + favorability.position_prompt_block(pihak_kita_nama or pihak_1, peran_kita) +
+
+        f"Kembalikan HANYA JSON objek dengan key \"results\" berisi array tepat {len(batch_contexts)} objek (satu untuk setiap id 0..{len(batch_contexts) - 1}, tanpa markdown, tanpa teks lain):\n"
+        '{\n'
+        '  "results": [\n'
+        '    {\n'
+        '      "id": 0,\n'
+        '      "status": "SESUAI" | "BERESIKO" | "FATAL",\n'
+        '      "pasal_regulasi_terkait": "misal: Pasal 15 ayat (3) PP 45/2015",\n'
+        '      "penjelasan": "penjelasan spesifik 1-2 kalimat merujuk regulasi",\n'
+        '      "rekomendasi": "saran perbaikan konkret (kosongkan jika SESUAI)",\n'
+        '      "ai_analysis": "dampak bisnis jangka panjang (isi hanya jika BERESIKO atau FATAL)",\n'
+        '      "kelebihan": [{"poin": "...", "alasan": "...", "dasar": "hukum"}],\n'
+        '      "kekurangan": [{"poin": "...", "alasan": "...", "dasar": "komersial"}],\n'
+        '      "posisi_perusahaan": "MENGUNTUNGKAN" | "NETRAL" | "MERUGIKAN",\n'
+        '      "catatan_posisi": "satu kalimat"\n'
+        '    }\n'
+        '  ]\n'
+        '}'
+    )
+
+    by_id: dict[int, dict] = {}
+    try:
+        raw_v = call_llm(
+            [{"role": "user", "content": prompt_batch}],
+            temperature=0.1,
+            timeout=120,
+        )
+        parsed = extract_json(raw_v)
+        items = parsed.get("results") if isinstance(parsed, dict) else parsed
+        if isinstance(items, list):
+            for pos, item in enumerate(items):
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    item_id = int(item.get("id", pos))
+                except (TypeError, ValueError):
+                    item_id = pos
+                if 0 <= item_id < len(batch_contexts) and item_id not in by_id:
+                    by_id[item_id] = item
+    except Exception as e:
+        print(f"[Compliance] Batch verify fallback triggered ({len(batch_contexts)} clauses): {e}")
+
+    out: list[dict] = []
+    for idx, ctx in enumerate(batch_contexts):
+        if idx in by_id:
+            out.append(_build_clause_result(ctx, by_id[idx]))
+        else:
+            out.append(
+                _verify_single_clause(
+                    ctx, doc_type, pihak_1, pihak_2, sektor, pokok,
+                    pihak_kita_nama, peran_kita,
+                )
+            )
+    return out
+
+
+def process_single_pasal(c, doc_type, pihak_1, pihak_2, sektor, pokok, COSINE_THRESHOLD, uid, excluded, report_id,
+                         pihak_kita_nama="", peran_kita=None, contract_categories=None, precomputed_vec=None):
+    ctx = _retrieve_clause_context(
+        c, doc_type, sektor, COSINE_THRESHOLD, uid, excluded, report_id,
+        contract_categories=contract_categories,
+        precomputed_vec=precomputed_vec,
+    )
+    if ctx is None:
+        return None
+    return _verify_single_clause(
+        ctx, doc_type, pihak_1, pihak_2, sektor, pokok,
+        pihak_kita_nama, peran_kita,
+    )
 
 def extract_docx_content(file_path: str, filename: str, use_ocr: bool = False) -> str:
     """
@@ -1058,52 +1263,11 @@ async def check_compliance(
 
         print(f"[Compliance] Found {len(pasal_items)} clauses. Running analysis...")
 
-        # ── Pass 2: Per-clause RAG + LLM Compliance Check ────────────────
-        COSINE_THRESHOLD = 0.45  # tightened from 0.60 to reduce wrong-domain citations
-        # B2: load the per-user exclusion set once (≤5 worker threads × ≤20
-        # clauses would otherwise re-read it); uid binds the internal-chunk branch.
-        uid = str(current_user["id"])
-        excluded = get_user_exclusions(current_user["id"])
-        rid = report_id if report_id else None   # B3: '' / None => no narrowing
-
-        from services.scraper.category_classifier import classify_contract_categories
-        contract_categories = classify_contract_categories(
-            f"{doc_type}\n{sektor}\n{pokok}\n{text_snippet[:6000]}"
-        )
-        print(f"[Compliance] Category routing: {contract_categories}")
-
-        clauses_to_check = pasal_items[:80]
-        # Batch-embed all clause search queries in one forward pass
-        from services.embed_service import embed_documents
-        clause_queries = [
-            f"[{doc_type}] [{sektor}] {(c.get('deskripsi') or '')[:400]}"
-            for c in clauses_to_check
-        ]
-        clause_vecs = embed_documents(clause_queries) if clause_queries else []
-
-        def worker(args):
-            c, vec = args
-            return process_single_pasal(c, doc_type, pihak_1, pihak_2, sektor, pokok,
-                                        COSINE_THRESHOLD, uid, excluded, rid,
-                                        pihak_kita_nama, peran_kita_clean,
-                                        contract_categories=contract_categories,
-                                        precomputed_vec=vec)
-
-        results = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-            for res in executor.map(worker, zip(clauses_to_check, clause_vecs)):
-                if res:
-                    results.append(res)
-
-        # ── Pass 3 & Pass 3B in Parallel ─────────────────────────────────
-        # Commercial-position sweep (Pass 3) and Reverse-RAG gap detection
-        # (Pass 3B) are completely independent and can run concurrently.
-        def _run_pass3():
-            try:
-                filled = favorability.sweep(results, doc_type, pihak_kita_nama, peran_kita_clean)
-                print(f"[Compliance] Position sweep filled {filled} clause(s)")
-            except Exception as e:
-                print(f"[Compliance] Position sweep skipped: {e}")
+        # ── Pass 3B (Gap Detector) launched early in parallel with Pass 2 ──
+        # gap_detector only depends on pasal_items, doc_ctx, and text_snippet,
+        # so starting it now hides its LLM latency behind Pass 2 & Pass 3.
+        detected_contract_type = doc_ctx.get("archetype") or "GENERAL"
+        missing_clauses: list = []
 
         def _run_pass3b():
             nonlocal detected_contract_type, missing_clauses
@@ -1124,13 +1288,89 @@ async def check_compliance(
             except Exception as e:
                 print(f"[Compliance] Gap detector skipped: {e}")
 
-        detected_contract_type = doc_ctx.get("archetype") or "GENERAL"
-        missing_clauses: list = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as p3_pool:
-            f3 = p3_pool.submit(_run_pass3)
-            f3b = p3_pool.submit(_run_pass3b)
-            f3.result()
+        gap_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        f3b = gap_pool.submit(_run_pass3b)
+
+        try:
+            # ── Pass 2: Per-clause RAG + CrossEncoder Rerank + Batched LLM ───
+            COSINE_THRESHOLD = 0.45  # tightened from 0.60 to reduce wrong-domain citations
+            # B2: load the per-user exclusion set once (≤5 worker threads × ≤20
+            # clauses would otherwise re-read it); uid binds the internal-chunk branch.
+            uid = str(current_user["id"])
+            excluded = get_user_exclusions(current_user["id"])
+            rid = report_id if report_id else None   # B3: '' / None => no narrowing
+
+            from services.scraper.category_classifier import classify_contract_categories
+            contract_categories = classify_contract_categories(
+                f"{doc_type}\n{sektor}\n{pokok}\n{text_snippet[:6000]}"
+            )
+            print(f"[Compliance] Category routing: {contract_categories}")
+
+            clauses_to_check = pasal_items[:80]
+            # Batch-embed all clause search queries in one forward pass
+            from services.embed_service import embed_documents
+            clause_queries = [
+                f"[{doc_type}] [{sektor}] {(c.get('deskripsi') or '')[:400]}"
+                for c in clauses_to_check
+            ]
+            clause_vecs = embed_documents(clause_queries) if clause_queries else []
+
+            def _retrieve_worker(args):
+                idx, (c, vec) = args
+                ctx = _retrieve_clause_context(
+                    c, doc_type, sektor, COSINE_THRESHOLD, uid, excluded, rid,
+                    contract_categories=contract_categories,
+                    precomputed_vec=vec,
+                )
+                return idx, ctx
+
+            retrieved: list[tuple[int, Optional[dict]]] = []
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+                for item in executor.map(_retrieve_worker, enumerate(zip(clauses_to_check, clause_vecs))):
+                    retrieved.append(item)
+
+            ordered_results: dict[int, dict] = {}
+            regulated_items: list[tuple[int, dict]] = []
+            for idx, ctx in retrieved:
+                if ctx is None:
+                    continue
+                if not ctx["relevant_refs"]:
+                    ordered_results[idx] = _unregulated_clause_result(ctx)
+                else:
+                    regulated_items.append((idx, ctx))
+
+            batch_size = max(1, int(os.environ.get("COMPLIANCE_CLAUSE_BATCH_SIZE", "4")))
+            batches = [
+                regulated_items[i:i + batch_size]
+                for i in range(0, len(regulated_items), batch_size)
+            ]
+
+            def _verify_batch_worker(batch: list[tuple[int, dict]]) -> list[tuple[int, dict]]:
+                batch_ctxs = [ctx for _, ctx in batch]
+                verified = verify_clauses_batch(
+                    batch_ctxs, doc_type, pihak_1, pihak_2, sektor, pokok,
+                    pihak_kita_nama, peran_kita_clean,
+                )
+                return [(idx, res) for (idx, _), res in zip(batch, verified)]
+
+            if batches:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+                    for batch_out in executor.map(_verify_batch_worker, batches):
+                        for idx, res in batch_out:
+                            ordered_results[idx] = res
+
+            results = [ordered_results[i] for i in sorted(ordered_results)]
+
+            # ── Pass 3: Commercial-position sweep ────────────────────────────
+            try:
+                filled = favorability.sweep(results, doc_type, pihak_kita_nama, peran_kita_clean)
+                print(f"[Compliance] Position sweep filled {filled} clause(s)")
+            except Exception as e:
+                print(f"[Compliance] Position sweep skipped: {e}")
+
             f3b.result()
+        finally:
+            gap_pool.shutdown(wait=True)
 
         # ── Pass 4: Document-Level Summary ───────────────────────────────
         fatal_count        = sum(1 for r in results if r["status"] == "FATAL")

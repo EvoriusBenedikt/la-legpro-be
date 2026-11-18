@@ -138,7 +138,10 @@ def build_sweep_prompt(clauses: list[dict], doc_type: str, pihak_kita: str,
         f"- Pihak yang kami wakili: {pihak_kita}{peran}\n\n"
         f"KLAUSUL:\n{joined}\n\n"
         "Untuk SETIAP klausul di atas, tentukan apakah klausul itu menguntungkan "
-        "atau merugikan pihak yang kami wakili. Maksimal "
+        "atau merugikan pihak yang kami wakili, serta jelaskan secara singkat mengapa "
+        "klausul ini berstatus TIDAK DIATUR regulasi khusus (mis. sekadar definisi, "
+        "ketentuan administratif/teknis standar, atau kebebasan berkontrak yang tidak menimbulkan risiko hukum). "
+        "Maksimal "
         f"{MAX_BULLETS} kelebihan dan {MAX_BULLETS} kekurangan per klausul, "
         "hanya yang material. Alasan harus konkret dan singkat (maksimal 1 kalimat).\n\n"
         "Kembalikan HANYA JSON berikut (tanpa markdown, tanpa teks lain):\n"
@@ -146,6 +149,7 @@ def build_sweep_prompt(clauses: list[dict], doc_type: str, pihak_kita: str,
         '  "posisi": [\n'
         '    {\n'
         '      "pasal": "label persis seperti di atas",\n'
+        '      "alasan_tidak_diatur": "1 kalimat mengapa klausul ini tidak diatur regulasi khusus / tidak berisiko",\n'
         '      "posisi_perusahaan": "MENGUNTUNGKAN" | "NETRAL" | "MERUGIKAN",\n'
         '      "kelebihan": [{"poin": "...", "alasan": "...", "dasar": "hukum|komersial"}],\n'
         '      "kekurangan": [{"poin": "...", "alasan": "...", "dasar": "hukum|komersial"}],\n'
@@ -185,7 +189,11 @@ def _merge_batch(batch: list[dict], rows: list) -> int:
         bucket = pending.get(label_key(row.get("pasal")))
         if not bucket:
             continue
-        apply_position(bucket.pop(0), row)
+        target = bucket.pop(0)
+        apply_position(target, row)
+        why_unreg = str(row.get("alasan_tidak_diatur") or "").strip()
+        if why_unreg and target.get("status") == "TIDAK DIATUR":
+            target["penjelasan"] = why_unreg
         filled += 1
     return filled
 

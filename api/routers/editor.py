@@ -303,7 +303,7 @@ class RecheckGapsRequest(BaseModel):
 
 
 class RecheckRequest(BaseModel):
-    content_html: str
+    content_html: Optional[str] = None
 
 
 def _verify_report_owner(report_id: str, user_id: str) -> dict:
@@ -1377,6 +1377,12 @@ def get_editor_draft(
     detected_contract_type = ch_results.get("detected_contract_type") or (ch_results.get("summary") or {}).get("detected_contract_type") or "GENERAL"
     missing_clauses = ch_results.get("missing_clauses") or []
 
+    kb_meta = pg_service.query_one(
+        "SELECT COALESCE(kb_stale, FALSE) AS kb_stale, kb_stale_reason "
+        "FROM compliance_history WHERE id = %s",
+        (report_id,),
+    ) or {}
+
     return {
         "report_id": report_id,
         "filename": access["filename"],
@@ -1392,6 +1398,8 @@ def get_editor_draft(
         "translation_discrepancies": discrepancies,
         "detected_contract_type": detected_contract_type,
         "missing_clauses": missing_clauses,
+        "kb_stale": bool(kb_meta.get("kb_stale")),
+        "kb_stale_reason": kb_meta.get("kb_stale_reason"),
     }
 
 
@@ -1788,45 +1796,14 @@ def recheck_editor_compliance(
     req: RecheckRequest,
     current_user: dict = Depends(get_current_user),
 ):
-    import re
+    from services import kb_sync
 
     verify_report_access(report_id, current_user["id"])
-    row = pg_service.query_one(
-        "SELECT id, results_json FROM compliance_history WHERE id = %s",
-        (report_id,),
+    return kb_sync.recheck_report_compliance(
+        report_id=report_id,
+        content_html=req.content_html,
+        user_id=str(current_user["id"]),
     )
-    if not row:
-        raise HTTPException(status_code=404, detail="Document report not found")
-
-    try:
-        data = json.loads(row.get("results_json") or "{}")
-    except Exception:
-        data = {}
-
-    summary = data.get("summary") or {}
-    results = data.get("results") or []
-    base_score = int(summary.get("skor_kepatuhan") or 0)
-
-    plain = re.sub(r"<del\b[^>]*>.*?</del>", "", req.content_html, flags=re.DOTALL | re.IGNORECASE)
-    plain = re.sub(r"<[^>]+>", " ", plain)
-
-    risky_clauses = [r for r in results if r.get("status") in ("BERESIKO", "FATAL")]
-    resolved_count = 0
-    for r in risky_clauses:
-        orig = (r.get("isi_pasal") or "").strip()
-        if orig and orig not in plain:
-            resolved_count += 1
-
-    total_clauses = max(len(results), 1)
-    bonus = round((resolved_count / total_clauses) * 100)
-    new_score = min(100, base_score + bonus)
-
-    return {
-        "previous_score": base_score,
-        "updated_score": new_score,
-        "resolved_risks": resolved_count,
-        "total_risks": len(risky_clauses),
-    }
 
 
 # ============================================================================

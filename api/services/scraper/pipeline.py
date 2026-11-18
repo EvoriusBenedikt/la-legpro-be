@@ -276,4 +276,8 @@ def run_portal_scrape(
 
         summary["portals_run"].append(portal_result)
 
+    if not dry_run and (summary["newly_indexed"] > 0 or summary["replaced"] > 0):
+        from services import kb_sync
+        kb_sync.mark_all_reports_stale("new_regulation_indexed")
+
     return summary

@@ -4,6 +4,7 @@ from typing import Optional
 import json
 import logging
 import os
+import re
 import shutil
 import uuid
 
@@ -540,6 +541,7 @@ def get_compliance_report_detail(report_id: str, current_user: dict = Depends(ge
         "COALESCE(review_status, 'draft') AS review_status, "
         "to_char(expiration_date, 'YYYY-MM-DD') AS expiration_date, results_json, "
         "notebook_id, "
+        "COALESCE(kb_stale, FALSE) AS kb_stale, kb_stale_reason, "
         "to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at "
         "FROM compliance_history WHERE id = %s AND (user_id = %s OR EXISTS ("
         "  SELECT 1 FROM workspace_collaborators wc WHERE wc.notebook_id = COALESCE(compliance_history.notebook_id, compliance_history.id) AND wc.user_id = %s"
@@ -580,8 +582,78 @@ def get_compliance_report_detail(report_id: str, current_user: dict = Depends(ge
         "notebook_id": row["notebook_id"],
         # Notebook display name for the topbar path trail (phase-3).
         "notebook_name": notebook_name,
+        "kb_stale": bool(row.get("kb_stale")),
+        "kb_stale_reason": row.get("kb_stale_reason"),
         "results": json.loads(row["results_json"])
     }
+
+
+class ExportAnalysisPdfRequest(BaseModel):
+    report_id: Optional[str] = None
+    filename: Optional[str] = None
+    summary: Optional[dict] = None
+    results: Optional[list] = None
+    missing_clauses: Optional[list] = None
+    locale: str = "id"
+
+
+@router.post("/compliance-history/export-pdf")
+def export_compliance_analysis_pdf_post(
+    req: ExportAnalysisPdfRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    from fastapi.responses import Response
+    from services.pdf_report import generate_analysis_pdf
+
+    filename = req.filename or "Contract_Analysis_Report"
+    summary = req.summary or {}
+    results = req.results or []
+    missing_clauses = req.missing_clauses or []
+
+    if req.report_id:
+        row = pg_service.query_one(
+            "SELECT filename, results_json FROM compliance_history WHERE id = %s AND (user_id = %s OR EXISTS ("
+            "  SELECT 1 FROM workspace_collaborators wc WHERE wc.notebook_id = COALESCE(compliance_history.notebook_id, compliance_history.id) AND wc.user_id = %s"
+            "))",
+            (req.report_id, current_user["id"], current_user["id"]),
+        )
+        if row:
+            filename = req.filename or row.get("filename") or filename
+            raw_json = row.get("results_json")
+            stored = json.loads(raw_json) if isinstance(raw_json, str) else (raw_json or {})
+            if not summary:
+                summary = stored.get("summary") or {}
+            if not results:
+                results = stored.get("results") or []
+            if not missing_clauses:
+                missing_clauses = stored.get("missing_clauses") or []
+
+    pdf_bytes = generate_analysis_pdf(
+        filename=filename,
+        summary=summary,
+        results=results,
+        missing_clauses=missing_clauses,
+        locale=req.locale,
+    )
+    safe_base = re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.splitext(filename)[0]).strip("_") or "Analysis_Report"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{safe_base}_Audit_Report.pdf"'},
+    )
+
+
+@router.get("/compliance-history/{report_id}/export-pdf")
+def export_compliance_analysis_pdf_get(
+    report_id: str,
+    locale: str = "id",
+    current_user: dict = Depends(get_current_user),
+):
+    return export_compliance_analysis_pdf_post(
+        ExportAnalysisPdfRequest(report_id=report_id, locale=locale),
+        current_user=current_user,
+    )
+
 
 def _contract_file_dir() -> str:
     return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "contracts")
