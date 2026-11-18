@@ -21,7 +21,7 @@ business judgement in the UI. Nothing here decides legality.
 """
 import re
 
-from services.llm_client import call_glm, extract_json
+from services.llm_client import call_llm, extract_json
 
 MAX_BULLETS = 3
 SWEEP_BATCH = 20
@@ -209,7 +209,7 @@ def sweep(results: list[dict], doc_type: str, pihak_kita: str,
     if not todo:
         return 0
 
-    caller = call or call_glm
+    caller = call or call_llm
     filled = 0
     for start in range(0, len(todo), SWEEP_BATCH):
         batch = todo[start:start + SWEEP_BATCH]

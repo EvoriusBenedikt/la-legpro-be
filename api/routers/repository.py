@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+import asyncio
 import os
 from datetime import timezone
 from pydantic import BaseModel
@@ -161,7 +162,7 @@ async def get_repository(current_user: dict = Depends(auth.get_current_user)):
     # is TEXT while regulations.id is int -> id::text comparison.)
     records = pg_service.query(
         "SELECT id, judul, nomor, jenis, sektor, status, local_path, klasifikasi, "
-        "ai_confidence, approval_mode "
+        "ai_confidence, approval_mode, category_code, legal_status "
         "FROM regulations "
         "WHERE local_path IS NOT NULL AND local_path != '' "
         "AND status != 'Menunggu Konfirmasi' "
@@ -205,7 +206,9 @@ async def get_repository(current_user: dict = Depends(auth.get_current_user)):
             # confidence-gated auto-approval, 'manual' = pending confirmed,
             # None = pre-feature row.
             "ai_confidence": row["ai_confidence"],
-            "approval_mode": row["approval_mode"]
+            "approval_mode": row["approval_mode"],
+            "category_code": row.get("category_code") or "CIVIL_CONTRACT",
+            "legal_status": row.get("legal_status") or "berlaku",
         })
     return {"documents": docs}
 
@@ -621,14 +624,14 @@ def ingest_document_background(file_path: str, doc_id: str, filename: str, nomor
         task_queue.begin_stage(task_id, 2)
         document_summary = ""
         try:
-            from services.llm_client import call_glm
+            from services.llm_client import call_llm
             summary_prompt = (
                 "Buatlah ringkasan singkat (maksimal 2 kalimat) yang menjelaskan tentang apa dokumen ini, "
                 "siapa pihak yang terlibat, dan apa topik utamanya. "
                 "Tujuan ringkasan ini adalah untuk memberikan konteks global pada potongan-potongan kecil teks dokumen.\\n\\n"
                 f"TEKS DOKUMEN (Bagian Awal):\\n{full_text[:4000]}"
             )
-            document_summary = call_glm([{"role": "user", "content": summary_prompt}], temperature=0.1, timeout=30)
+            document_summary = call_llm([{"role": "user", "content": summary_prompt}], temperature=0.1, timeout=30)
             print(f"Generated contextual summary: {document_summary}")
         except Exception as e:
             print(f"Warning: Failed to generate document summary: {e}")
@@ -889,3 +892,57 @@ async def delete_failed_documents(current_user: dict = Depends(auth.require_role
             deleted_count += 1
     
     return {"message": f"Berhasil menghapus {deleted_count} dokumen yang gagal."}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Live Regulation Freshness & Status Verification Endpoints
+# ─────────────────────────────────────────────────────────────────────────────
+
+class BatchVerifyRequest(BaseModel):
+    regulation_ids: list[int]
+
+
+@router.post("/regulations/verify-live-batch")
+async def verify_regulations_live_batch(
+    req: BatchVerifyRequest,
+    current_user: dict = Depends(auth.get_current_user),
+):
+    """Verify up to 10 cited regulations concurrently without blocking the event loop."""
+    from services.freshness.live_verifier import verify_regulation_live
+
+    unique_ids = list(dict.fromkeys(req.regulation_ids))[:10]
+    if not unique_ids:
+        return {"results": []}
+
+    results = await asyncio.gather(
+        *(asyncio.to_thread(verify_regulation_live, reg_id) for reg_id in unique_ids)
+    )
+    return {"results": [r for r in results if r is not None]}
+
+
+@router.post("/regulations/{regulation_id}/verify-live")
+async def verify_regulation_live_endpoint(
+    regulation_id: int,
+    current_user: dict = Depends(auth.get_current_user),
+):
+    """Check live legal_status against the regulation's DB-stored detail_url (2.0s connect / 3.0s read)."""
+    from services.freshness.live_verifier import verify_regulation_live
+
+    result = await asyncio.to_thread(verify_regulation_live, regulation_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Regulasi tidak ditemukan.")
+    return result
+
+
+@router.get("/regulations/freshness-summary")
+async def regulations_freshness_summary(
+    current_user: dict = Depends(auth.get_current_user),
+):
+    """Return freshness coverage buckets and recent regulation_status_history rows."""
+    from services.freshness.live_verifier import get_freshness_summary
+
+    def _load():
+        with pg_service.get_conn() as conn:
+            return get_freshness_summary(conn)
+
+    return await asyncio.to_thread(_load)

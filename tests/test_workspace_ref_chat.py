@@ -199,13 +199,13 @@ def test_chat_prompt_highlights_workspace_reference(monkeypatch):
 
     captured_calls = []
 
-    def fake_call_glm(messages, **kwargs):
+    def fake_call_llm(messages, **kwargs):
         captured_calls.append(messages)
         if len(captured_calls) == 1:
             return "Ya, klausul SLA perlu disesuaikan dengan referensi workspace [1]."
         return "Revisi SLA Kontrak"
 
-    monkeypatch.setattr(chat, "call_glm", fake_call_glm)
+    monkeypatch.setattr(chat, "call_llm", fake_call_llm)
 
     req = chat.ChatRequest(
         report_id="ws-1",

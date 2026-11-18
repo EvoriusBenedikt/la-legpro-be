@@ -107,7 +107,7 @@ def _no_llm(monkeypatch):
     from routers import compliance
     monkeypatch.setattr(rag_service, "is_regulation_relevant", lambda *a, **k: True)
     # Keep the final verification call off the network; a cited reg is enough.
-    monkeypatch.setattr(compliance, "call_glm",
+    monkeypatch.setattr(compliance, "call_llm",
                         lambda *a, **k: '{"status": "SESUAI", "penjelasan": "ok"}')
 
 

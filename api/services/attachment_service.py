@@ -263,7 +263,7 @@ def build_vision_parts(attachment_ids: list, owner: str):
 
     Returns (parts, dropped_ids); dropped covers over-cap, non-image,
     not-ready, foreign, and file-missing ids — chat.py turns drops into a
-    loud notice line, never a silent skip. call_glm passes `messages`
+    loud notice line, never a silent skip. call_llm passes `messages`
     verbatim to the API, so list content needs no llm_client change.
     """
     import base64

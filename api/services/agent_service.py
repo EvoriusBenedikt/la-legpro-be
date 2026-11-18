@@ -13,7 +13,7 @@ from fastapi import HTTPException
 from lxml import html as lhtml
 
 from services import pg_service
-from services.llm_client import call_glm, extract_json
+from services.llm_client import call_llm, extract_json
 from services.rag_service import retrieve_contexts
 from services.kg_service import retrieve_graph_contexts
 
@@ -184,7 +184,7 @@ def propose_clause_patches(
     )
 
     try:
-        raw = call_glm([{"role": "user", "content": prompt}], temperature=0.1, timeout=90)
+        raw = call_llm([{"role": "user", "content": prompt}], temperature=0.1, timeout=300)
         parsed = extract_json(raw)
         if isinstance(parsed, dict):
             parsed = parsed.get("patches", [])

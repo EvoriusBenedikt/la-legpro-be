@@ -15,9 +15,12 @@ import os
 import json
 import asyncio
 import psutil
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from services import backup_service, host_metrics, pg_service
+
+_DELTA_POLL_LOCK_KEY = 903101
+_HEARTBEAT_LOCK_KEY = 903102
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -78,7 +81,58 @@ async def backup_scheduler_loop():
 
         await asyncio.sleep(60)
 
+def _try_run_with_advisory_lock(lock_key: int, fn):
+    """Run `fn()` only if this worker acquires the session-level PostgreSQL advisory lock."""
+    with pg_service.get_conn() as conn:
+        acquired = conn.execute("SELECT pg_try_advisory_lock(%s) AS locked", (lock_key,)).fetchone()
+        if not acquired or not acquired.get("locked"):
+            return None
+        try:
+            return fn()
+        finally:
+            conn.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
+
+
+async def delta_poll_scheduler_loop():
+    """Run daily 'New Arrivals' delta poll at 02:00 WIB (UTC+7)."""
+    await asyncio.sleep(30)
+    last_run_date = None
+    while True:
+        try:
+            wib_now = datetime.now(timezone.utc) + timedelta(hours=7)
+            today_str = wib_now.strftime("%Y-%m-%d")
+            if wib_now.hour == 2 and last_run_date != today_str:
+                from services.freshness.delta_poller import run_delta_poll
+
+                result = await asyncio.to_thread(_try_run_with_advisory_lock, _DELTA_POLL_LOCK_KEY, run_delta_poll)
+                if result is not None:
+                    print(f"[Freshness:DeltaPoll] {result}")
+                last_run_date = today_str
+        except Exception as e:
+            print(f"Delta poll loop error: {e}")
+
+        await asyncio.sleep(60)
+
+
+async def heartbeat_scheduler_loop():
+    """Run hourly tiered HTML status heartbeat checks (max 40/hour)."""
+    await asyncio.sleep(45)
+    while True:
+        try:
+            from services.freshness.heartbeat_worker import run_heartbeat_batch
+
+            result = await asyncio.to_thread(_try_run_with_advisory_lock, _HEARTBEAT_LOCK_KEY, run_heartbeat_batch)
+            if result is not None:
+                print(f"[Freshness:Heartbeat] {result}")
+        except Exception as e:
+            print(f"Heartbeat loop error: {e}")
+
+        await asyncio.sleep(3600)
+
+
 def start_background_loops():
     """Create the asyncio background tasks. Called from main.py's async startup event."""
     asyncio.create_task(system_metrics_loop())
     asyncio.create_task(backup_scheduler_loop())
+    asyncio.create_task(delta_poll_scheduler_loop())
+    asyncio.create_task(heartbeat_scheduler_loop())

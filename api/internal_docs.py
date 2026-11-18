@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
+from pydantic import BaseModel
 from auth import get_current_user
 import re
 import uuid
@@ -84,10 +85,50 @@ def _extract_reference_text(file_path: str, ext: str) -> str:
     raise HTTPException(status_code=400, detail="Only PDF, DOCX, and PPTX files are supported.")
 
 
+_UPLOAD_ID_RE = re.compile(r"^[0-9a-fA-F]{8}$")
+
+
+class CheckInternalDuplicatesRequest(BaseModel):
+    filenames: list[str]
+    report_id: str | None = None
+
+
+@router.post("/upload-internal/check-duplicates")
+def check_internal_duplicates(
+    req: CheckInternalDuplicatesRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    if req.report_id is not None and not _REPORT_ID_RE.match(req.report_id):
+        raise HTTPException(status_code=400, detail="Invalid report_id.")
+    names = [os.path.basename(n) for n in req.filenames if n]
+    if not names:
+        return {"duplicates": []}
+
+    uid = str(current_user["id"])
+    rid = req.report_id if req.report_id else None
+    rows = pg_service.query(
+        "SELECT split_part(id, '_', 2) AS upload_id, min(judul) AS filename "
+        "FROM chunks "
+        "WHERE visibility = 'private' AND user_id = %s::text "
+        "AND doc_id IS NULL AND id LIKE 'internal\\_%%' "
+        "AND (report_id IS NULL OR report_id = %s) "
+        "AND judul = ANY(%s) "
+        "GROUP BY split_part(id, '_', 2)",
+        (uid, rid, names),
+    )
+    return {
+        "duplicates": [
+            {"upload_id": r["upload_id"], "filename": r["filename"]}
+            for r in rows
+        ]
+    }
+
+
 @router.post("/upload-internal")
-async def upload_internal_doc(
+def upload_internal_doc(
     file: UploadFile = File(...),
     report_id: str | None = Form(None),
+    replace: bool = Form(False),
     current_user: dict = Depends(get_current_user),
 ):
     safe_name = os.path.basename(file.filename or "")
@@ -123,6 +164,24 @@ async def upload_internal_doc(
         embeddings = embed_documents(texts)
 
         with pg_service.get_conn() as conn:
+            if replace:
+                # Replace any existing private internal chunks with the same filename in this scope
+                old_rows = conn.execute(
+                    "SELECT DISTINCT split_part(id, '_', 2) AS upload_id "
+                    "FROM chunks "
+                    "WHERE visibility = 'private' AND user_id = %s::text "
+                    "AND doc_id IS NULL AND id LIKE 'internal\\_%%' "
+                    "AND (report_id IS NULL OR report_id = %s) "
+                    "AND judul = %s",
+                    (str(current_user["id"]), report_id if report_id else None, safe_name),
+                ).fetchall()
+                for old in old_rows:
+                    old_uid = old["upload_id"]
+                    conn.execute(
+                        "DELETE FROM chunks WHERE visibility = 'private' AND user_id = %s::text "
+                        "AND doc_id IS NULL AND id LIKE %s",
+                        (str(current_user["id"]), f"internal_{old_uid}_%"),
+                    )
             for chunk_id, text, window, emb in zip(ids, texts, windows, embeddings):
                 conn.execute(
                     "INSERT INTO chunks (id, doc_id, text, window_context, jenis, nomor, "
@@ -145,3 +204,36 @@ async def upload_internal_doc(
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
+
+
+@router.delete("/upload-internal/{upload_id}")
+def delete_internal_doc(
+    upload_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    if not _UPLOAD_ID_RE.match(upload_id):
+        raise HTTPException(status_code=400, detail="Invalid upload_id.")
+
+    uid = str(current_user["id"])
+    like_pattern = f"internal_{upload_id.lower()}_%"
+    source_ref = f"internal:{upload_id.lower()}"
+
+    with pg_service.get_conn() as conn:
+        with conn.transaction():
+            cur = conn.execute(
+                "DELETE FROM chunks "
+                "WHERE visibility = 'private' AND user_id = %s::text "
+                "AND doc_id IS NULL AND id LIKE %s",
+                (uid, like_pattern),
+            )
+            deleted_chunks = cur.rowcount or 0
+            conn.execute(
+                "DELETE FROM rag_source_exclusions "
+                "WHERE user_id = %s AND source_ref = %s",
+                (uid, source_ref),
+            )
+
+    if deleted_chunks == 0:
+        raise HTTPException(status_code=404, detail="Internal reference not found.")
+
+    return {"status": "deleted", "upload_id": upload_id.lower(), "deleted_chunks": deleted_chunks}

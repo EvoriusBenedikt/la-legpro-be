@@ -3,7 +3,7 @@ import json
 from pydantic import BaseModel
 import auth
 from services import pg_service, rate_limit
-from services.llm_client import call_glm
+from services.llm_client import call_llm
 
 router = APIRouter(prefix="/api/knowledge-graph", tags=["kg"])
 
@@ -217,7 +217,7 @@ async def analyze_kg_scenario(
     ]
     
     try:
-        raw_response = call_glm(messages, temperature=0.1, timeout=90)
+        raw_response = call_llm(messages, temperature=0.1, timeout=90)
         
         # Parse out JSON block
         import re

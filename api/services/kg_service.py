@@ -10,7 +10,7 @@ services.pg_service.
 import os
 
 from services import pg_service
-from services.llm_client import call_glm, extract_json
+from services.llm_client import call_llm, extract_json
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -48,7 +48,7 @@ def extract_and_store_graph(doc_id: str, full_text: str, nomor: str, judul: str,
         {"role": "user", "content": f"Regulasi: {jenis} Nomor {nomor}\nJudul: {judul}\n\nTeks:\n{snippet}"}
     ]
     try:
-        raw = call_glm(prompt, temperature=0.0, timeout=45)
+        raw = call_llm(prompt, temperature=0.0, timeout=45)
         # (Bugfix M3: legacy only stripped a LEADING ``` fence. The current
         # LLM (llama-4-maverick via MODEL_BASE_URL) sometimes prefixes a prose
         # preamble -- "Berikut adalah ...:\n```json\n{...}\n```" -- after which

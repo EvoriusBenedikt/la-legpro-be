@@ -1,7 +1,8 @@
 import os
 import sys
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field, StrictBool
 from psycopg import errors as pg_errors
 
@@ -27,7 +28,7 @@ from services.db_service import log_audit
 router = APIRouter()
 
 
-SCRAPER_ROLES = {"sekretaris perusahaan", "dewa", "developer"}
+SCRAPER_ROLES = {"sekretaris perusahaan", "admin", "insinyur ti", "dewa", "developer"}
 
 
 def scraper_role(current_user: dict = Depends(get_current_user)):
@@ -115,8 +116,195 @@ def update_scraper_config(
         raise _config_error()
 
 
-@router.post("/scraper/run", status_code=202)
-def start_scraper_run(current_user: dict = Depends(scraper_role)):
+class SourcePatchRequest(BaseModel):
+    enabled: bool | None = None
+    min_year: int | None = Field(default=None, ge=1945, le=2035)
+    max_pages_per_run: int | None = Field(default=None, ge=1, le=100)
+    skip_repealed: bool | None = None
+    on_duplicate: str | None = Field(default=None, pattern="^(skip|replace)$")
+
+
+class BulkToggleRequest(BaseModel):
+    domain_group: str | None = None
+    enabled: bool
+
+
+class BroadScrapeRequest(BaseModel):
+    source_keys: list[str] | None = None
+    domain_group: str | None = None
+    dry_run: bool = False
+    on_duplicate: str | None = Field(default=None, pattern="^(skip|replace)$")
+
+
+class BulkSeedRequest(BaseModel):
+    categories: list[str] = []
+    source_mode: str = Field(default="all", pattern="^(all|national|sectoral)$")
+    min_year: int = Field(default=2015, ge=1945, le=2035)
+    active_only: bool = True
+
+
+@router.get("/scraper/coverage")
+def get_scraper_coverage(current_user: dict = Depends(scraper_role)):
+    from services.scraper.bulk_ingestor import get_coverage_stats
+    return get_coverage_stats()
+
+
+@router.post("/scraper/bulk/start")
+def start_bulk_seeder(req: BulkSeedRequest, current_user: dict = Depends(scraper_role)):
+    from services.scraper.bulk_ingestor import start_bulk_seed
+    log_audit(current_user["id"], "SCRAPE_STARTED", "bulk_seeder", f"categories={len(req.categories)} mode={req.source_mode}")
+    return start_bulk_seed(
+        categories=req.categories,
+        source_mode=req.source_mode,
+        min_year=req.min_year,
+        active_only=req.active_only,
+    )
+
+
+@router.get("/scraper/bulk/status")
+def get_bulk_seeder_status(batch_id: str | None = None, current_user: dict = Depends(scraper_role)):
+    from services.scraper.bulk_ingestor import get_bulk_status
+    return get_bulk_status(batch_id)
+
+
+@router.post("/scraper/bulk/pause")
+def pause_bulk_seeder(current_user: dict = Depends(scraper_role)):
+    from services.scraper.bulk_ingestor import pause_queue
+    return pause_queue()
+
+
+@router.post("/scraper/bulk/resume")
+def resume_bulk_seeder(current_user: dict = Depends(scraper_role)):
+    from services.scraper.bulk_ingestor import resume_queue
+    return resume_queue()
+
+
+@router.post("/scraper/bulk/retry-failed")
+def retry_failed_bulk_seeder(current_user: dict = Depends(scraper_role)):
+    from services.scraper.bulk_ingestor import retry_failed
+    return retry_failed()
+
+
+@router.get("/scraper/sources")
+def get_scraper_sources(current_user: dict = Depends(scraper_role)):
+    from services.scraper.adapters import PORTAL_REGISTRY
+    from services.scraper.pipeline import seed_scraper_configs
+
+    try:
+        seed_scraper_configs()
+        rows = pg_service.query("SELECT * FROM scraper_config")
+    except pg_errors.UndefinedTable:
+        raise _config_error()
+
+    by_id = {r["scraper_id"]: r for r in rows}
+    sources = []
+    for p in PORTAL_REGISTRY:
+        r = by_id.get(p.source_key, {})
+        sources.append({
+            "source_key": p.source_key,
+            "display_name": r.get("display_name") or p.display_name,
+            "base_url": r.get("base_url") or p.base_url,
+            "domain_group": r.get("domain_group") or p.domain_group,
+            "adapter_type": r.get("adapter_type") or p.adapter_type,
+            "enabled": bool(r.get("active", True)),
+            "min_year": int(r.get("min_year") or 2015),
+            "max_pages_per_run": int(r.get("max_pages_per_run") or 10),
+            "rate_limit_ms": int(r.get("rate_limit_ms") or 1200),
+            "skip_repealed": bool(r.get("skip_repealed", True)),
+            "on_duplicate": r.get("on_duplicate") or "skip",
+            "last_scraped_at": r["last_scraped_at"].isoformat() if r.get("last_scraped_at") else None,
+            "total_indexed": int(r.get("total_indexed") or 0),
+            "total_deduplicated": int(r.get("total_deduplicated") or 0),
+            "last_error": r.get("last_error"),
+        })
+    return {"sources": sources}
+
+
+@router.patch("/scraper/sources/{source_key}")
+def patch_scraper_source(
+    source_key: str,
+    req: SourcePatchRequest,
+    current_user: dict = Depends(scraper_role),
+):
+    from services.scraper.adapters import PORTAL_BY_KEY
+    from services.scraper.pipeline import seed_scraper_configs
+
+    if source_key not in PORTAL_BY_KEY:
+        raise HTTPException(status_code=404, detail=f"Scraper tidak dikenal: {source_key}")
+
+    seed_scraper_configs()
+    updates: list[str] = ["updated_at = NOW()", "updated_by = %s"]
+    params: list = [str(current_user["id"])]
+
+    if req.enabled is not None:
+        updates.append("active = %s")
+        params.append(req.enabled)
+    if req.min_year is not None:
+        updates.append("min_year = %s")
+        params.append(req.min_year)
+    if req.max_pages_per_run is not None:
+        updates.append("max_pages_per_run = %s")
+        params.append(req.max_pages_per_run)
+    if req.skip_repealed is not None:
+        updates.append("skip_repealed = %s")
+        params.append(req.skip_repealed)
+    if req.on_duplicate is not None:
+        updates.append("on_duplicate = %s")
+        params.append(req.on_duplicate)
+
+    params.append(source_key)
+    pg_service.execute(f"UPDATE scraper_config SET {', '.join(updates)} WHERE scraper_id = %s", tuple(params))
+    log_audit(current_user["id"], "UPDATE_SCRAPER_CONFIG", source_key, "patch_source")
+    return get_scraper_sources(current_user)
+
+
+@router.post("/scraper/sources/bulk-toggle")
+def bulk_toggle_scraper_sources(
+    req: BulkToggleRequest,
+    current_user: dict = Depends(scraper_role),
+):
+    from services.scraper.pipeline import seed_scraper_configs
+
+    seed_scraper_configs()
+    if req.domain_group:
+        pg_service.execute(
+            "UPDATE scraper_config SET active = %s, updated_at = NOW(), updated_by = %s "
+            "WHERE domain_group = %s",
+            (req.enabled, str(current_user["id"]), req.domain_group),
+        )
+    else:
+        pg_service.execute(
+            "UPDATE scraper_config SET active = %s, updated_at = NOW(), updated_by = %s",
+            (req.enabled, str(current_user["id"])),
+        )
+    log_audit(current_user["id"], "UPDATE_SCRAPER_CONFIG", req.domain_group or "all", f"enabled={req.enabled}")
+    return get_scraper_sources(current_user)
+
+
+@router.post("/scraper/run")
+async def start_scraper_run(
+    req: BroadScrapeRequest | None = Body(default=None),
+    current_user: dict = Depends(scraper_role),
+):
+    if req is not None:
+        from services.scraper.pipeline import run_portal_scrape
+
+        log_audit(
+            current_user["id"],
+            "SCRAPE_STARTED",
+            req.domain_group or "",
+            f"dry_run={req.dry_run} on_duplicate={req.on_duplicate}",
+        )
+        summary = await run_in_threadpool(
+            run_portal_scrape,
+            req.source_keys,
+            req.domain_group,
+            req.dry_run,
+            req.on_duplicate,
+        )
+        log_audit(current_user["id"], "SCRAPE_FINISHED", "", f"indexed={summary['newly_indexed']} deduped={summary['deduplicated']}")
+        return summary
+
     def audit_started():
         log_audit(current_user["id"], "SCRAPE_STARTED", "", f"sources={len(scraper_runner.snapshot()['sources'])}")
 

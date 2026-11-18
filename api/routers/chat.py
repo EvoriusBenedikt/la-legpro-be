@@ -1,11 +1,11 @@
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.concurrency import run_in_threadpool
-import os, re, json
+import asyncio, os, re, json
 from typing import List
 from pydantic import BaseModel
 import auth
 from services import pg_service, rate_limit
-from services.llm_client import call_glm
+from services.llm_client import call_llm
 
 router = APIRouter(prefix="/api", tags=["chat"])
 
@@ -741,7 +741,7 @@ async def chat_endpoint(
         f"REMINDER: {lang_rule}"
     )
 
-    # call_glm passes `messages` verbatim to the OpenAI-compatible API, so a
+    # call_llm passes `messages` verbatim to the OpenAI-compatible API, so a
     # list content (vision parts + text part) needs no llm_client change.
     user_content = enriched_user_prompt
     if vision_parts:
@@ -759,19 +759,86 @@ async def chat_endpoint(
     # FR-25: Audit log the search query -- moved BEFORE the LLM call so a
     # failed generation is still auditable (critique remediation, 2026-10-08).
     log_audit(current_user.get("id", ""), "SEARCH", "", f"Query: {last_user_message[:200]}")
-    try:
-        answer = call_glm(messages, temperature=0.1, timeout=60)
-    except HTTPException as e:
-        # Critique remediation P1-3 (2026-10-08): an LLM failure must never
-        # return a canned apology shaped like an ordinary answer -- it got
-        # saved to chat history and replayed into later LLM context as if
-        # the assistant had really answered. Surface failures as 502; the FE
-        # renders non-2xx as a first-class error state with a retry action.
-        print(f"Chat LLM call failed: {e.detail}")
+
+    user_message_count = sum(1 for m in req.messages if m.role == "user")
+    suggested_title: str | None = None
+    action_proposal: dict | None = None
+    tool_steps: list[dict] = []
+
+    async def _run_main_answer():
+        return await run_in_threadpool(call_llm, messages, temperature=0.1, timeout=300)
+
+    async def _run_title():
+        if user_message_count != 1:
+            return None
+        try:
+            if user_lang == "english":
+                title_instruction = (
+                    "Write a SHORT conversation title (maximum 8 words, no quotes, no punctuation at the end) "
+                    "that captures what the user is asking about. Reply with ONLY the title text, nothing else.\n\n"
+                    f"User question: {last_user_message}"
+                )
+            else:
+                title_instruction = (
+                    "Tulis JUDUL percakapan yang SINGKAT (maksimal 8 kata, tanpa tanda kutip, tanpa tanda baca di akhir) "
+                    "yang menggambarkan apa yang ditanyakan pengguna. Balas HANYA dengan teks judul, tidak ada yang lain.\n\n"
+                    f"Pertanyaan pengguna: {last_user_message}"
+                )
+            raw_title = await run_in_threadpool(
+                call_llm,
+                [{"role": "user", "content": title_instruction}],
+                temperature=0.3,
+                timeout=8,
+                max_attempts=1,
+            )
+            clean = raw_title.strip().strip('"\'').strip()
+            return clean[:72] if clean else None
+        except Exception as e:
+            print(f"Title generation failed (non-fatal): {e}")
+            return None
+
+    async def _run_proposal():
+        if not target_report_id:
+            return None
+        try:
+            from services import agent_service
+            if agent_service.is_patch_intent(last_user_message):
+                return await run_in_threadpool(
+                    agent_service.propose_clause_patches,
+                    target_report_id,
+                    current_user["id"],
+                    last_user_message,
+                )
+        except Exception as e:
+            print(f"[Agent] Proposal generation skipped: {e}")
+        return None
+
+    # Run answer, optional first-turn title, and optional agentic patch proposal in parallel.
+    main_res, title_res, proposal_res = await asyncio.gather(
+        _run_main_answer(),
+        _run_title(),
+        _run_proposal(),
+        return_exceptions=True,
+    )
+    if isinstance(main_res, HTTPException):
+        print(f"Chat LLM call failed: {main_res.detail}")
         raise HTTPException(
             status_code=502,
             detail="Layanan AI tidak dapat dihubungi. Silakan coba lagi beberapa saat."
         )
+    if isinstance(main_res, Exception):
+        print(f"Chat LLM call failed: {main_res}")
+        raise HTTPException(
+            status_code=502,
+            detail="Layanan AI tidak dapat dihubungi. Silakan coba lagi beberapa saat."
+        )
+    answer = main_res
+    if isinstance(title_res, str) and title_res:
+        suggested_title = title_res
+    if isinstance(proposal_res, dict) and proposal_res:
+        tool_steps = proposal_res.pop("tool_steps", [])
+        action_proposal = proposal_res
+
     if retrieval_degraded:
         notice = (
             "\n\n---\n_Catatan: penelusuran basis data regulasi sedang tidak tersedia, "
@@ -800,60 +867,6 @@ async def chat_endpoint(
             "_Note: PDF attachment retrieval was unavailable; some attachment content may not be reflected._")
     if attachment_notes:
         answer += "\n\n---\n" + "\n".join(attachment_notes)
-
-    # ── Conversation title generation (first message only) ──────────────────
-    # Only fires when the window contains exactly one user message — meaning
-    # this is the very first exchange in a new conversation. A tiny, cheap
-    # LLM call produces a short descriptive title (≤8 words, no quotes, no
-    # punctuation) in the user's language. Failure is silently swallowed:
-    # the FE falls back to its existing "slice of the user text" logic when
-    # suggested_title is None, so a title-gen hiccup never breaks the chat.
-    user_message_count = sum(1 for m in req.messages if m.role == "user")
-    suggested_title: str | None = None
-    if user_message_count == 1:
-        try:
-            if user_lang == "english":
-                title_instruction = (
-                    "Write a SHORT conversation title (maximum 8 words, no quotes, no punctuation at the end) "
-                    "that captures what the user is asking about. Reply with ONLY the title text, nothing else.\n\n"
-                    f"User question: {last_user_message}"
-                )
-            else:
-                title_instruction = (
-                    "Tulis JUDUL percakapan yang SINGKAT (maksimal 8 kata, tanpa tanda kutip, tanpa tanda baca di akhir) "
-                    "yang menggambarkan apa yang ditanyakan pengguna. Balas HANYA dengan teks judul, tidak ada yang lain.\n\n"
-                    f"Pertanyaan pengguna: {last_user_message}"
-                )
-            raw_title = call_glm(
-                [{"role": "user", "content": title_instruction}],
-                temperature=0.3,
-                timeout=15,
-            )
-            # Strip surrounding quotes/whitespace the model sometimes adds
-            clean = raw_title.strip().strip('"\'').strip()
-            if clean:
-                suggested_title = clean[:72]  # hard cap so the sidebar never overflows
-        except Exception as e:
-            print(f"Title generation failed (non-fatal): {e}")
-    # ── End title generation ────────────────────────────────────────────────
-
-    action_proposal: dict | None = None
-    tool_steps: list[dict] = []
-    if target_report_id:
-        try:
-            from services import agent_service
-            if agent_service.is_patch_intent(last_user_message):
-                proposal = await run_in_threadpool(
-                    agent_service.propose_clause_patches,
-                    target_report_id,
-                    current_user["id"],
-                    last_user_message,
-                )
-                if proposal:
-                    tool_steps = proposal.pop("tool_steps", [])
-                    action_proposal = proposal
-        except Exception as e:
-            print(f"[Agent] Proposal generation skipped: {e}")
 
     answer, suggested_actions = _extract_suggestions_and_clean_answer(answer)
     if not suggested_actions:

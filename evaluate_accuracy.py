@@ -3,7 +3,7 @@
 Retrieves public chunks for 20 golden questions from the PG chunks table
 (embedding via services.embed_service -- the vendored all-MiniLM-L6-v2 that
 replaced ChromaDB's default ONNX embedder), answers them through the shared
-services.llm_client.call_glm (MODEL_BASE_URL/MODEL_API_KEY/LLM_MODEL from
+services.llm_client.call_llm (MODEL_BASE_URL/MODEL_API_KEY/LLM_MODEL from
 .env, with the production retry + llm_metrics logging) and keyword-grades the
 answers.
 
@@ -28,7 +28,7 @@ script_env.bootstrap()
 
 from services import pg_service
 from services.embed_service import embed_query
-from services.llm_client import call_glm
+from services.llm_client import call_llm
 
 # --- Minimal ANSI coloring (replaces the termcolor dependency) ---
 def colored(text: str, color: str) -> str:
@@ -165,7 +165,7 @@ def query_llm(question: str, context: str) -> str:
     print(f"         [DEBUG] Sending payload of size ~{len(system_prompt) + len(question)} chars...")
 
     try:
-        return call_glm(
+        return call_llm(
             [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": question},
@@ -174,7 +174,7 @@ def query_llm(question: str, context: str) -> str:
             timeout=60,
         )
     except Exception as e:
-        # call_glm raises HTTPException with the user-facing Indonesian message;
+        # call_llm raises HTTPException with the user-facing Indonesian message;
         # grading below treats any "Error:" answer as a miss, like the legacy.
         print(f"         [API ERROR] {e}")
         return "Error: " + str(e)

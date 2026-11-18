@@ -17,7 +17,7 @@ import auth
 from services import pg_service
 from services import grant_policy
 from services.embed_service import embed_query
-from services.llm_client import call_glm, call_glm_vision, vlm_extract_page_image, VLM_PAGE_PROMPT, extract_json
+from services.llm_client import call_llm, call_llm_vision, vlm_extract_page_image, VLM_PAGE_PROMPT, extract_json
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -314,7 +314,7 @@ def llm_extract_pasal_items(full_text: str, max_items: int = 80) -> List[dict]:
         f"DOKUMEN:\n{snippet}"
     )
     try:
-        raw = call_glm([{"role": "user", "content": prompt}], temperature=0.0, timeout=60)
+        raw = call_llm([{"role": "user", "content": prompt}], temperature=0.0, timeout=60)
         items = extract_json(raw)
         if isinstance(items, list):
             return [{"pasal": str(i.get("pasal", f"Klausul {n+1}")),
@@ -464,6 +464,7 @@ def understand_document(text: str) -> dict:
         "Kembalikan HANYA JSON tanpa teks tambahan:\n"
         '{\n'
         '  "jenis_dokumen": "PKS / NDA / Perjanjian Kerja / Kontrak Layanan / dll",\n'
+        '  "archetype": "PKS" | "NDA" | "DSA" | "MSA" | "EMPLOYMENT" | "PROCUREMENT" | "LEASE" | "GENERAL",\n'
         '  "pihak_pertama": "nama lengkap perusahaan/entitas pihak pertama",\n'
         '  "pihak_kedua": "nama lengkap perusahaan/entitas pihak kedua",\n'
         '  "sektor_bisnis": "teknologi / keuangan / ketenagakerjaan / perbankan / dll",\n'
@@ -472,7 +473,7 @@ def understand_document(text: str) -> dict:
         f"DOKUMEN (BAGIAN AWAL):\n{snippet}"
     )
     try:
-        raw = call_glm([{"role": "user", "content": prompt}], temperature=0.0, timeout=30)
+        raw = call_llm([{"role": "user", "content": prompt}], temperature=0.0, timeout=30)
         result = extract_json(raw)
         print(f"[DocContext] Metadata: {result}")
         return result
@@ -480,6 +481,7 @@ def understand_document(text: str) -> dict:
         print(f"[DocContext] Metadata LLM failed: {e}")
         return {
             "jenis_dokumen": "Kontrak",
+            "archetype": "GENERAL",
             "pihak_pertama": "Pihak Pertama",
             "pihak_kedua": "Pihak Kedua",
             "sektor_bisnis": "umum",
@@ -539,7 +541,7 @@ def classify_document_vlm(pdf_path: str, full_text: str) -> dict:
             "nilai rendah bila halaman pertama tidak cukup menentukan.\n\n"
             f"TEKS HASIL EKSTRAKSI (awal dokumen):\n{(full_text or '')[:2500]}"
         )
-        raw = call_glm_vision(image_b64, prompt, timeout=90)
+        raw = call_llm_vision(image_b64, prompt, timeout=90)
         data = extract_json(raw)
         if not isinstance(data, dict):
             raise ValueError("classifier JSON bukan objek")
@@ -595,7 +597,7 @@ def extract_signing_date(text: str) -> str | None:
     )
     llm_date = None
     try:
-        raw = call_glm([{"role": "user", "content": prompt}], temperature=0.0, timeout=25)
+        raw = call_llm([{"role": "user", "content": prompt}], temperature=0.0, timeout=25)
         parsed = extract_json(raw)
         llm_date = parsed.get("tanggal")
         if llm_date:
@@ -661,7 +663,7 @@ def extract_duration_months(text: str) -> int | None:
     )
     llm_duration = None
     try:
-        raw = call_glm([{"role": "user", "content": prompt}], temperature=0.0, timeout=25)
+        raw = call_llm([{"role": "user", "content": prompt}], temperature=0.0, timeout=25)
         parsed = extract_json(raw)
         val = parsed.get("durasi_bulan")
         if val and isinstance(val, (int, float)) and 1 <= int(val) <= 600:
@@ -710,7 +712,7 @@ def extract_explicit_end_date(text: str) -> str | None:
         f"TEKS:\n{context_for_llm}"
     )
     try:
-        raw = call_glm([{"role": "user", "content": prompt}], temperature=0.0, timeout=25)
+        raw = call_llm([{"role": "user", "content": prompt}], temperature=0.0, timeout=25)
         parsed = extract_json(raw)
         end_date = parsed.get("tanggal_berakhir")
         if end_date:
@@ -768,10 +770,42 @@ def is_regulation_relevant(pasal_text: str, reg_text: str, reg_name: str) -> boo
         f"REGULASI:\n{reg_text[:600]}"
     )
     try:
-        ans = call_glm([{"role": "user", "content": prompt}], temperature=0.0, timeout=20)
+        ans = call_llm([{"role": "user", "content": prompt}], temperature=0.0, timeout=8, max_attempts=1)
         return "YA" in ans.upper()
     except Exception:
         return True  # default: assume relevant if check fails
+
+
+def filter_relevant_regulations_batch(pasal_text: str, candidates: list[dict]) -> list[int]:
+    """
+    Single batched relevance check for up to 3 candidate regulations on a clause.
+    Returns the list of 0-based indices that are directly relevant.
+    """
+    if not candidates:
+        return []
+    if len(candidates) == 1:
+        c = candidates[0]
+        return [0] if is_regulation_relevant(pasal_text, c["text"], c["reg_name"]) else []
+
+    cand_block = "\n\n".join(
+        f"[{i}] {c['reg_name']}:\n{c['text'][:450]}"
+        for i, c in enumerate(candidates)
+    )
+    prompt = (
+        "Pilih nomor kandidat regulasi di bawah ini yang SECARA LANGSUNG relevan untuk mengevaluasi "
+        "klausul kontrak berikut. Kembalikan HANYA daftar angka dipisahkan koma (misal: 0,2), atau 'NONE' jika tidak ada.\n\n"
+        f"KLAUSUL:\n{pasal_text[:400]}\n\n"
+        f"KANDIDAT REGULASI:\n{cand_block}"
+    )
+    try:
+        ans = call_llm([{"role": "user", "content": prompt}], temperature=0.0, timeout=10, max_attempts=1)
+        up = ans.upper().strip()
+        if "NONE" in up or "TIDAK" in up:
+            return []
+        idxs = [int(x) for x in re.findall(r"\b(\d+)\b", up)]
+        return [i for i in dict.fromkeys(idxs) if 0 <= i < len(candidates)]
+    except Exception:
+        return list(range(len(candidates)))
 
 
 _ROMAN_NUM_RE = re.compile(r'^[IVXLCDM]+$', re.I)
@@ -874,7 +908,7 @@ def is_text_readable_llm(text: str) -> bool:
         f"TEKS:\n{snippet}"
     )
     try:
-        ans = call_glm([{"role": "user", "content": prompt}], temperature=0.0, timeout=20)
+        ans = call_llm([{"role": "user", "content": prompt}], temperature=0.0, timeout=8, max_attempts=1)
         return "BISA DIBACA" in ans.upper()
     except Exception:
         return True # Default to readable if check fails
@@ -924,8 +958,9 @@ def extract_text_hybrid(pdf_path: str, digital_threshold: int = 80,
             use_vlm = True
             reason = "global font corruption"
         elif len(digital_text) < digital_threshold:
-            use_vlm = True
-            reason = f"scanned/empty ({len(digital_text)} chars)"
+            if page.get_images(full=False):
+                use_vlm = True
+                reason = f"scanned/empty ({len(digital_text)} chars)"
         elif is_text_garbled(digital_text):
             use_vlm = True
             reason = "font encoding corruption detected"
@@ -943,7 +978,7 @@ def extract_text_hybrid(pdf_path: str, digital_threshold: int = 80,
 
         print(f"  [VLM] Page {page_num + 1} -> {reason}")
         try:
-            vlm_text = call_glm_vision(img_b64, VLM_PAGE_PROMPT, timeout=90)
+            vlm_text = call_llm_vision(img_b64, VLM_PAGE_PROMPT, timeout=90)
             if vlm_text and vlm_text.strip():
                 return page_num, f"--- Halaman {page_num + 1} ---\n{vlm_text.strip()}", True
             else:
@@ -954,7 +989,7 @@ def extract_text_hybrid(pdf_path: str, digital_threshold: int = 80,
             return page_num, digital_text, False
 
     has_vlm = any(t[4] for t in page_tasks)
-    max_workers = min(4, len(page_tasks)) if has_vlm else 1
+    max_workers = min(2, len(page_tasks)) if has_vlm else 1
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
         results = list(pool.map(_process_page_task, page_tasks))
 
@@ -1115,7 +1150,7 @@ def _merge_workspace_refs(ws_refs: List[dict], contexts: List[dict]) -> List[dic
     return merged
 
 
-def retrieve_contexts(query: str, current_user: dict, n_results=5, doc_category=None, hybrid_cag=True, report_id=None) -> List[dict]:
+def retrieve_contexts(query: str, current_user: dict, n_results=5, doc_category=None, hybrid_cag=True, report_id=None, categories=None) -> List[dict]:
     """Searches Vector DB and returns structured raw dictionaries.
        If hybrid_cag=True, uses RAG to find the best document, then CAG to inject the full text.
        Enforces FR-17 by strictly filtering out classified documents the user cannot access.
@@ -1195,6 +1230,13 @@ def retrieve_contexts(query: str, current_user: dict, n_results=5, doc_category=
     if doc_category:
         where_sql += " AND doc_category = ANY(%s)"
         where_params.append([doc_category, "UMUM"])
+    where_sql += " AND COALESCE(is_active_law, TRUE) = TRUE"
+    if categories:
+        cat_list = list(categories)
+        if "CIVIL_CONTRACT" not in cat_list:
+            cat_list.append("CIVIL_CONTRACT")
+        where_sql += " AND (visibility = 'private' OR category_code = ANY(%s))"
+        where_params.append(cat_list)
         
     contexts = []
     query_vec = embed_query(query)

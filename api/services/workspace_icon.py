@@ -1,7 +1,7 @@
 """Workspace Lucide icon classification and inference service.
 
 Provides deterministic fast-path regex classification for 12 canonical Indonesian/English
-legal contract types, and an LLM fallback (call_glm) for novel workspace names, with
+legal contract types, and an LLM fallback (call_llm) for novel workspace names, with
 defensive fallback to 'folder'.
 """
 import logging
@@ -9,9 +9,9 @@ import re
 from typing import Optional
 
 try:
-    from api.services.llm_client import call_glm, extract_json
+    from api.services.llm_client import call_llm, extract_json
 except ImportError:
-    from services.llm_client import call_glm, extract_json
+    from services.llm_client import call_llm, extract_json
 
 logger = logging.getLogger(__name__)
 
@@ -119,7 +119,7 @@ def infer_workspace_icon(name: Optional[str], description: str = "") -> str:
     """Infer the most appropriate Lucide icon for a workspace.
 
     1. Checks fast-path canonical regex matcher (0ms latency, deterministic).
-    2. If no canonical match and name is provided, queries the LLM fallback (call_glm)
+    2. If no canonical match and name is provided, queries the LLM fallback (call_llm)
        with a low temperature and prompt constrained to CURATED_WORKSPACE_ICONS.
     3. Defensively catches any exception or timeout and falls back cleanly to 'folder'.
     """
@@ -154,7 +154,7 @@ def infer_workspace_icon(name: Optional[str], description: str = "") -> str:
             },
             {"role": "user", "content": prompt},
         ]
-        raw_response = call_glm(messages, temperature=0.0, timeout=5)
+        raw_response = call_llm(messages, temperature=0.0, timeout=5)
         parsed = extract_json(raw_response)
 
         if isinstance(parsed, list) and len(parsed) > 0 and isinstance(parsed[0], dict):

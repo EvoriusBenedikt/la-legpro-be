@@ -1,17 +1,14 @@
-"""Canonical LLM transport client (OpenAI-compatible GLM/VLM endpoints).
+"""Canonical LLM transport client (OpenAI-compatible LLM/VLM endpoints).
 
-Phase 2 refactor note: this module previously held an older, simpler copy of
-call_glm / get_glm_session / is_transient_network_error. It has been replaced
-with the newer implementation moved verbatim from api/main.py. The external
-contract (URL handling, payload, retry env knobs, HTTPException status codes
-and user-facing messages) is unchanged; the newer version additionally logs
-llm_metrics, prints debug info, and uses a hardened transport session.
-Vision helpers (call_glm_vision, vlm_extract_page_image, VLM_PAGE_PROMPT)
-also moved here from api/main.py.
+Phase 2 refactor note: replaces legacy call_glm / get_glm_session naming with
+call_llm / call_llm_vision / get_llm_session while keeping full transport
+contract (URL handling, payload, retry env knobs, HTTPException status codes,
+llm_metrics logging, and user-facing messages).
 """
 import os
 import json
 import re
+import time
 import base64
 import requests
 from typing import Optional
@@ -23,49 +20,52 @@ from services import pg_service
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# ── GLM API Config ──────────────────────────────────────────────────────────
+# ── LLM API Config ──────────────────────────────────────────────────────────
 API_BASE_URL = os.getenv("MODEL_BASE_URL", "https://console.labahasa.ai/v1").rstrip("/")
 API_KEY      = os.getenv("MODEL_API_KEY", "")
-# Reverted to use Maverick for both text and vision because GLM is unstable
-GLM_MODEL    = os.getenv("LLM_MODEL", "llama-4-maverick-instruct")
+LLM_MODEL    = os.getenv("LLM_MODEL", "llama-4-maverick-instruct")
 VLM_MODEL    = os.getenv("LLM_MODEL", "llama-4-maverick-instruct")
-GLM_MAX_ATTEMPTS = int(os.getenv("GLM_MAX_ATTEMPTS", "5"))
-GLM_RETRY_BACKOFF_BASE = float(os.getenv("GLM_RETRY_BACKOFF_BASE", "0.8"))
+LLM_MAX_ATTEMPTS = int(os.getenv("LLM_MAX_ATTEMPTS") or os.getenv("GLM_MAX_ATTEMPTS", "5"))
+LLM_RETRY_BACKOFF_BASE = float(os.getenv("LLM_RETRY_BACKOFF_BASE") or os.getenv("GLM_RETRY_BACKOFF_BASE", "0.8"))
 
 if not API_BASE_URL or not API_KEY:
     print("[WARNING] MODEL_BASE_URL or MODEL_API_KEY is not set in .env — LLM calls will fail.")
 
-_glm_session: Optional[requests.Session] = None
+_llm_session: Optional[requests.Session] = None
 
-GENERIC_GLM_ERROR_MESSAGE = (
+GENERIC_LLM_ERROR_MESSAGE = (
     "Layanan AI sedang mengalami gangguan koneksi sementara. "
     "Silakan coba lagi dalam beberapa saat."
 )
 
-def get_glm_session() -> requests.Session:
-    """Build a reusable HTTP session with transport-level retries."""
-    global _glm_session
-    if _glm_session is None:
+_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+
+
+def get_llm_session() -> requests.Session:
+    """Build a reusable HTTP session with connect-level retries only (read/status
+    retries are managed once by call_llm / call_llm_vision to avoid 3x5=15
+    multiplied waits)."""
+    global _llm_session
+    if _llm_session is None:
         session = requests.Session()
         import urllib3
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         session.verify = False
-        
+
         retry_cfg = Retry(
             total=2,
             connect=2,
-            read=2,
-            status=2,
-            backoff_factor=0.6,
-            status_forcelist=[429, 500, 502, 503, 504],
+            read=0,
+            status=0,
+            backoff_factor=0.4,
             allowed_methods=frozenset(["POST"]),
             raise_on_status=False,
         )
         adapter = HTTPAdapter(max_retries=retry_cfg, pool_connections=10, pool_maxsize=20)
         session.mount("https://", adapter)
         session.mount("http://", adapter)
-        _glm_session = session
-    return _glm_session
+        _llm_session = session
+    return _llm_session
 
 def is_transient_network_error(err: Exception | None) -> bool:
     if err is None:
@@ -123,52 +123,61 @@ def extract_json(raw: str):
         "no parseable JSON object/array in LLM response", text, 0)
 
 
-def call_glm(messages: list, temperature: float = 0.1, timeout: int = 90) -> str:
+def call_llm(
+    messages: list,
+    temperature: float = 0.1,
+    timeout: int = 90,
+    max_attempts: Optional[int] = None,
+    max_tokens: Optional[int] = None,
+) -> str:
     """
-    Unified GLM API caller (OpenAI-compatible).
+    Unified LLM API caller (OpenAI-compatible).
     Returns the assistant message content string.
     Raises HTTPException on failure.
     """
-    # Handle cases where user might have included /chat/completions in the base URL
     if API_BASE_URL.endswith("/chat/completions"):
         url = API_BASE_URL
     else:
         url = f"{API_BASE_URL}/chat/completions"
-    
-    # DEBUG: See what the server is actually using
+
     print(f"DEBUG: Calling LLM at URL: {url}")
-    print(f"DEBUG: Model: {GLM_MODEL}")
+    print(f"DEBUG: Model: {LLM_MODEL}")
     print(f"DEBUG: API Key configured: {'Yes' if API_KEY else 'No (EMPTY)'}")
 
     headers = {
         "Authorization": f"Bearer {API_KEY}",
         "Content-Type": "application/json"
     }
-    payload = {
-        "model": GLM_MODEL,
+    payload: dict = {
+        "model": LLM_MODEL,
         "messages": messages,
         "temperature": temperature,
         "stream": False
     }
-    max_attempts = max(1, GLM_MAX_ATTEMPTS)
-    last_error: Exception | None = None
-    session = get_glm_session()
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
 
-    for attempt in range(1, max_attempts + 1):
+    attempts = max(1, max_attempts if max_attempts is not None else LLM_MAX_ATTEMPTS)
+    last_error: Exception | None = None
+    session = get_llm_session()
+
+    for attempt in range(1, attempts + 1):
         try:
-            import time
             start_time = time.time()
             # Tuple timeout: (connect_timeout, read_timeout)
             resp = session.post(url, json=payload, headers=headers, timeout=(15, timeout))
             latency_ms = int((time.time() - start_time) * 1000)
 
             if not resp.ok:
-                # Include truncated upstream body to speed up debugging bad credentials/model/payload.
                 body_snippet = (resp.text or "")[:300]
-                print(f"GLM non-2xx response: status={resp.status_code}, body={body_snippet}")
+                print(f"LLM non-2xx response (attempt {attempt}/{attempts}): status={resp.status_code}, body={body_snippet}")
+                if resp.status_code in _RETRYABLE_STATUS_CODES and attempt < attempts:
+                    sleep_s = LLM_RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
+                    time.sleep(sleep_s)
+                    continue
                 raise HTTPException(
-                    status_code=500,
-                    detail=GENERIC_GLM_ERROR_MESSAGE
+                    status_code=503 if resp.status_code in _RETRYABLE_STATUS_CODES else 500,
+                    detail=GENERIC_LLM_ERROR_MESSAGE
                 )
 
             data = resp.json()
@@ -187,20 +196,19 @@ def call_glm(messages: list, temperature: float = 0.1, timeout: int = 90) -> str
             raise
         except requests.exceptions.RequestException as e:
             last_error = e
-            print(f"GLM request attempt {attempt}/{max_attempts} failed: {e}")
-            if attempt < max_attempts:
-                # Exponential backoff to absorb transient upstream disconnects.
-                sleep_s = GLM_RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
+            print(f"LLM request attempt {attempt}/{attempts} failed: {e}")
+            if attempt < attempts:
+                sleep_s = LLM_RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
                 time.sleep(sleep_s)
                 continue
             break
         except (KeyError, IndexError, TypeError) as e:
-            print(f"Unexpected GLM response format: {e}")
-            raise HTTPException(status_code=500, detail=GENERIC_GLM_ERROR_MESSAGE)
+            print(f"Unexpected LLM response format: {e}")
+            raise HTTPException(status_code=500, detail=GENERIC_LLM_ERROR_MESSAGE)
 
     if is_transient_network_error(last_error):
-        raise HTTPException(status_code=503, detail=GENERIC_GLM_ERROR_MESSAGE)
-    raise HTTPException(status_code=500, detail=GENERIC_GLM_ERROR_MESSAGE)
+        raise HTTPException(status_code=503, detail=GENERIC_LLM_ERROR_MESSAGE)
+    raise HTTPException(status_code=500, detail=GENERIC_LLM_ERROR_MESSAGE)
 
 
 def vlm_extract_page_image(page) -> str:
@@ -215,9 +223,9 @@ def vlm_extract_page_image(page) -> str:
     return base64.b64encode(pix.tobytes("jpeg", jpg_quality=88)).decode("utf-8")
 
 
-def call_glm_vision(image_b64: str, prompt: str, timeout: int = 90, mime_type: str = "image/jpeg") -> str:
+def call_llm_vision(image_b64: str, prompt: str, timeout: int = 90, mime_type: str = "image/jpeg") -> str:
     """
-    Send a page image to llama-4-maverick via the vision (multimodal) API.
+    Send a page image to the vision (multimodal) API.
     Returns the extracted text content.
     """
     if API_BASE_URL.endswith("/chat/completions"):
@@ -247,25 +255,31 @@ def call_glm_vision(image_b64: str, prompt: str, timeout: int = 90, mime_type: s
         "temperature": 0.0,
         "stream": False
     }
-    import time
-    start_time = time.time()
-    resp = get_glm_session().post(url, json=payload, headers=headers, timeout=(15, timeout))
-    latency_ms = int((time.time() - start_time) * 1000)
+    session = get_llm_session()
+    attempts = 2
+    for attempt in range(1, attempts + 1):
+        start_time = time.time()
+        resp = session.post(url, json=payload, headers=headers, timeout=(15, timeout))
+        latency_ms = int((time.time() - start_time) * 1000)
 
-    if resp.ok:
-        data = resp.json()
-        tokens = data.get("usage", {}).get("total_tokens", 0)
-        cost = (tokens / 1000.0) * 0.001
-        try:
-            pg_service.execute(
-                "INSERT INTO llm_metrics (endpoint, tokens_used, latency_ms, cost_estimate) "
-                "VALUES (%s, %s, %s, %s)",
-                ("vlm_vision", tokens, latency_ms, cost),
-            )
-        except Exception:
-            pass
-        return data["choices"][0]["message"]["content"]
-    print(f"VLM page extraction failed: {resp.status_code} {resp.text[:200]}")
+        if resp.ok:
+            data = resp.json()
+            tokens = data.get("usage", {}).get("total_tokens", 0)
+            cost = (tokens / 1000.0) * 0.001
+            try:
+                pg_service.execute(
+                    "INSERT INTO llm_metrics (endpoint, tokens_used, latency_ms, cost_estimate) "
+                    "VALUES (%s, %s, %s, %s)",
+                    ("vlm_vision", tokens, latency_ms, cost),
+                )
+            except Exception:
+                pass
+            return data["choices"][0]["message"]["content"]
+        if resp.status_code in _RETRYABLE_STATUS_CODES and attempt < attempts:
+            time.sleep(LLM_RETRY_BACKOFF_BASE * attempt)
+            continue
+        print(f"VLM page extraction failed: {resp.status_code} {resp.text[:200]}")
+        return ""
     return ""
 
 

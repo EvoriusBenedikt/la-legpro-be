@@ -65,7 +65,7 @@ def _no_llm(monkeypatch):
     from services import rag_service
     from routers import compliance
     monkeypatch.setattr(rag_service, "is_regulation_relevant", lambda *a, **k: True)
-    monkeypatch.setattr(compliance, "call_glm",
+    monkeypatch.setattr(compliance, "call_llm",
                         lambda *a, **k: '{"status": "SESUAI", "penjelasan": "ok"}')
 
 

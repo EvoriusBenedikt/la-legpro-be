@@ -1,0 +1,4 @@
+services:
+  backend:
+    ports:
+      - "172.17.0.1:8080:8000"

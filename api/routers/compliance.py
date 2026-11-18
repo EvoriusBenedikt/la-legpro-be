@@ -9,7 +9,7 @@ import auth
 from fastapi.concurrency import run_in_threadpool
 from services import pg_service, rate_limit
 from services import favorability
-from services.llm_client import call_glm, extract_json
+from services.llm_client import call_llm, extract_json
 
 # M3 migration note: SQLite (legal_metadata.db) and ChromaDB are replaced by
 # PostgreSQL + pgvector. Regulation metadata lives in `regulations`; chunks +
@@ -275,11 +275,11 @@ async def analyze_document(
     diubah_dengan = []
     
     try:
-        # call_glm is blocking `requests` code; awaited in a worker thread so
+        # call_llm is blocking `requests` code; awaited in a worker thread so
         # the single-threaded event loop keeps serving everyone else while the
         # LLM call runs (previously froze the whole backend for the call's
         # duration — healthz included; bug_reports.md 2026-10-07).
-        raw_content = await run_in_threadpool(call_glm, messages_llm, temperature=0.1, timeout=60)
+        raw_content = await run_in_threadpool(call_llm, messages_llm, temperature=0.1, timeout=60)
         parsed = extract_json(raw_content)
         overview = parsed.get("overview", overview)
         dicabut = parsed.get("dicabut", [])
@@ -358,7 +358,7 @@ async def analyze_pasals(
         # the longest LLM round trip in the drawer (timeout=180, plus the
         # retry chain) and must not freeze other users' requests.
         raw = await run_in_threadpool(
-            call_glm,
+            call_llm,
             [
                 {"role": "system", "content": system_prompt},
                 {"role": "user",   "content": user_prompt},
@@ -395,7 +395,7 @@ async def analyze_pasals(
 
 
 def process_single_pasal(c, doc_type, pihak_1, pihak_2, sektor, pokok, COSINE_THRESHOLD, uid, excluded, report_id,
-                         pihak_kita_nama="", peran_kita=None):
+                         pihak_kita_nama="", peran_kita=None, contract_categories=None, precomputed_vec=None):
     pasal_label = c.get("pasal", "Pasal")
     desc = c.get("deskripsi", "")
     if not desc or len(desc) < 10:
@@ -404,31 +404,49 @@ def process_single_pasal(c, doc_type, pihak_1, pihak_2, sektor, pokok, COSINE_TH
     # Map doc_type to doc_category
     doc_cat = "NDA" if "NDA" in str(doc_type).upper() or "NON-DISCLOSURE" in str(doc_type).upper() else "PKS"
 
-    # Enrich the search query with document context for better RAG retrieval
-    search_query = f"[{doc_type}] [{sektor}] {desc[:400]}"
-    from services.embed_service import embed_query
-    query_vec = embed_query(search_query)
+    # Reuse precomputed batch embedding if provided
+    if precomputed_vec is not None:
+        query_vec = precomputed_vec
+    else:
+        search_query = f"[{doc_type}] [{sektor}] {desc[:400]}"
+        from services.embed_service import embed_query
+        query_vec = embed_query(search_query)
+    cat_filter = list(contract_categories) if contract_categories else None
     with pg_service.get_conn() as conn:
         conn.execute("SET LOCAL hnsw.ef_search = 100")
-        # B2: also admit the caller's OWN internal uploads (doc_category NULL,
-        # so they never matched before). Additive: it can only add the user's
-        # private internal rows to the candidate pool; the < 0.45 distance gate
-        # and is_regulation_relevant micro-check still reject irrelevant ones.
-        # shortcut: keep LIMIT 3 — shared across public + admitted internal
-        # candidates, so a user with many internal chunks could crowd out public
-        # law for a clause (moot today: no FE path produces internal chunks).
-        # Revisit raising it only if internal docs crowd out public law in testing.
-        cur = conn.execute(
-            "SELECT id, doc_id, text, jenis, nomor, sektor, "
-            "embedding <=> %s::vector AS dist "
-            "FROM chunks "
-            "WHERE embedding IS NOT NULL "
-            "AND ( doc_category = ANY(%s) "
-            "      OR (visibility = 'private' AND user_id = %s::text "
-            "          AND doc_id IS NULL AND id LIKE 'internal\\_%%' "
-            "          AND (report_id IS NULL OR report_id = %s)) ) "
-            "ORDER BY embedding <=> %s::vector LIMIT 3",
-            (query_vec, [doc_cat, "UMUM"], uid, report_id, query_vec))
+        conn.execute("SET LOCAL hnsw.iterative_scan = strict_order")
+        if cat_filter:
+            cur = conn.execute(
+                "SELECT c.id, c.doc_id, c.text, c.jenis, c.nomor, c.sektor, "
+                "c.embedding <=> %s::vector AS dist, "
+                "r.id AS regulation_id, r.legal_status, r.status_note, r.last_verified_at, r.detail_url "
+                "FROM chunks c "
+                "LEFT JOIN regulations r ON r.id::text = c.doc_id "
+                "WHERE c.embedding IS NOT NULL "
+                "AND COALESCE(c.is_active_law, TRUE) = TRUE "
+                "AND (c.doc_id IS NULL OR COALESCE(r.legal_status, 'berlaku') IN ('berlaku', 'diubah', 'dicabut_sebagian')) "
+                "AND ( (c.doc_category = ANY(%s) AND c.category_code = ANY(%s)) "
+                "      OR (c.visibility = 'private' AND c.user_id = %s::text "
+                "          AND c.doc_id IS NULL AND c.id LIKE 'internal\\_%%' "
+                "          AND (c.report_id IS NULL OR c.report_id = %s)) ) "
+                "ORDER BY c.embedding <=> %s::vector LIMIT 3",
+                (query_vec, [doc_cat, "UMUM", "regulations"], cat_filter, uid, report_id, query_vec))
+        else:
+            cur = conn.execute(
+                "SELECT c.id, c.doc_id, c.text, c.jenis, c.nomor, c.sektor, "
+                "c.embedding <=> %s::vector AS dist, "
+                "r.id AS regulation_id, r.legal_status, r.status_note, r.last_verified_at, r.detail_url "
+                "FROM chunks c "
+                "LEFT JOIN regulations r ON r.id::text = c.doc_id "
+                "WHERE c.embedding IS NOT NULL "
+                "AND COALESCE(c.is_active_law, TRUE) = TRUE "
+                "AND (c.doc_id IS NULL OR COALESCE(r.legal_status, 'berlaku') IN ('berlaku', 'diubah', 'dicabut_sebagian')) "
+                "AND ( c.doc_category = ANY(%s) "
+                "      OR (c.visibility = 'private' AND c.user_id = %s::text "
+                "          AND c.doc_id IS NULL AND c.id LIKE 'internal\\_%%' "
+                "          AND (c.report_id IS NULL OR c.report_id = %s)) ) "
+                "ORDER BY c.embedding <=> %s::vector LIMIT 3",
+                (query_vec, [doc_cat, "UMUM", "regulations"], uid, report_id, query_vec))
         sr_rows = cur.fetchall()
 
     # B2: drop deselected sources before the distance/relevance loop.
@@ -440,24 +458,60 @@ def process_single_pasal(c, doc_type, pihak_1, pihak_2, sektor, pokok, COSINE_TH
     relevant_refs = []
 
     if sr_rows:
-        from services.rag_service import is_regulation_relevant
+        from services.rag_service import filter_relevant_regulations_batch
+        within_thresh = []
         for row in sr_rows:
-            dist = float(row["dist"])
-            if dist < COSINE_THRESHOLD:
-                doc_text = row["text"]
-                reg_name = f"{row['jenis'] or 'Aturan'} Nomor {row['nomor'] or 'N/A'}"
+            if float(row["dist"]) < COSINE_THRESHOLD:
+                within_thresh.append({
+                    "row": row,
+                    "text": row["text"],
+                    "reg_name": f"{row['jenis'] or 'Aturan'} Nomor {row['nomor'] or 'N/A'}",
+                })
+        if within_thresh:
+            # High-confidence matches (< 0.28) are kept directly; others verified in 1 batched call
+            need_check = [c for c in within_thresh if float(c["row"]["dist"]) >= 0.28]
+            auto_keep = [c for c in within_thresh if float(c["row"]["dist"]) < 0.28]
+            kept_checked = []
+            if need_check:
+                valid_idxs = set(filter_relevant_regulations_batch(desc, need_check))
+                for idx, c in enumerate(need_check):
+                    if idx in valid_idxs:
+                        kept_checked.append(c)
+                    else:
+                        print(f"  [Relevance] {c['reg_name']} rejected for {pasal_label}")
+            matched_reg_ids = [
+                c["row"]["regulation_id"] for c in (auto_keep + kept_checked)
+                if c["row"].get("regulation_id") is not None
+            ]
+            amendment_map = {}
+            if matched_reg_ids:
+                from services.freshness.live_verifier import get_amendment_chain
+                with pg_service.get_conn() as conn:
+                    amendment_map = get_amendment_chain(conn, matched_reg_ids)
 
-                # Relevance confirmation micro-call
-                if is_regulation_relevant(desc, doc_text, reg_name):
-                    supporting_regulations.append({
-                        "jenis": row['jenis'] or 'Aturan',
-                        "nomor": row['nomor'] or 'N/A',
-                        "sektor": row['sektor'] or 'Umum',
-                        "teks": doc_text
-                    })
-                    relevant_refs.append(f"--- {reg_name} ---\n{doc_text[:700]}")
-                else:
-                    print(f"  [Relevance] {reg_name} rejected for {pasal_label}")
+            for c in auto_keep + kept_checked:
+                row = c["row"]
+                reg_id = row.get("regulation_id")
+                legal_status = row.get("legal_status") or "berlaku"
+                amended_by = amendment_map.get(reg_id, []) if reg_id is not None else []
+                lv_at = row.get("last_verified_at")
+                supporting_regulations.append({
+                    "regulation_id": reg_id,
+                    "jenis": row['jenis'] or 'Aturan',
+                    "nomor": row['nomor'] or 'N/A',
+                    "sektor": row['sektor'] or 'Umum',
+                    "teks": c["text"],
+                    "legal_status": legal_status,
+                    "status_note": row.get("status_note"),
+                    "last_verified_at": lv_at.isoformat() if hasattr(lv_at, "isoformat") else lv_at,
+                    "detail_url": row.get("detail_url"),
+                    "amended_by": amended_by,
+                })
+                amend_note = ""
+                if amended_by:
+                    labels = ", ".join(a.get("canonical_key") or "" for a in amended_by if a.get("canonical_key"))
+                    amend_note = f"\n[Catatan Perubahan: {legal_status.upper()} oleh {labels}]"
+                relevant_refs.append(f"--- {c['reg_name']} ({legal_status}) ---{amend_note}\n{c['text'][:700]}")
 
     if not relevant_refs:
         # No regulation matched: no LLM call here, so the commercial-position
@@ -521,7 +575,7 @@ def process_single_pasal(c, doc_type, pihak_1, pihak_2, sektor, pokok, COSINE_TH
     )
 
     try:
-        raw_v = call_glm(
+        raw_v = call_llm(
             [{"role": "user", "content": prompt_verify}],
             temperature=0.1,
             timeout=90
@@ -585,7 +639,7 @@ def extract_docx_content(file_path: str, filename: str, use_ocr: bool = False) -
     from PIL import Image
     from docx.table import Table
     from docx.text.paragraph import Paragraph
-    from services.llm_client import call_glm_vision, VLM_PAGE_PROMPT, vlm_extract_page_image
+    from services.llm_client import call_llm_vision, VLM_PAGE_PROMPT, vlm_extract_page_image
     from services.rag_service import extract_text_hybrid
 
     try:
@@ -737,7 +791,7 @@ def extract_docx_content(file_path: str, filename: str, use_ocr: bool = False) -
                     def _ocr_page(args: tuple[int, str]) -> tuple[int, str]:
                         idx, b64_data = args
                         try:
-                            txt = call_glm_vision(b64_data, VLM_PAGE_PROMPT, timeout=75)
+                            txt = call_llm_vision(b64_data, VLM_PAGE_PROMPT, timeout=75)
                             if txt and txt.strip():
                                 print(f"    [DOCX->VLM] Page {idx}/{len(page_b64_list)} extracted ({len(txt.strip())} chars)")
                                 return idx, f"--- Halaman {idx} ---\n{txt.strip()}"
@@ -772,7 +826,7 @@ def extract_docx_content(file_path: str, filename: str, use_ocr: bool = False) -
                     vlm_pages.append(p_txt)
                 else:
                     b64_img = vlm_extract_page_image(page)
-                    ocr_txt = call_glm_vision(b64_img, VLM_PAGE_PROMPT, timeout=75)
+                    ocr_txt = call_llm_vision(b64_img, VLM_PAGE_PROMPT, timeout=75)
                     if ocr_txt and ocr_txt.strip():
                         vlm_pages.append(f"--- Halaman {pno + 1} ---\n{ocr_txt.strip()}")
             fitz_doc.close()
@@ -786,7 +840,7 @@ def extract_docx_content(file_path: str, filename: str, use_ocr: bool = False) -
 
 def extract_text_multi_format(file_path: str, filename: str, use_ocr: bool = False) -> str:
     from services.rag_service import extract_text_hybrid
-    from services.llm_client import call_glm_vision, VLM_PAGE_PROMPT
+    from services.llm_client import call_llm_vision, VLM_PAGE_PROMPT
     """
     Extracts text from various file formats: PDF, DOCX, XLSX, PPTX, JPG, PNG, TXT.
     Routes to the appropriate extractor based on the file extension.
@@ -817,7 +871,7 @@ def extract_text_multi_format(file_path: str, filename: str, use_ocr: bool = Fal
         with open(file_path, "rb") as f:
             img_b64 = base64.b64encode(f.read()).decode('utf-8')
         mime = f"image/{'png' if ext == 'png' else 'jpeg'}"
-        vlm_text = call_glm_vision(img_b64, VLM_PAGE_PROMPT, timeout=60, mime_type=mime)
+        vlm_text = call_llm_vision(img_b64, VLM_PAGE_PROMPT, timeout=60, mime_type=mime)
         return vlm_text.strip()
         
     elif ext == 'docx':
@@ -860,6 +914,7 @@ def extract_text_multi_format(file_path: str, filename: str, use_ocr: bool = Fal
 # before the limiter so a 403 never consumes rate-limit budget.
 @router.post("/check-compliance")
 async def check_compliance(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     use_ocr: str = Form("false"),
     report_id: str | None = Form(None),   # B3: current workspace; None => no narrowing
@@ -946,9 +1001,16 @@ async def check_compliance(
                 detail="Dokumen tidak dapat dibaca atau teks kurang dari 100 karakter. Jika dokumen berupa pindaian (scan) atau gambar dalam DOCX/PDF, pastikan gambar terbaca jelas atau aktifkan opsi OCR."
             )
 
-        # ── Pass 0A: Document Metadata Understanding ──────────────────────
-        print("[Compliance] Pass 0A: Extracting document metadata...")
-        doc_ctx  = understand_document(full_text)
+        # ── Pass 0A + 0B + 0C in Parallel ────────────────────────────────
+        print("[Compliance] Pass 0A/0B/0C: Extracting metadata, signing date & duration in parallel...")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as p0_pool:
+            fut_ctx = p0_pool.submit(understand_document, full_text)
+            fut_date = p0_pool.submit(extract_signing_date, full_text)
+            fut_dur = p0_pool.submit(extract_duration_months, full_text)
+            doc_ctx = fut_ctx.result()
+            tanggal_pembuatan = fut_date.result()
+            durasi_bulan = fut_dur.result()
+
         doc_type = doc_ctx.get("jenis_dokumen", "Kontrak")
         pihak_1  = doc_ctx.get("pihak_pertama", "Pihak Pertama")
         pihak_2  = doc_ctx.get("pihak_kedua", "Pihak Kedua")
@@ -964,14 +1026,6 @@ async def check_compliance(
         pihak_kita_nama = pihak_2 if pihak_kita_key == "kedua" else pihak_1
         peran_kita_clean = favorability.normalize_peran(peran_kita)
         print(f"[Compliance] Scoring position for: {pihak_kita_nama} ({peran_kita_clean or 'peran tidak ditentukan'})")
-
-        # ── Pass 0B: Dedicated signing date extraction ────────────────────
-        print("[Compliance] Pass 0B: Extracting signing date...")
-        tanggal_pembuatan = extract_signing_date(full_text)
-
-        # ── Pass 0C: Dedicated duration extraction ────────────────────────
-        print("[Compliance] Pass 0C: Extracting contract duration...")
-        durasi_bulan = extract_duration_months(full_text)
 
         # ── Compute expiry date ───────────────────────────────────────────
         tanggal_berakhir = None
@@ -1012,26 +1066,71 @@ async def check_compliance(
         excluded = get_user_exclusions(current_user["id"])
         rid = report_id if report_id else None   # B3: '' / None => no narrowing
 
-        def worker(c):
+        from services.scraper.category_classifier import classify_contract_categories
+        contract_categories = classify_contract_categories(
+            f"{doc_type}\n{sektor}\n{pokok}\n{text_snippet[:6000]}"
+        )
+        print(f"[Compliance] Category routing: {contract_categories}")
+
+        clauses_to_check = pasal_items[:80]
+        # Batch-embed all clause search queries in one forward pass
+        from services.embed_service import embed_documents
+        clause_queries = [
+            f"[{doc_type}] [{sektor}] {(c.get('deskripsi') or '')[:400]}"
+            for c in clauses_to_check
+        ]
+        clause_vecs = embed_documents(clause_queries) if clause_queries else []
+
+        def worker(args):
+            c, vec = args
             return process_single_pasal(c, doc_type, pihak_1, pihak_2, sektor, pokok,
                                         COSINE_THRESHOLD, uid, excluded, rid,
-                                        pihak_kita_nama, peran_kita_clean)
+                                        pihak_kita_nama, peran_kita_clean,
+                                        contract_categories=contract_categories,
+                                        precomputed_vec=vec)
 
         results = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-            for res in executor.map(worker, pasal_items[:80]):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            for res in executor.map(worker, zip(clauses_to_check, clause_vecs)):
                 if res:
                     results.append(res)
 
-        # ── Pass 3: Commercial-position sweep ────────────────────────────
-        # TIDAK DIATUR clauses return before any LLM call, so they carry
-        # neutral placeholders. Fill them in batches; a failure here must never
-        # fail the analysis, so it is logged and swallowed.
-        try:
-            filled = favorability.sweep(results, doc_type, pihak_kita_nama, peran_kita_clean)
-            print(f"[Compliance] Position sweep filled {filled} clause(s)")
-        except Exception as e:
-            print(f"[Compliance] Position sweep skipped: {e}")
+        # ── Pass 3 & Pass 3B in Parallel ─────────────────────────────────
+        # Commercial-position sweep (Pass 3) and Reverse-RAG gap detection
+        # (Pass 3B) are completely independent and can run concurrently.
+        def _run_pass3():
+            try:
+                filled = favorability.sweep(results, doc_type, pihak_kita_nama, peran_kita_clean)
+                print(f"[Compliance] Position sweep filled {filled} clause(s)")
+            except Exception as e:
+                print(f"[Compliance] Position sweep skipped: {e}")
+
+        def _run_pass3b():
+            nonlocal detected_contract_type, missing_clauses
+            try:
+                from services import gap_detector
+                is_bilingual_doc = bool(bilingual_meta and bilingual_meta.get("is_bilingual"))
+                detected_contract_type, missing_clauses = gap_detector.detect_missing_clauses(
+                    pasal_items=pasal_items,
+                    contract_type=detected_contract_type,
+                    doc_type=doc_type,
+                    pihak_kita=pihak_kita_nama,
+                    peran_kita=peran_kita_clean,
+                    is_bilingual=is_bilingual_doc,
+                    full_text=text_snippet,
+                    filename=clean_filename,
+                )
+                print(f"[Compliance] Gap detector ({detected_contract_type}): {len(missing_clauses)} gap(s) found")
+            except Exception as e:
+                print(f"[Compliance] Gap detector skipped: {e}")
+
+        detected_contract_type = doc_ctx.get("archetype") or "GENERAL"
+        missing_clauses: list = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as p3_pool:
+            f3 = p3_pool.submit(_run_pass3)
+            f3b = p3_pool.submit(_run_pass3b)
+            f3.result()
+            f3b.result()
 
         # ── Pass 4: Document-Level Summary ───────────────────────────────
         fatal_count        = sum(1 for r in results if r["status"] == "FATAL")
@@ -1069,13 +1168,20 @@ async def check_compliance(
             "klausul_merugikan": merugikan_count,
             "klausul_netral": netral_count,
             "skor_posisi": skor_posisi,
+            "detected_contract_type": detected_contract_type,
+            "missing_clauses_count": len(missing_clauses),
         }
 
         print(f"[Compliance] Done. Score: {summary['skor_kepatuhan']}% | "
               f"SESUAI={sesuai_count} BERESIKO={beresiko_count} FATAL={fatal_count} | "
               f"posisi: +{menguntungkan_count} / -{merugikan_count} / ={netral_count}")
 
-        out_payload = {"report": results, "summary": summary}
+        out_payload = {
+            "report": results,
+            "summary": summary,
+            "detected_contract_type": detected_contract_type,
+            "missing_clauses": missing_clauses,
+        }
         if bilingual_meta and bilingual_meta.get("is_bilingual"):
             from services import bilingual_extractor
             out_payload["layout_mode"] = bilingual_meta.get("layout_mode", "bilingual_parallel")
@@ -1088,7 +1194,23 @@ async def check_compliance(
         return out_payload
 
     try:
-        return await run_in_threadpool(_run_pipeline)
+        out_payload = await run_in_threadpool(_run_pipeline)
+        matched_ids = {
+            sr["regulation_id"]
+            for clause in out_payload.get("report") or []
+            for sr in clause.get("supporting_regulations") or []
+            if sr.get("regulation_id") is not None
+        }
+        if matched_ids:
+            from services.freshness.live_verifier import (
+                record_regulation_matches,
+                refresh_stale_regulations_background,
+            )
+            with pg_service.get_conn() as conn:
+                stale_ids = record_regulation_matches(conn, matched_ids)
+            if stale_ids:
+                background_tasks.add_task(refresh_stale_regulations_background, stale_ids)
+        return out_payload
     except HTTPException:
         raise
     except Exception as e:

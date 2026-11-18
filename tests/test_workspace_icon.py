@@ -117,61 +117,61 @@ def test_curated_icons_list():
 
 
 def test_infer_workspace_icon_canonical_fastpath():
-    with patch("api.services.workspace_icon.call_glm") as mock_glm:
+    with patch("api.services.workspace_icon.call_llm") as mock_llm:
         # Fast path should never call LLM
         icon = infer_workspace_icon("PKS Lintasarta 2026")
         assert icon == "handshake"
-        mock_glm.assert_not_called()
+        mock_llm.assert_not_called()
 
         icon = infer_workspace_icon("BAST Proyek Fiber")
         assert icon == "clipboard-check"
-        mock_glm.assert_not_called()
+        mock_llm.assert_not_called()
 
 
 def test_infer_workspace_icon_empty_or_none():
-    with patch("api.services.workspace_icon.call_glm") as mock_glm:
+    with patch("api.services.workspace_icon.call_llm") as mock_llm:
         assert infer_workspace_icon("") == "folder"
         assert infer_workspace_icon("   ") == "folder"
         assert infer_workspace_icon(None) == "folder"
-        mock_glm.assert_not_called()
+        mock_llm.assert_not_called()
 
 
 def test_infer_workspace_icon_llm_success():
-    with patch("api.services.workspace_icon.call_glm") as mock_glm:
-        mock_glm.return_value = '{"icon": "server"}'
+    with patch("api.services.workspace_icon.call_llm") as mock_llm:
+        mock_llm.return_value = '{"icon": "server"}'
         icon = infer_workspace_icon("Infrastruktur Data Center Cikarang", description="Manajemen server")
         assert icon == "server"
-        mock_glm.assert_called_once()
+        mock_llm.assert_called_once()
         # Verify prompt contents
-        args, kwargs = mock_glm.call_args
+        args, kwargs = mock_llm.call_args
         messages = args[0]
         assert any("Infrastruktur Data Center Cikarang" in m["content"] for m in messages)
         assert any("Manajemen server" in m["content"] for m in messages)
 
 
 def test_infer_workspace_icon_llm_markdown_fence():
-    with patch("api.services.workspace_icon.call_glm") as mock_glm:
-        mock_glm.return_value = 'Berikut adalah icon yang cocok:\n```json\n{"icon": "database"}\n```'
+    with patch("api.services.workspace_icon.call_llm") as mock_llm:
+        mock_llm.return_value = 'Berikut adalah icon yang cocok:\n```json\n{"icon": "database"}\n```'
         icon = infer_workspace_icon("Sistem Backup Database Oracle")
         assert icon == "database"
 
 
 def test_infer_workspace_icon_llm_invalid_icon_fallback():
-    with patch("api.services.workspace_icon.call_glm") as mock_glm:
-        mock_glm.return_value = '{"icon": "non-existent-alien-icon"}'
+    with patch("api.services.workspace_icon.call_llm") as mock_llm:
+        mock_llm.return_value = '{"icon": "non-existent-alien-icon"}'
         icon = infer_workspace_icon("Proyek Eksplorasi Luar Angkasa")
         assert icon == "folder"
 
 
 def test_infer_workspace_icon_llm_exception_defensive():
-    with patch("api.services.workspace_icon.call_glm") as mock_glm:
-        mock_glm.side_effect = RuntimeError("Connection timeout to LLM endpoint")
+    with patch("api.services.workspace_icon.call_llm") as mock_llm:
+        mock_llm.side_effect = RuntimeError("Connection timeout to LLM endpoint")
         icon = infer_workspace_icon("Proyek Novel Tanpa Kategori")
         assert icon == "folder"
 
 
 def test_infer_workspace_icon_llm_malformed_json_fallback():
-    with patch("api.services.workspace_icon.call_glm") as mock_glm:
-        mock_glm.return_value = "Maaf, saya tidak mengerti permintaannya."
+    with patch("api.services.workspace_icon.call_llm") as mock_llm:
+        mock_llm.return_value = "Maaf, saya tidak mengerti permintaannya."
         icon = infer_workspace_icon("Proyek Novel Tanpa Kategori")
         assert icon == "folder"

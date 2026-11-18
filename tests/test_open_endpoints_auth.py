@@ -24,7 +24,7 @@ def _no_llm(monkeypatch):
         return '["n1"]'
 
     for mod in (chat, compliance, knowledge_graph):
-        monkeypatch.setattr(mod, "call_glm", fake)
+        monkeypatch.setattr(mod, "call_llm", fake)
 
 
 @pytest.fixture

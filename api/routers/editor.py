@@ -282,9 +282,24 @@ class ExportDocxRequest(BaseModel):
 
 
 class AiAssistRequest(BaseModel):
-    clause_text: str
+    clause_text: str = ""
     preset: str = "compliance"
     recommendation: Optional[str] = None
+    mode: Optional[str] = "rewrite"
+    clause_title: Optional[str] = None
+    advisory_guidance: Optional[str] = None
+    recommended_elements: Optional[list[str]] = None
+    user_deal_terms: Optional[str] = None
+    is_bilingual: Optional[bool] = False
+
+
+class MissingClauseStatusRequest(BaseModel):
+    resolution_status: str
+    dismissed_reason: Optional[str] = None
+
+
+class RecheckGapsRequest(BaseModel):
+    contract_type: str
 
 
 class RecheckRequest(BaseModel):
@@ -1359,6 +1374,8 @@ def get_editor_draft(
     is_bilingual = "bilingual-contract-table" in final_html or ch_results.get("layout_mode") == "bilingual_parallel"
     governing_language = ch_results.get("governing_language") or ("id" if is_bilingual else None)
     discrepancies = ch_results.get("translation_discrepancies") or []
+    detected_contract_type = ch_results.get("detected_contract_type") or (ch_results.get("summary") or {}).get("detected_contract_type") or "GENERAL"
+    missing_clauses = ch_results.get("missing_clauses") or []
 
     return {
         "report_id": report_id,
@@ -1373,6 +1390,8 @@ def get_editor_draft(
         "is_bilingual": is_bilingual,
         "governing_language": governing_language,
         "translation_discrepancies": discrepancies,
+        "detected_contract_type": detected_contract_type,
+        "missing_clauses": missing_clauses,
     }
 
 
@@ -1644,11 +1663,89 @@ def ai_assist_clause(
     current_user: dict = Depends(get_current_user),
 ):
     verify_report_access(report_id, current_user["id"])
+
+    if (req.mode or "").strip().lower() == "draft_missing_clause":
+        row = pg_service.query_one(
+            "SELECT results_json FROM compliance_history WHERE id = %s",
+            (report_id,),
+        )
+        summary = {}
+        if row and row.get("results_json"):
+            try:
+                summary = (json.loads(row["results_json"]) or {}).get("summary") or {}
+            except Exception:
+                summary = {}
+        pihak_kita = summary.get("pihak_kita") or summary.get("pihak_pertama") or "Pihak Pertama"
+        peran_kita = summary.get("peran_kita") or ""
+        party_ctx = f"{pihak_kita} ({peran_kita})" if peran_kita else pihak_kita
+        title = (req.clause_title or "Klausul Tambahan").strip()
+        guidance = (req.advisory_guidance or "").strip()
+        elems = [str(e).strip() for e in (req.recommended_elements or []) if str(e).strip()]
+        deal_terms = (req.user_deal_terms or "").strip()
+        elems_block = "\n".join(f"- {e}" for e in elems) if elems else "- Ketentuan hukum dan komersial standar yang melindungi Para Pihak."
+
+        try:
+            from services.llm_client import call_llm, extract_json
+            if req.is_bilingual:
+                prompt = (
+                    "Anda adalah Konsultan Hukum Korporasi Indonesia senior.\n"
+                    f"Buat draf klausul kontrak dwibahasa (Bahasa Indonesia & Bahasa Inggris) untuk topik: {title}.\n"
+                    f"Lindungi kepentingan pihak kita: {party_ctx}.\n"
+                    f"Panduan Hukum/Komersial: {guidance}\n"
+                    f"Poin Wajib:\n{elems_block}\n"
+                    f"Detail Kesepakatan Pengguna: {deal_terms or 'Gunakan standar perlindungan korporasi yang wajar.'}\n\n"
+                    "Kembalikan HANYA JSON valid tanpa markdown:\n"
+                    '{"draft_id": "<teks klausul lengkap Bahasa Indonesia dengan ayat (1), (2), ...>", '
+                    '"draft_en": "<matching English legal translation with (1), (2), ...>"}'
+                )
+                raw = call_llm([{"role": "user", "content": prompt}], temperature=0.2, max_tokens=1100)
+                parsed = extract_json(raw)
+                d_id = str((parsed or {}).get("draft_id") or "").strip()
+                d_en = str((parsed or {}).get("draft_en") or "").strip()
+                if d_id:
+                    return {
+                        "rewritten": f"{d_id}\n\n{d_en}".strip() if d_en else d_id,
+                        "draft_id": d_id,
+                        "draft_en": d_en or None,
+                    }
+            else:
+                prompt = (
+                    "Anda adalah Konsultan Hukum Korporasi Indonesia senior.\n"
+                    f"Buat draf klausul kontrak yang siap dimasukkan ke dalam perjanjian untuk topik: {title}.\n"
+                    f"Lindungi kepentingan pihak kita: {party_ctx}.\n"
+                    f"Panduan Hukum/Komersial: {guidance}\n"
+                    f"Poin Wajib:\n{elems_block}\n"
+                    f"Detail Kesepakatan Pengguna: {deal_terms or 'Gunakan standar perlindungan korporasi yang wajar.'}\n\n"
+                    "Tulis dalam Bahasa Indonesia hukum yang tegas dengan penomoran ayat (1), (2), dst. "
+                    "Berikan HANYA teks klausul tanpa pembuka atau penutup."
+                )
+                draft = call_llm([{"role": "user", "content": prompt}], temperature=0.2, max_tokens=800)
+                if draft and draft.strip():
+                    return {"rewritten": draft.strip(), "draft_id": draft.strip(), "draft_en": None}
+        except Exception:
+            pass
+
+        # Deterministic fallback when LLM is offline
+        terms_note = f" Ketentuan khusus yang disepakati: {deal_terms}." if deal_terms else ""
+        fallback_id = (
+            f"Pasal Tambahan — {title}\n"
+            f"(1) Para Pihak sepakat mengatur ketentuan mengenai {title} sesuai prinsip kehati-hatian dan kepatuhan hukum.{terms_note}\n"
+            f"(2) Pelaksanaan ketentuan ini wajib memenuhi unsur: {'; '.join(elems) if elems else guidance}."
+        )
+        if req.is_bilingual:
+            fallback_en = (
+                f"Additional Article — {title}\n"
+                f"(1) The Parties agree to govern {title} in accordance with prudent commercial practice and applicable law.{terms_note}\n"
+                f"(2) Implementation shall cover: {'; '.join(elems) if elems else guidance}."
+            )
+            return {"rewritten": f"{fallback_id}\n\n{fallback_en}", "draft_id": fallback_id, "draft_en": fallback_en}
+        return {"rewritten": fallback_id, "draft_id": fallback_id, "draft_en": None}
+
     clause = req.clause_text.strip()
     rec = (req.recommendation or "").strip()
 
     try:
-        from services.llm_client import call_glm_chat
+        from services.llm_client import call_llm
         prompt = (
             "Anda adalah Konsultan Hukum Korporasi & Kepatuhan OJK. "
             "Tulis ulang klausul kontrak berikut dalam Bahasa Indonesia hukum yang tegas, jelas, dan patuh regulasi.\n\n"
@@ -1657,7 +1754,7 @@ def ai_assist_clause(
             f"Klausul Asli:\n{clause}\n\n"
             "Berikan HANYA teks klausul hasil perbaikan tanpa pembuka atau penutup."
         )
-        rewritten = call_glm_chat([{"role": "user", "content": prompt}], temperature=0.2, max_tokens=600)
+        rewritten = call_llm([{"role": "user", "content": prompt}], temperature=0.2, max_tokens=600)
         if rewritten and rewritten.strip():
             return {"rewritten": rewritten.strip()}
     except Exception:
@@ -2119,6 +2216,125 @@ def restore_editor_version(
         "content_html": ver["snapshot_html"],
         "draft_version": updated_draft["version"] if updated_draft else 1,
         "updated_at": updated_draft["updated_at"] if updated_draft else None,
+    }
+
+
+@router.patch("/contracts/{report_id}/missing-clauses/{gap_id}")
+def update_missing_clause_status(
+    report_id: str,
+    gap_id: str,
+    req: MissingClauseStatusRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    verify_report_access(report_id, current_user["id"])
+    allowed_statuses = {"open", "addressed", "dismissed"}
+    new_status = (req.resolution_status or "").strip().lower()
+    if new_status not in allowed_statuses:
+        raise HTTPException(status_code=400, detail="Invalid resolution_status; must be open, addressed, or dismissed")
+
+    row = pg_service.query_one(
+        "SELECT id, results_json FROM compliance_history WHERE id = %s",
+        (report_id,),
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Document report not found")
+
+    try:
+        data = json.loads(row.get("results_json") or "{}")
+    except Exception:
+        data = {}
+
+    gaps = data.get("missing_clauses")
+    if not isinstance(gaps, list):
+        raise HTTPException(status_code=404, detail="Missing clause not found")
+
+    updated_gap = None
+    for gap in gaps:
+        if isinstance(gap, dict) and gap.get("gap_id") == gap_id:
+            gap["resolution_status"] = new_status
+            if new_status == "dismissed":
+                gap["dismissed_reason"] = (req.dismissed_reason or "").strip() or None
+            elif new_status == "open":
+                gap["dismissed_reason"] = None
+            updated_gap = gap
+            break
+
+    if not updated_gap:
+        raise HTTPException(status_code=404, detail="Missing clause gap_id not found")
+
+    pg_service.execute(
+        "UPDATE compliance_history SET results_json = %s WHERE id = %s",
+        (json.dumps(data), report_id),
+    )
+    return {"gap": updated_gap}
+
+
+@router.post("/contracts/{report_id}/recheck-gaps")
+def recheck_missing_clauses(
+    report_id: str,
+    req: RecheckGapsRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    verify_report_access(report_id, current_user["id"])
+    row = pg_service.query_one(
+        "SELECT id, results_json FROM compliance_history WHERE id = %s",
+        (report_id,),
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Document report not found")
+
+    try:
+        data = json.loads(row.get("results_json") or "{}")
+    except Exception:
+        data = {}
+
+    draft_row = pg_service.query_one(
+        "SELECT content_html FROM document_editor_drafts WHERE report_id = %s",
+        (report_id,),
+    )
+
+    from services import gap_detector
+    pasal_items: list[dict] = []
+    if draft_row and draft_row.get("content_html"):
+        pasal_items = gap_detector.reconstruct_pasal_items_from_html(draft_row["content_html"])
+
+    if not pasal_items:
+        for r in (data.get("results") or []):
+            if isinstance(r, dict) and r.get("isi_pasal"):
+                pasal_items.append({
+                    "pasal": r.get("pasal") or "Klausul",
+                    "deskripsi": r.get("isi_pasal") or "",
+                })
+
+    summary = data.get("summary") or {}
+    is_bilingual = bool(data.get("layout_mode") == "bilingual_parallel" or data.get("segments"))
+    full_text = "\n\n".join(f"{p.get('pasal', '')}\n{p.get('deskripsi', '')}" for p in pasal_items)
+
+    archetype, missing_clauses = gap_detector.detect_missing_clauses(
+        pasal_items=pasal_items,
+        contract_type=req.contract_type,
+        doc_type=str(summary.get("jenis_dokumen") or ""),
+        pihak_kita=str(summary.get("pihak_kita") or summary.get("pihak_pertama") or ""),
+        peran_kita=summary.get("peran_kita"),
+        is_bilingual=is_bilingual,
+        full_text=full_text,
+        existing_gaps=data.get("missing_clauses") or [],
+    )
+
+    data["detected_contract_type"] = archetype
+    data["missing_clauses"] = missing_clauses
+    if isinstance(summary, dict):
+        summary["detected_contract_type"] = archetype
+        summary["missing_clauses_count"] = len(missing_clauses)
+        data["summary"] = summary
+
+    pg_service.execute(
+        "UPDATE compliance_history SET results_json = %s WHERE id = %s",
+        (json.dumps(data), report_id),
+    )
+    return {
+        "detected_contract_type": archetype,
+        "missing_clauses": missing_clauses,
     }
 
 
